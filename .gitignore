@@ -1,0 +1,13 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Generated data / render artifacts
+*.nc
+*.ppm
+*.png
+
+# Editor / OS
+.DS_Store
+compile_commands.json
+.cache/

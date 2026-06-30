@@ -65,7 +65,7 @@ class App {
   float step_{0.5f};          //!< in voxels; converted to world units per render
   float density_scale_{1.0f};
   float iso_value_{0.5f};
-  float bg_[3] = {0.05f, 0.06f, 0.08f};
+  float bg_[3] = {1.0f, 1.0f, 1.0f};  // white scene background
 
   // --- renderer / output ----------------------------------------------
   std::unique_ptr<Renderer> renderer_;

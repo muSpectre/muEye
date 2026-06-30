@@ -14,8 +14,24 @@ namespace mueye {
 
 App::App() {
   backends_ = enumerate_backends();
-  renderer_ = create_renderer(Backend::CPU);
-  current_backend_ = Backend::CPU;
+
+  // Prefer a GPU backend (Metal / CUDA / HIP) when one is available and can be
+  // constructed; otherwise fall back to the CPU backend.
+  for (const BackendInfo &bi : backends_) {
+    if (bi.backend == Backend::CPU || !bi.available) continue;
+    if (auto r = create_renderer(bi.backend)) {
+      renderer_ = std::move(r);
+      current_backend_ = bi.backend;
+      break;
+    }
+  }
+  if (!renderer_) {
+    renderer_ = create_renderer(Backend::CPU);
+    current_backend_ = Backend::CPU;
+  }
+
+  status_ = std::string("Renderer: ") + renderer_->name() +
+            "  —  open a muGrid NetCDF (.nc) file to begin.";
 }
 
 void App::set_backend(Backend backend) {

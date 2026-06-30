@@ -248,11 +248,13 @@ MUEYE_HD inline Vec4 trace_ray(const float *vol, const Vec4 *lut,
         float frac = fabsf(denom) > 1e-12f ? prev_v / -denom : 0.0f;
         Vec3 hit = prev + (pos - prev) * frac;
         Vec3 n = normalize(gradient(vol, p, hit));
-        // Two-sided Phong with a head light along the view direction.
+        // Two-sided Phong with a head light along the view direction. A warm,
+        // mid-tone material so the surface reads clearly against a light/white
+        // background (a near-white material would disappear).
         Vec3 l = normalize(cam.eye - hit);
         float diff = fabsf(dot(n, l));
-        Vec3 base = make_vec3(0.85f, 0.85f, 0.90f);
-        Vec3 col = base * (0.25f + 0.75f * diff);
+        Vec3 base = make_vec3(0.82f, 0.45f, 0.20f);
+        Vec3 col = base * (0.20f + 0.80f * diff);
         return Vec4{col.x, col.y, col.z, 1.0f};
       }
       prev = pos;

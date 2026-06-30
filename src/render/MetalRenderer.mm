@@ -173,8 +173,8 @@ kernel void raymarch(device const float*  vol [[buffer(0)]],
                     float3 nrm = normalize(gradient(vol, p, hitp));
                     float3 l = normalize(eye - hitp);
                     float diff = fabs(dot(nrm, l));
-                    float3 base = float3(0.85, 0.85, 0.90);
-                    col = base * (0.25 + 0.75*diff);
+                    float3 base = float3(0.82, 0.45, 0.20);
+                    col = base * (0.20 + 0.80*diff);
                     hit = true;
                     break;
                 }

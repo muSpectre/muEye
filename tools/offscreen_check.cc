@@ -28,6 +28,7 @@
 #include "io/file_io_base.hh"
 #include "io/file_io_netcdf.hh"
 #include "render/CpuRenderer.hh"
+#include "render/RendererFactory.hh"
 #include "ui/OrbitCamera.hh"
 #include "ui/TransferFunction.hh"
 
@@ -123,18 +124,14 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // 4. Ray-trace a frame with the CPU renderer (DVR).
+  // 4. Set up shared render parameters.
   mueye::TransferFunction tf;
   tf.set_colormap(mueye::Colormap::Viridis);
   tf.set_opacity_scale(1.0f);
 
   mueye::OrbitCamera cam;
-  mueye::Framebuffer fb;
-  fb.resize(256, 256);
+  const mueye::Camera camv = cam.to_camera(1.0f);
 
-  mueye::RenderRequest req;
-  req.volume = vol.data.data();
-  req.lut = tf.data();
   mueye::RenderParams p;
   p.nx = vol.nx;
   p.ny = vol.ny;
@@ -149,41 +146,81 @@ int main(int argc, char **argv) {
   p.iso_value = 0.5f * (vol.vmin + vol.vmax);
   p.mode = mueye::RenderMode::DVR;
   p.bg = mueye::Vec3{0.05f, 0.06f, 0.08f};
-  req.params = p;
-  req.camera = cam.to_camera(1.0f);
 
-  mueye::CpuRenderer renderer;
-  renderer.render(req, fb);
+  auto render_with = [&](mueye::Renderer &r, mueye::Framebuffer &fb,
+                         mueye::RenderMode mode) {
+    p.mode = mode;
+    r.set_volume(vol.data.data(), vol.nx, vol.ny, vol.nz);
+    r.set_transfer_function(tf.data(), tf.size());
+    r.render(p, camv, fb);
+  };
+  auto count_nonbg = [](const mueye::Framebuffer &fb) {
+    std::size_t n = 0;
+    std::uint8_t bgr = static_cast<std::uint8_t>(0.05f * 255 + 0.5f);
+    for (int i = 0; i < fb.width * fb.height; ++i)
+      if (std::abs(int(fb.rgba[i * 4]) - int(bgr)) > 6 ||
+          fb.rgba[i * 4 + 1] > 16 || fb.rgba[i * 4 + 2] > 24)
+        ++n;
+    return n;
+  };
 
-  // 5. Count non-background pixels (the blob should be visible).
-  std::size_t nonbg = 0;
-  std::uint8_t bgr = static_cast<std::uint8_t>(0.05f * 255 + 0.5f);
-  for (int i = 0; i < fb.width * fb.height; ++i) {
-    std::uint8_t r = fb.rgba[i * 4 + 0];
-    std::uint8_t g = fb.rgba[i * 4 + 1];
-    std::uint8_t b = fb.rgba[i * 4 + 2];
-    if (std::abs(int(r) - int(bgr)) > 6 || g > 16 || b > 24) ++nonbg;
-  }
-  double frac = double(nonbg) / (fb.width * fb.height);
-  std::printf("rendered 256x256 DVR: %zu non-background px (%.1f%%)\n", nonbg,
+  // 5. CPU reference render (DVR + isosurface).
+  mueye::CpuRenderer cpu;
+  mueye::Framebuffer fb_cpu;
+  fb_cpu.resize(256, 256);
+  render_with(cpu, fb_cpu, mueye::RenderMode::DVR);
+  std::size_t nonbg = count_nonbg(fb_cpu);
+  double frac = double(nonbg) / (fb_cpu.width * fb_cpu.height);
+  std::printf("CPU DVR 256x256: %zu non-background px (%.1f%%)\n", nonbg,
               100.0 * frac);
-
-  if (write_ppm("offscreen.ppm", fb))
-    std::printf("wrote offscreen.ppm\n");
-
+  if (write_ppm("offscreen.ppm", fb_cpu)) std::printf("wrote offscreen.ppm\n");
   if (frac < 0.02) {
     std::fprintf(stderr, "render produced almost nothing; check pipeline.\n");
     return 1;
   }
-
-  // 6. Also exercise the isosurface path.
-  req.params.mode = mueye::RenderMode::Isosurface;
-  renderer.render(req, fb);
+  render_with(cpu, fb_cpu, mueye::RenderMode::Isosurface);
   std::size_t iso_hits = 0;
-  for (int i = 0; i < fb.width * fb.height; ++i)
-    if (fb.rgba[i * 4 + 0] > 60) ++iso_hits;
-  std::printf("rendered isosurface: %zu lit px\n", iso_hits);
+  for (int i = 0; i < fb_cpu.width * fb_cpu.height; ++i)
+    if (fb_cpu.rgba[i * 4] > 60) ++iso_hits;
+  std::printf("CPU isosurface: %zu lit px\n", iso_hits);
 
-  std::printf("OK: muGrid I/O -> scalarize -> ray-trace pipeline verified.\n");
+  // Re-render CPU DVR as the comparison reference.
+  render_with(cpu, fb_cpu, mueye::RenderMode::DVR);
+
+  // 6. Cross-check every other available backend against the CPU image.
+  int mismatches = 0;
+  for (const mueye::BackendInfo &bi : mueye::enumerate_backends()) {
+    if (bi.backend == mueye::Backend::CPU) continue;
+    if (!bi.available) {
+      std::printf("backend %-14s : unavailable (%s)\n", bi.name, bi.note);
+      continue;
+    }
+    auto r = mueye::create_renderer(bi.backend);
+    if (!r) {
+      std::printf("backend %-14s : create failed\n", bi.name);
+      continue;
+    }
+    mueye::Framebuffer fb;
+    fb.resize(256, 256);
+    render_with(*r, fb, mueye::RenderMode::DVR);
+
+    double sum = 0.0;
+    for (std::size_t i = 0; i < fb.rgba.size(); ++i)
+      sum += std::abs(int(fb.rgba[i]) - int(fb_cpu.rgba[i]));
+    double mean_abs_diff = sum / fb.rgba.size();
+    std::printf("backend %-14s : mean|Δ| vs CPU = %.3f / 255\n", bi.name,
+                mean_abs_diff);
+    // Allow small differences from float math / rounding across devices.
+    if (mean_abs_diff > 4.0) ++mismatches;
+  }
+
+  if (mismatches) {
+    std::fprintf(stderr, "%d backend(s) diverged from the CPU reference.\n",
+                 mismatches);
+    return 1;
+  }
+
+  std::printf(
+      "OK: muGrid I/O -> scalarize -> ray-trace verified; backends agree.\n");
   return 0;
 }

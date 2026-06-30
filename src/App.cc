@@ -10,13 +10,30 @@
 
 #include <chrono>
 
-#if defined(_OPENMP)
-#include <omp.h>
-#endif
-
 namespace mueye {
 
-App::App() = default;
+App::App() {
+  backends_ = enumerate_backends();
+  renderer_ = create_renderer(Backend::CPU);
+  current_backend_ = Backend::CPU;
+}
+
+void App::set_backend(Backend backend) {
+  if (backend == current_backend_ && renderer_) return;
+  auto next = create_renderer(backend);
+  if (!next) {
+    status_ = std::string("Backend '") + to_string(backend) +
+              "' is unavailable; keeping " + to_string(current_backend_) + ".";
+    return;
+  }
+  renderer_ = std::move(next);
+  current_backend_ = backend;
+  // The new backend has no data yet; re-upload on the next render.
+  volume_dirty_ = true;
+  tf_dirty_ = true;
+  needs_render_ = true;
+  status_ = std::string("Renderer: ") + renderer_->name();
+}
 
 void App::open_path(const std::string &path) {
   meta_ = loader_.open(path);
@@ -61,6 +78,7 @@ void App::reload_volume() {
   status_ = "Field '" + fi.name + "' frame " + std::to_string(frame_) +
             "  range [" + std::to_string(volume_.vmin) + ", " +
             std::to_string(volume_.vmax) + "]";
+  volume_dirty_ = true;  // backend must re-upload the new volume
   needs_render_ = true;
 }
 
@@ -73,7 +91,7 @@ void App::render(int width, int height) {
 
   fb_.resize(rw, rh);
 
-  if (volume_.empty()) {
+  if (volume_.empty() || !renderer_) {
     // Clear to background.
     for (std::size_t i = 0; i < fb_.rgba.size(); i += 4) {
       fb_.rgba[i + 0] = static_cast<std::uint8_t>(bg_[0] * 255);
@@ -87,13 +105,18 @@ void App::render(int width, int height) {
     return;
   }
 
-#if defined(_OPENMP)
-  if (cpu_threads_ > 0) omp_set_num_threads(cpu_threads_);
-#endif
-
-  RenderRequest req;
-  req.volume = volume_.data.data();
-  req.lut = tf_.data();
+  // Upload data to the backend only when it changed (cheap for CPU, avoids a
+  // device round-trip every frame for Metal/CUDA/HIP).
+  if (volume_dirty_) {
+    renderer_->set_volume(volume_.data.data(), volume_.nx, volume_.ny,
+                          volume_.nz);
+    volume_dirty_ = false;
+  }
+  if (tf_dirty_) {
+    renderer_->set_transfer_function(tf_.data(), tf_.size());
+    tf_dirty_ = false;
+  }
+  renderer_->set_num_threads(cpu_threads_);  // no-op for GPU backends
 
   RenderParams p;
   p.nx = volume_.nx;
@@ -112,12 +135,11 @@ void App::render(int width, int height) {
   p.iso_value = iso_value_;
   p.mode = mode_;
   p.bg = Vec3{bg_[0], bg_[1], bg_[2]};
-  req.params = p;
 
-  req.camera = camera_.to_camera(static_cast<float>(rw) / rh);
+  Camera cam = camera_.to_camera(static_cast<float>(rw) / rh);
 
   auto t0 = std::chrono::high_resolution_clock::now();
-  active_renderer_->render(req, fb_);
+  renderer_->render(p, cam, fb_);
   auto t1 = std::chrono::high_resolution_clock::now();
   last_render_ms_ =
       std::chrono::duration<double, std::milli>(t1 - t0).count();

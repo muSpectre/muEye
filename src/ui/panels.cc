@@ -162,16 +162,19 @@ void App::draw_ui() {
     int cm = static_cast<int>(tf_.colormap());
     if (ImGui::Combo("Colormap", &cm, cmaps, IM_ARRAYSIZE(cmaps))) {
       tf_.set_colormap(static_cast<Colormap>(cm));
+      tf_dirty_ = true;
       needs_render_ = true;
     }
     float op = tf_.opacity_scale();
     if (ImGui::SliderFloat("Opacity", &op, 0.0f, 2.0f, "%.2f")) {
       tf_.set_opacity_scale(op);
+      tf_dirty_ = true;
       needs_render_ = true;
     }
     float g = tf_.opacity_gamma();
     if (ImGui::SliderFloat("Opacity gamma", &g, 0.2f, 4.0f, "%.2f")) {
       tf_.set_opacity_gamma(g);
+      tf_dirty_ = true;
       needs_render_ = true;
     }
 
@@ -198,17 +201,25 @@ void App::draw_ui() {
   // -------------------------------------------------------------- Device
   ImGui::Begin("Device");
   {
-    int dev = 0;  // 0 = CPU
-    ImGui::RadioButton("CPU", &dev, 0);
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!gpu_available_);
-    ImGui::RadioButton("GPU", &dev, 1);
-    ImGui::EndDisabled();
-    if (!gpu_available_) {
-      ImGui::TextDisabled("(GPU backend not built — configure with -DMUEYE_ENABLE_CUDA=ON)");
+    ImGui::TextDisabled("Rendering backend");
+    for (const BackendInfo &bi : backends_) {
+      bool selected = (bi.backend == current_backend_);
+      ImGui::BeginDisabled(!bi.available);
+      if (ImGui::RadioButton(bi.name, selected) && !selected) {
+        set_backend(bi.backend);
+      }
+      ImGui::EndDisabled();
+      if (!bi.available && bi.note && bi.note[0]) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%s)", bi.note);
+      }
     }
-    ImGui::Text("Active backend: %s", active_renderer_->name());
-    ImGui::SliderInt("CPU threads (0=auto)", &cpu_threads_, 0, 64);
+    ImGui::Separator();
+    if (renderer_)
+      ImGui::Text("Active: %s", renderer_->name());
+    if (current_backend_ == Backend::CPU) {
+      ImGui::SliderInt("CPU threads (0=auto)", &cpu_threads_, 0, 64);
+    }
   }
   ImGui::End();
 

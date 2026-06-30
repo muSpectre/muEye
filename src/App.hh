@@ -18,8 +18,8 @@
 #include "gl/GlTexture.hh"
 #include "io/Volume.hh"
 #include "io/VolumeLoader.hh"
-#include "render/CpuRenderer.hh"
 #include "render/Renderer.hh"
+#include "render/RendererFactory.hh"
 #include "ui/OrbitCamera.hh"
 #include "ui/TransferFunction.hh"
 
@@ -43,6 +43,7 @@ class App {
 
   // --- rendering -------------------------------------------------------
   void render(int width, int height);
+  void set_backend(Backend backend);
 
   VolumeLoader loader_;
   FileMeta meta_;
@@ -67,10 +68,12 @@ class App {
   float bg_[3] = {0.05f, 0.06f, 0.08f};
 
   // --- renderer / output ----------------------------------------------
-  CpuRenderer cpu_renderer_;
-  Renderer *active_renderer_{&cpu_renderer_};
-  bool gpu_available_{false};  //!< GPU backend not built in this pass
-  int cpu_threads_{0};         //!< 0 => OpenMP default
+  std::unique_ptr<Renderer> renderer_;
+  Backend current_backend_{Backend::CPU};
+  std::vector<BackendInfo> backends_;
+  int cpu_threads_{0};       //!< 0 => auto
+  bool volume_dirty_{true};  //!< re-upload volume to the backend before next render
+  bool tf_dirty_{true};      //!< re-upload transfer function before next render
 
   Framebuffer fb_;
   GlTexture texture_;

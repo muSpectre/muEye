@@ -27,7 +27,14 @@ muEye reuses muGrid internally:
 - Orbit camera (left-drag orbit, right/middle-drag pan, wheel zoom).
 - Field / frame / component selection, plus derived scalars: vector **magnitude** and,
   for 3×3 tensor fields, **von Mises** and **trace**.
-- Multi-threaded CPU renderer (OpenMP); adjustable render downscale for interactivity.
+- **Pluggable rendering backends** behind one interface (`render/Renderer.hh`),
+  selectable at runtime in the Device panel:
+  - **CPU** — multi-threaded (OpenMP, or a `std::thread` fallback so it is parallel
+    even on Apple clang).
+  - **Metal** — Apple-GPU compute shader (default on macOS).
+  - **CUDA / HIP** — single-source kernel sharing `render_core.hh` with the CPU path
+    (opt-in; requires the respective toolchain).
+- Adjustable render downscale for interactivity.
 
 ## Build
 
@@ -58,16 +65,32 @@ python scripts/make_test_volume.py demo.nc
 Then: type a path and **Load** (or pass it on the command line), pick a field/frame,
 toggle **DVR**/**Isosurface**, drag to orbit, scroll to zoom.
 
-## GPU backend (deferred)
+## Rendering backends
 
-The CMake options `-DMUEYE_ENABLE_CUDA=ON` / `-DMUEYE_ENABLE_HIP=ON` are declared but
-the GPU ray tracer is **not implemented in this pass** (the development machine is
-CPU-only macOS, where CUDA/HIP cannot be built or run). The ray-march core
-(`src/render/render_core.hh`) is written as a single `__host__ __device__`-decorated
-unit precisely so a `src/render/render_gpu.cc` backend can be added later — compiled
-with `LANGUAGE CUDA`/`HIP`, reusing muGrid's `Device` and `gpu_runtime.hh` for device
-selection and memory — without touching the CPU path. The CPU and GPU images should
-then match, which is the cross-check that the shared core is consistent.
+All backends implement `mueye::Renderer` (`src/render/Renderer.hh`), which separates
+*data upload* (`set_volume` / `set_transfer_function`, done only when the data changes)
+from *per-frame* `render()` — so GPU backends keep the volume resident in device memory.
+`RendererFactory` discovers which backends are compiled in **and** have a device
+present; the Device panel lists them and switches at runtime.
+
+| Backend     | When built                          | Notes |
+|-------------|-------------------------------------|-------|
+| CPU         | always                              | OpenMP if available, else `std::thread` |
+| Metal       | Apple, `MUEYE_ENABLE_METAL` (ON)    | compute shader compiled at runtime (no offline `metal` toolchain needed) |
+| CUDA / HIP  | `-DMUEYE_ENABLE_CUDA=ON` / `=ON`    | single-source kernel sharing `render_core.hh`; reuses muGrid `gpu_runtime.hh` |
+
+The CPU, Metal and CUDA/HIP backends all call the **same** ray-march algorithm —
+`render_core.hh`'s `__host__ __device__` `trace_ray()` (the Metal shader mirrors it in
+MSL) — so their images match. `tools/offscreen_check.cc` renders with every available
+backend and asserts they agree with the CPU reference (Metal currently matches it
+bit-for-bit).
+
+```bash
+# CUDA build on an NVIDIA machine:
+cmake -S . -B build -DMUEYE_MUGRID_SOURCE_DIR=../muGrid -DMUEYE_ENABLE_CUDA=ON
+# HIP build on an AMD/ROCm machine:
+cmake -S . -B build -DMUEYE_MUGRID_SOURCE_DIR=../muGrid -DMUEYE_ENABLE_HIP=ON
+```
 
 ## Layout
 
@@ -81,10 +104,15 @@ src/
   io/Volume.*          dense float volume + scalarization
   io/VolumeLoader.*    netcdf-c introspection + muGrid-backed field read
   render/render_core.hh shared host/device ray-march core (DVR + isosurface)
-  render/Renderer.hh   renderer interface + RGBA8 framebuffer
-  render/CpuRenderer.* OpenMP CPU ray tracer
+  render/Renderer.hh   backend interface (Backend enum) + RGBA8 framebuffer
+  render/RendererFactory.* backend discovery + construction
+  render/parallel_for.hh   OpenMP / std::thread parallel-for
+  render/CpuRenderer.*  multi-threaded CPU backend
+  render/MetalRenderer.{hh,mm}  Metal compute backend (Apple)
+  render/GpuRenderer.{hh,cc}    CUDA / HIP backend (single-source kernel)
   gl/GlTexture.*       framebuffer -> GL texture for ImGui::Image
 scripts/make_test_volume.py   writes a 64^3 demo .nc via muGrid
+tools/offscreen_check.cc      headless pipeline + cross-backend verification
 ```
 
 ## Known limitations (first draft)

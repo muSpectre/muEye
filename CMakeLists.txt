@@ -25,15 +25,37 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 set(MUEYE_MUGRID_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../muGrid"
     CACHE PATH "Path to the muGrid source tree (consumed via add_subdirectory)")
 
-# GPU backend is declared but deferred to a follow-up pass. When implemented,
-# enabling these will add src/render/render_gpu.cc (compiled with LANGUAGE
-# CUDA/HIP, target archs, --extended-lambda --expt-relaxed-constexpr) and reuse
-# muGrid's Device + memory/gpu_runtime.hh. The default build is CPU-only and
-# must configure cleanly on macOS (which has no CUDA/HIP).
-option(MUEYE_ENABLE_CUDA "Build the CUDA GPU ray tracer (not yet implemented)" OFF)
-option(MUEYE_ENABLE_HIP  "Build the HIP GPU ray tracer (not yet implemented)"  OFF)
-if(MUEYE_ENABLE_CUDA OR MUEYE_ENABLE_HIP)
-    message(WARNING "muEye GPU backend is not implemented yet; building CPU-only.")
+# Rendering backends. CPU is always built. Metal is built by default on Apple.
+# CUDA/HIP are opt-in and require the respective toolchain (not available on the
+# CPU-only macOS dev machine).
+if(APPLE)
+    option(MUEYE_ENABLE_METAL "Build the Metal GPU backend" ON)
+else()
+    option(MUEYE_ENABLE_METAL "Build the Metal GPU backend" OFF)
+endif()
+option(MUEYE_ENABLE_CUDA "Build the CUDA GPU backend" OFF)
+option(MUEYE_ENABLE_HIP  "Build the HIP GPU backend"  OFF)
+if(MUEYE_ENABLE_CUDA AND MUEYE_ENABLE_HIP)
+    message(FATAL_ERROR "Enable only one of MUEYE_ENABLE_CUDA / MUEYE_ENABLE_HIP.")
+endif()
+if(MUEYE_ENABLE_METAL AND NOT APPLE)
+    message(FATAL_ERROR "MUEYE_ENABLE_METAL requires an Apple platform.")
+endif()
+
+# Additional languages must be enabled early — right after project() and before
+# add_subdirectory(muGrid) — so CMake loads their compile rules correctly.
+if(MUEYE_ENABLE_METAL)
+    enable_language(OBJCXX)
+    set(CMAKE_OBJCXX_STANDARD 20)
+    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+endif()
+if(MUEYE_ENABLE_CUDA)
+    enable_language(CUDA)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 70 80 90)
+    endif()
+elseif(MUEYE_ENABLE_HIP)
+    enable_language(HIP)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -100,9 +122,45 @@ target_include_directories(imgui PUBLIC
 target_link_libraries(imgui PUBLIC glfw OpenGL::GL)
 
 # ---------------------------------------------------------------------------
-# OpenMP (optional) for the CPU renderer
+# CPU parallelism: OpenMP if available, else the std::thread fallback (Threads).
 # ---------------------------------------------------------------------------
 find_package(OpenMP QUIET)
+find_package(Threads REQUIRED)
+
+# ---------------------------------------------------------------------------
+# Assemble the rendering-backend sources, libraries and compile definitions.
+# CpuRenderer + RendererFactory are always present; Metal / CUDA / HIP are
+# added according to the options above.
+# ---------------------------------------------------------------------------
+set(MUEYE_RENDER_SOURCES
+    src/render/CpuRenderer.cc
+    src/render/RendererFactory.cc)
+set(MUEYE_BACKEND_LIBS "")
+set(MUEYE_BACKEND_DEFS "")
+
+if(MUEYE_ENABLE_METAL)
+    list(APPEND MUEYE_RENDER_SOURCES src/render/MetalRenderer.mm)
+    # ARC for the Objective-C++ implementation.
+    set_source_files_properties(src/render/MetalRenderer.mm PROPERTIES
+        COMPILE_OPTIONS "-fobjc-arc")
+    find_library(METAL_LIB Metal REQUIRED)
+    find_library(FOUNDATION_LIB Foundation REQUIRED)
+    list(APPEND MUEYE_BACKEND_LIBS ${METAL_LIB} ${FOUNDATION_LIB})
+    list(APPEND MUEYE_BACKEND_DEFS MUEYE_ENABLE_METAL)
+endif()
+
+if(MUEYE_ENABLE_CUDA)
+    list(APPEND MUEYE_RENDER_SOURCES src/render/GpuRenderer.cc)
+    set_source_files_properties(src/render/GpuRenderer.cc PROPERTIES
+        LANGUAGE CUDA)
+    # MUGRID_ENABLE_CUDA switches muGrid's gpu_runtime.hh into its CUDA path.
+    list(APPEND MUEYE_BACKEND_DEFS MUEYE_ENABLE_CUDA MUGRID_ENABLE_CUDA)
+elseif(MUEYE_ENABLE_HIP)
+    list(APPEND MUEYE_RENDER_SOURCES src/render/GpuRenderer.cc)
+    set_source_files_properties(src/render/GpuRenderer.cc PROPERTIES
+        LANGUAGE HIP)
+    list(APPEND MUEYE_BACKEND_DEFS MUEYE_ENABLE_HIP MUGRID_ENABLE_HIP)
+endif()
 
 # ---------------------------------------------------------------------------
 # muEye executable
@@ -115,19 +173,23 @@ add_executable(muEye
     src/ui/TransferFunction.cc
     src/io/Volume.cc
     src/io/VolumeLoader.cc
-    src/render/CpuRenderer.cc
-    src/gl/GlTexture.cc)
+    src/gl/GlTexture.cc
+    ${MUEYE_RENDER_SOURCES})
 
 target_include_directories(muEye PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${NetCDF_INCLUDE_DIRS})
+
+target_compile_definitions(muEye PRIVATE ${MUEYE_BACKEND_DEFS})
 
 target_link_libraries(muEye PRIVATE
     muGrid           # note: under add_subdirectory the target is `muGrid`, no namespace alias
     imgui
     glfw
     OpenGL::GL
-    ${NetCDF_LIBRARIES})
+    Threads::Threads
+    ${NetCDF_LIBRARIES}
+    ${MUEYE_BACKEND_LIBS})
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(muEye PRIVATE OpenMP::OpenMP_CXX)
@@ -140,26 +202,41 @@ endif()
 
 # ---------------------------------------------------------------------------
 # Headless verification tool (no ImGui/OpenGL): writes a demo .nc via muGrid,
-# reads it back through the loader, scalarizes and ray-traces offscreen.
+# reads it back through the loader, scalarizes, ray-traces offscreen and
+# cross-checks every available backend against the CPU reference.
 # Build with: cmake --build build --target muEye_check
 # ---------------------------------------------------------------------------
-# Only the data + render + camera/transfer-function layers — no App/panels (which
-# pull in ImGui) and no GlTexture (which pulls in OpenGL).
 add_executable(muEye_check
     tools/offscreen_check.cc
     src/io/Volume.cc
     src/io/VolumeLoader.cc
-    src/render/CpuRenderer.cc
     src/ui/OrbitCamera.cc
-    src/ui/TransferFunction.cc)
+    src/ui/TransferFunction.cc
+    ${MUEYE_RENDER_SOURCES})
 set_target_properties(muEye_check PROPERTIES EXCLUDE_FROM_ALL TRUE)
 target_include_directories(muEye_check PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${NetCDF_INCLUDE_DIRS})
-target_link_libraries(muEye_check PRIVATE muGrid ${NetCDF_LIBRARIES})
+target_compile_definitions(muEye_check PRIVATE ${MUEYE_BACKEND_DEFS})
+target_link_libraries(muEye_check PRIVATE
+    muGrid
+    Threads::Threads
+    ${NetCDF_LIBRARIES}
+    ${MUEYE_BACKEND_LIBS})
 if(OpenMP_CXX_FOUND)
     target_link_libraries(muEye_check PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
+set(_mueye_backends "CPU")
+if(MUEYE_ENABLE_METAL)
+    string(APPEND _mueye_backends ", Metal")
+endif()
+if(MUEYE_ENABLE_CUDA)
+    string(APPEND _mueye_backends ", CUDA")
+endif()
+if(MUEYE_ENABLE_HIP)
+    string(APPEND _mueye_backends ", HIP")
+endif()
+message(STATUS "muEye backends: ${_mueye_backends}")
 message(STATUS "muEye configured: muGrid=${MUEYE_MUGRID_SOURCE_DIR}, "
                "OpenMP=${OpenMP_CXX_FOUND}, NetCDF=${NetCDF_LIBRARIES}")

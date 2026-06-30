@@ -35,6 +35,9 @@ muEye reuses muGrid internally:
   - **CUDA / HIP** — single-source kernel sharing `render_core.hh` with the CPU path
     (opt-in; requires the respective toolchain).
 - Adjustable render downscale for interactivity.
+- Uses the host platform's **native UI font** (San Francisco on macOS, Segoe UI on
+  Windows, Ubuntu/Cantarell/Noto→DejaVu Sans on Linux), HiDPI-aware, with a graceful
+  fallback to Dear ImGui's built-in font.
 
 ## Build
 

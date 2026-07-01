@@ -13,6 +13,13 @@
 #if defined(__APPLE__)
 #define GL_SILENCE_DEPRECATION
 #include <OpenGL/gl.h>
+#elif defined(_WIN32)
+// <GL/gl.h> on Windows relies on WINGDIAPI / APIENTRY from <windows.h>, so that
+// must be included first (otherwise gl.h fails to parse).
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <GL/gl.h>
 #else
 #include <GL/gl.h>
 #endif

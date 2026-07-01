@@ -98,6 +98,13 @@ set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
+# On Linux, GLFW 3.4 builds both X11 and Wayland backends by default; the Wayland
+# one requires wayland-scanner + protocol dev packages at configure time. We only
+# need X11 (Wayland compositors run it via XWayland), so disable Wayland to keep
+# the build self-contained with just the X11 dev headers (xorg-dev). No effect on
+# macOS/Windows, which use their native backend.
+set(GLFW_BUILD_WAYLAND  OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_X11      ON  CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(glfw)
 
 # Dear ImGui has no CMake build of its own; we fetch sources and compile a small

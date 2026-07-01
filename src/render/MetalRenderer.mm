@@ -113,79 +113,99 @@ static bool intersect_unit_box(float3 o, float3 d, thread float& t_near, thread 
     return t_far > t_near;
 }
 
-kernel void raymarch(texture3d<float>     vol [[texture(0)]],
-                     device const float4* lut [[buffer(1)]],
-                     constant P&          p   [[buffer(2)]],
-                     device uchar4*       out [[buffer(3)]],
-                     uint2 gid [[thread_position_in_grid]]) {
-    if (int(gid.x) >= p.width || int(gid.y) >= p.height) return;
-
-    float3 eye = float3(p.eye_x, p.eye_y, p.eye_z);
+// Primary (pinhole) ray direction through normalized image coordinate (u,v).
+static float3 primary_dir(constant P& p, float u, float v) {
     float3 fwd = float3(p.fwd_x, p.fwd_y, p.fwd_z);
     float3 rt  = float3(p.right_x, p.right_y, p.right_z);
     float3 up  = float3(p.up_x, p.up_y, p.up_z);
-    float3 bg  = float3(p.bg_x, p.bg_y, p.bg_z);
-
-    float u = (float(gid.x) + 0.5) / p.width;
-    float v = (float(gid.y) + 0.5) / p.height;
     float sx = (2.0*u - 1.0) * p.aspect * p.tan_half_fov;
     float sy = (1.0 - 2.0*v) * p.tan_half_fov;
-    float3 dir = normalize(fwd + rt*sx + up*sy);
+    return normalize(fwd + rt*sx + up*sy);
+}
 
-    float3 col = bg;
-
-    float t_near, t_far;
-    if (intersect_unit_box(eye, dir, t_near, t_far)) {
-        if (p.mode == 1) {
-            // Isosurface.
-            float t = t_near;
-            float3 prev = eye + dir*t;
-            float prev_v = sample(vol, prev) - p.iso_value;
-            t += p.step;
-            bool hit = false;
-            while (t < t_far) {
-                float3 pos = eye + dir*t;
-                float cur_v = sample(vol, pos) - p.iso_value;
-                if (prev_v * cur_v <= 0.0) {
-                    float denom = cur_v - prev_v;
-                    float frac = fabs(denom) > 1e-12 ? prev_v / -denom : 0.0;
-                    float3 hitp = prev + (pos - prev)*frac;
-                    float3 nrm = normalize(gradient(vol, p, hitp));
-                    float3 l = normalize(eye - hitp);
-                    float diff = fabs(dot(nrm, l));
-                    float3 base = float3(0.82, 0.45, 0.20);
-                    col = base * (0.20 + 0.80*diff);
-                    hit = true;
-                    break;
-                }
-                prev = pos; prev_v = cur_v; t += p.step;
-            }
-            if (!hit) col = bg;
-        } else {
-            // DVR front-to-back.
-            float3 accum = float3(0.0);
-            float trans = 1.0;
-            for (float t = t_near; t < t_far; t += p.step) {
-                float3 pos = eye + dir*t;
-                float val = sample(vol, pos);
-                float nv = normalize_value(p, val);
-                float f = nv * (p.lut_size - 1);
-                int i0 = clamp(int(f), 0, p.lut_size - 1);
-                int i1 = min(i0 + 1, p.lut_size - 1);
-                float4 c = mix(lut[i0], lut[i1], f - i0);
-                float alpha = clamp(c.w * p.density_scale * p.step * p.nx, 0.0, 1.0);
-                accum += c.rgb * (alpha * trans);
-                trans *= (1.0 - alpha);
-                if (trans < 0.003) break;
-            }
-            col = accum + bg * trans;
-        }
-    }
-
+static void store_pixel(device uchar4* out, constant P& p, uint2 gid, float3 col) {
     col = clamp(col, 0.0, 1.0);
     out[gid.y * uint(p.width) + gid.x] =
         uchar4(uchar(col.x*255.0+0.5), uchar(col.y*255.0+0.5),
                uchar(col.z*255.0+0.5), 255);
+}
+
+// DVR and isosurface are separate kernels (rather than one with a mode branch)
+// so each compiles a single path: p.mode is grid-uniform so the branch never
+// diverges, but a combined kernel inflates register/instruction footprint and
+// can cap occupancy. The host binds the matching pipeline (see render()).
+kernel void raymarch_dvr(texture3d<float>     vol [[texture(0)]],
+                         device const float4* lut [[buffer(1)]],
+                         constant P&          p   [[buffer(2)]],
+                         device uchar4*       out [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (int(gid.x) >= p.width || int(gid.y) >= p.height) return;
+    float3 eye = float3(p.eye_x, p.eye_y, p.eye_z);
+    float3 bg  = float3(p.bg_x, p.bg_y, p.bg_z);
+    float u = (float(gid.x) + 0.5) / p.width;
+    float v = (float(gid.y) + 0.5) / p.height;
+    float3 dir = primary_dir(p, u, v);
+
+    float3 col = bg;
+    float t_near, t_far;
+    if (intersect_unit_box(eye, dir, t_near, t_far)) {
+        float3 accum = float3(0.0);
+        float trans = 1.0;
+        for (float t = t_near; t < t_far; t += p.step) {
+            float3 pos = eye + dir*t;
+            float val = sample(vol, pos);
+            float nv = normalize_value(p, val);
+            float f = nv * (p.lut_size - 1);
+            int i0 = clamp(int(f), 0, p.lut_size - 1);
+            int i1 = min(i0 + 1, p.lut_size - 1);
+            float4 c = mix(lut[i0], lut[i1], f - i0);
+            float alpha = clamp(c.w * p.density_scale * p.step * p.nx, 0.0, 1.0);
+            accum += c.rgb * (alpha * trans);
+            trans *= (1.0 - alpha);
+            if (trans < 0.003) break;
+        }
+        col = accum + bg * trans;
+    }
+    store_pixel(out, p, gid, col);
+}
+
+kernel void raymarch_iso(texture3d<float>     vol [[texture(0)]],
+                         device const float4* lut [[buffer(1)]],
+                         constant P&          p   [[buffer(2)]],
+                         device uchar4*       out [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (int(gid.x) >= p.width || int(gid.y) >= p.height) return;
+    float3 eye = float3(p.eye_x, p.eye_y, p.eye_z);
+    float3 bg  = float3(p.bg_x, p.bg_y, p.bg_z);
+    float u = (float(gid.x) + 0.5) / p.width;
+    float v = (float(gid.y) + 0.5) / p.height;
+    float3 dir = primary_dir(p, u, v);
+
+    float3 col = bg;
+    float t_near, t_far;
+    if (intersect_unit_box(eye, dir, t_near, t_far)) {
+        float t = t_near;
+        float3 prev = eye + dir*t;
+        float prev_v = sample(vol, prev) - p.iso_value;
+        t += p.step;
+        while (t < t_far) {
+            float3 pos = eye + dir*t;
+            float cur_v = sample(vol, pos) - p.iso_value;
+            if (prev_v * cur_v <= 0.0) {
+                float denom = cur_v - prev_v;
+                float frac = fabs(denom) > 1e-12 ? prev_v / -denom : 0.0;
+                float3 hitp = prev + (pos - prev)*frac;
+                float3 nrm = normalize(gradient(vol, p, hitp));
+                float3 l = normalize(eye - hitp);
+                float diff = fabs(dot(nrm, l));
+                float3 base = float3(0.82, 0.45, 0.20);
+                col = base * (0.20 + 0.80*diff);
+                break;
+            }
+            prev = pos; prev_v = cur_v; t += p.step;
+        }
+    }
+    store_pixel(out, p, gid, col);
 }
 )METAL";
 
@@ -194,7 +214,8 @@ kernel void raymarch(texture3d<float>     vol [[texture(0)]],
 struct MetalRenderer::Impl {
   id<MTLDevice> device = nil;
   id<MTLCommandQueue> queue = nil;
-  id<MTLComputePipelineState> pipeline = nil;
+  id<MTLComputePipelineState> pipeline_dvr = nil;
+  id<MTLComputePipelineState> pipeline_iso = nil;
 
   id<MTLTexture> volume = nil;
   id<MTLBuffer> lut = nil;
@@ -215,11 +236,17 @@ struct MetalRenderer::Impl {
       NSLog(@"muEye Metal: shader compile failed: %@", err);
       return false;
     }
-    id<MTLFunction> fn = [lib newFunctionWithName:@"raymarch"];
-    if (fn == nil) return false;
-    pipeline = [device newComputePipelineStateWithFunction:fn error:&err];
-    if (pipeline == nil) {
-      NSLog(@"muEye Metal: pipeline creation failed: %@", err);
+    id<MTLFunction> fn_dvr = [lib newFunctionWithName:@"raymarch_dvr"];
+    id<MTLFunction> fn_iso = [lib newFunctionWithName:@"raymarch_iso"];
+    if (fn_dvr == nil || fn_iso == nil) return false;
+    pipeline_dvr = [device newComputePipelineStateWithFunction:fn_dvr error:&err];
+    if (pipeline_dvr == nil) {
+      NSLog(@"muEye Metal: DVR pipeline creation failed: %@", err);
+      return false;
+    }
+    pipeline_iso = [device newComputePipelineStateWithFunction:fn_iso error:&err];
+    if (pipeline_iso == nil) {
+      NSLog(@"muEye Metal: isosurface pipeline creation failed: %@", err);
       return false;
     }
     return true;
@@ -243,7 +270,9 @@ MetalRenderer::MetalRenderer() : impl_(new Impl()) {
 
 MetalRenderer::~MetalRenderer() { delete impl_; }
 
-bool MetalRenderer::ok() const { return impl_ && impl_->pipeline != nil; }
+bool MetalRenderer::ok() const {
+  return impl_ && impl_->pipeline_dvr != nil && impl_->pipeline_iso != nil;
+}
 
 const char *MetalRenderer::name() const { return "Metal (GPU)"; }
 
@@ -323,9 +352,13 @@ void MetalRenderer::render(const RenderParams &params, const Camera &camera,
     p.bg_x = params.bg.x; p.bg_y = params.bg.y; p.bg_z = params.bg.z;
     p.width = w; p.height = h;
 
+    id<MTLComputePipelineState> pipeline =
+        (params.mode == RenderMode::Isosurface) ? impl_->pipeline_iso
+                                                : impl_->pipeline_dvr;
+
     id<MTLCommandBuffer> cmd = [impl_->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    [enc setComputePipelineState:impl_->pipeline];
+    [enc setComputePipelineState:pipeline];
     [enc setTexture:impl_->volume atIndex:0];
     [enc setBuffer:impl_->lut offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(GpuParams) atIndex:2];

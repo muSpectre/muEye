@@ -27,6 +27,11 @@ class GlTexture {
   /** Upload the framebuffer, (re)allocating the texture if the size changed. */
   void upload(const Framebuffer &fb);
 
+  /** Ensure a GL_TEXTURE_2D of size w x h exists (allocating RGBA8 storage,
+   *  without uploading pixels) and return its GL name. Used as the destination
+   *  for a backend's zero-copy Renderer::render_to_gl path. */
+  unsigned int ensure(int w, int h);
+
   /** Texture id suitable for ImGui::Image (cast to ImTextureID). */
   std::uintptr_t id() const { return static_cast<std::uintptr_t>(tex_); }
 

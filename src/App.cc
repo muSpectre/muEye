@@ -155,12 +155,18 @@ void App::render(int width, int height) {
   Camera cam = camera_.to_camera(static_cast<float>(rw) / rh);
 
   auto t0 = std::chrono::high_resolution_clock::now();
-  renderer_->render(p, cam, fb_);
+  // Prefer a backend's zero-copy path straight into the GL texture (GPU
+  // backends that share memory with GL); otherwise render to the host
+  // Framebuffer and upload it.
+  unsigned int gl_tex = texture_.ensure(rw, rh);
+  if (!renderer_->render_to_gl(p, cam, gl_tex, rw, rh)) {
+    renderer_->render(p, cam, fb_);
+    texture_.upload(fb_);
+  }
   auto t1 = std::chrono::high_resolution_clock::now();
   last_render_ms_ =
       std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-  texture_.upload(fb_);
   last_render_w_ = rw;
   last_render_h_ = rh;
 }

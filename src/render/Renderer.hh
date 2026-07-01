@@ -73,6 +73,24 @@ class Renderer {
   virtual void render(const RenderParams &params, const Camera &camera,
                       Framebuffer &fb) = 0;
 
+  /**
+   * Optional zero-copy path: render directly into the OpenGL texture @p gl_tex
+   * (an RGBA8 GL_TEXTURE_2D of size @p width x @p height, already allocated by
+   * the caller), bypassing the host Framebuffer and its upload. GPU backends
+   * that can share memory with GL override this; it lets them skip the
+   * device->host->GL round trip.
+   *
+   * Returns true if it rendered into the texture. The default returns false —
+   * the caller must then fall back to render() + a manual texture upload. CPU
+   * (no device memory to keep resident) and backends without a usable GL-interop
+   * path (see MetalRenderer) simply do not override it.
+   */
+  virtual bool render_to_gl(const RenderParams & /*params*/,
+                            const Camera & /*camera*/, unsigned int /*gl_tex*/,
+                            int /*width*/, int /*height*/) {
+    return false;
+  }
+
   /** Human-readable backend name for the UI. */
   virtual const char *name() const = 0;
 

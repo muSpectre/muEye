@@ -26,6 +26,32 @@ GlTexture::~GlTexture() {
   }
 }
 
+unsigned int GlTexture::ensure(int w, int h) {
+  if (w <= 0 || h <= 0) return tex_;
+
+  if (tex_ == 0) {
+    GLuint t = 0;
+    glGenTextures(1, &t);
+    tex_ = t;
+    glBindTexture(GL_TEXTURE_2D, tex_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  } else {
+    glBindTexture(GL_TEXTURE_2D, tex_);
+  }
+
+  if (w != width_ || h != height_) {
+    width_ = w;
+    height_ = h;
+    // Allocate storage without pixel data; a backend's render_to_gl fills it.
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width_, height_, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+  }
+  return tex_;
+}
+
 void GlTexture::upload(const Framebuffer &fb) {
   if (fb.width <= 0 || fb.height <= 0) return;
 

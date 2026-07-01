@@ -73,8 +73,16 @@ toggle **DVR**/**Isosurface**, drag to orbit, scroll to zoom.
 All backends implement `mueye::Renderer` (`src/render/Renderer.hh`), which separates
 *data upload* (`set_volume` / `set_transfer_function`, done only when the data changes)
 from *per-frame* `render()` — so GPU backends keep the volume resident in device memory.
-`RendererFactory` discovers which backends are compiled in **and** have a device
-present; the Device panel lists them and switches at runtime.
+A backend may also override `render_to_gl()` to draw straight into the display's GL
+texture (the CUDA/HIP backend does, via a shared PBO); backends that don't fall back to
+`render()` + a host texture upload. `RendererFactory` discovers which backends are
+compiled in **and** have a device present; the Device panel lists them and switches at
+runtime.
+
+DVR and isosurface are compiled as **separate single-path kernels** and the matching one
+is dispatched per frame: the mode is uniform across the launch (so it never causes warp
+divergence), but keeping the two paths in separate kernels trims register/instruction
+footprint and helps GPU occupancy.
 
 | Backend     | When built                          | Notes |
 |-------------|-------------------------------------|-------|
@@ -127,8 +135,11 @@ tools/offscreen_check.cc      headless pipeline + cross-backend verification
 - Fields on a sub-point (quadrature) subdivision are read, but derived scalars operate
   on sub-point 0 only.
 - The transfer function is a colormap preset + opacity ramp (no node editor yet).
-- GPU↔GL display, when the GPU backend lands, will go via a host round-trip first; PBO /
-  CUDA-GL interop is a later optimization.
+- The CUDA/HIP backend displays via a CUDA↔GL PBO (no device→host round trip). The Metal
+  backend still copies its result through the host before the GL upload: a true Metal→GL
+  zero-copy needs an IOSurface exposed to GL as `GL_TEXTURE_RECTANGLE`, which Dear ImGui's
+  GL3 backend can't sample — and on Apple Silicon's unified memory that copy is a
+  same-RAM memcpy, so the payoff is small.
 
 ## License
 

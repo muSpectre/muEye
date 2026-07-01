@@ -242,51 +242,72 @@ MUEYE_HD inline bool intersect_unit_box(const Vec3 &o, const Vec3 &d,
 // The ray-march kernel. (u, v) are normalized image coordinates in [0,1].
 // ---------------------------------------------------------------------------
 
-template <class Sampler>
-MUEYE_HD inline Vec4 trace_ray(const Sampler &s, const Vec4 *MUEYE_RESTRICT lut,
-                               const RenderParams &p, const Camera &cam,
-                               float u, float v) {
-  // Build the primary ray through pixel (u, v).
+/** Primary (pinhole) ray direction through normalized image coordinate (u,v). */
+MUEYE_HD inline Vec3 primary_ray_dir(const Camera &cam, float u, float v) {
   float sx = (2.0f * u - 1.0f) * cam.aspect * cam.tan_half_fov;
   float sy = (1.0f - 2.0f * v) * cam.tan_half_fov;
-  Vec3 dir = normalize(cam.forward + cam.right * sx + cam.up * sy);
+  return normalize(cam.forward + cam.right * sx + cam.up * sy);
+}
 
+/**
+ * Isosurface ray-cast: march for a sign change against p.iso_value, then Phong
+ * shade the refined crossing.
+ *
+ * DVR and isosurface are separate entry points (rather than one function with a
+ * runtime mode branch) so the GPU backends can launch a single-path kernel per
+ * mode: p.mode is grid-uniform, so the branch never diverges, but compiling both
+ * paths into one kernel inflates register/instruction footprint and can cap
+ * occupancy. The CPU dispatcher trace_ray() below still selects at runtime — a
+ * scalar CPU core has no such footprint concern.
+ */
+template <class Sampler>
+MUEYE_HD inline Vec4 trace_ray_iso(const Sampler &s, const RenderParams &p,
+                                   const Camera &cam, float u, float v) {
+  Vec3 dir = primary_ray_dir(cam, u, v);
   float t_near, t_far;
   Vec4 bg = Vec4{p.bg.x, p.bg.y, p.bg.z, 1.0f};
   if (!intersect_unit_box(cam.eye, dir, t_near, t_far)) return bg;
 
-  if (p.mode == RenderMode::Isosurface) {
-    // March looking for a sign change relative to the iso value.
-    float t = t_near;
-    Vec3 prev = cam.eye + dir * t;
-    float prev_v = s.value_at(p, prev) - p.iso_value;
-    t += p.step;
-    while (t < t_far) {
-      Vec3 pos = cam.eye + dir * t;
-      float cur_v = s.value_at(p, pos) - p.iso_value;
-      if (prev_v * cur_v <= 0.0f) {
-        // Linear refinement of the crossing.
-        float denom = (cur_v - prev_v);
-        float frac = fabsf(denom) > 1e-12f ? prev_v / -denom : 0.0f;
-        Vec3 hit = prev + (pos - prev) * frac;
-        Vec3 n = normalize(gradient(s, p, hit));
-        // Two-sided Phong with a head light along the view direction. A warm,
-        // mid-tone material so the surface reads clearly against a light/white
-        // background (a near-white material would disappear).
-        Vec3 l = normalize(cam.eye - hit);
-        float diff = fabsf(dot(n, l));
-        Vec3 base = make_vec3(0.82f, 0.45f, 0.20f);
-        Vec3 col = base * (0.20f + 0.80f * diff);
-        return Vec4{col.x, col.y, col.z, 1.0f};
-      }
-      prev = pos;
-      prev_v = cur_v;
-      t += p.step;
+  float t = t_near;
+  Vec3 prev = cam.eye + dir * t;
+  float prev_v = s.value_at(p, prev) - p.iso_value;
+  t += p.step;
+  while (t < t_far) {
+    Vec3 pos = cam.eye + dir * t;
+    float cur_v = s.value_at(p, pos) - p.iso_value;
+    if (prev_v * cur_v <= 0.0f) {
+      // Linear refinement of the crossing.
+      float denom = (cur_v - prev_v);
+      float frac = fabsf(denom) > 1e-12f ? prev_v / -denom : 0.0f;
+      Vec3 hit = prev + (pos - prev) * frac;
+      Vec3 n = normalize(gradient(s, p, hit));
+      // Two-sided Phong with a head light along the view direction. A warm,
+      // mid-tone material so the surface reads clearly against a light/white
+      // background (a near-white material would disappear).
+      Vec3 l = normalize(cam.eye - hit);
+      float diff = fabsf(dot(n, l));
+      Vec3 base = make_vec3(0.82f, 0.45f, 0.20f);
+      Vec3 col = base * (0.20f + 0.80f * diff);
+      return Vec4{col.x, col.y, col.z, 1.0f};
     }
-    return bg;
+    prev = pos;
+    prev_v = cur_v;
+    t += p.step;
   }
+  return bg;
+}
 
-  // Direct volume rendering: front-to-back emission-absorption compositing.
+/** Direct volume rendering: front-to-back emission-absorption compositing. */
+template <class Sampler>
+MUEYE_HD inline Vec4 trace_ray_dvr(const Sampler &s,
+                                   const Vec4 *MUEYE_RESTRICT lut,
+                                   const RenderParams &p, const Camera &cam,
+                                   float u, float v) {
+  Vec3 dir = primary_ray_dir(cam, u, v);
+  float t_near, t_far;
+  if (!intersect_unit_box(cam.eye, dir, t_near, t_far))
+    return Vec4{p.bg.x, p.bg.y, p.bg.z, 1.0f};
+
   Vec3 accum = make_vec3(0.0f, 0.0f, 0.0f);
   float trans = 1.0f;  // remaining transparency
   for (float t = t_near; t < t_far; t += p.step) {
@@ -304,6 +325,15 @@ MUEYE_HD inline Vec4 trace_ray(const Sampler &s, const Vec4 *MUEYE_RESTRICT lut,
   // Composite over the background.
   Vec3 out = accum + p.bg * trans;
   return Vec4{out.x, out.y, out.z, 1.0f};
+}
+
+/** Runtime-dispatched entry point (CPU backend + single-kernel callers). */
+template <class Sampler>
+MUEYE_HD inline Vec4 trace_ray(const Sampler &s, const Vec4 *MUEYE_RESTRICT lut,
+                               const RenderParams &p, const Camera &cam,
+                               float u, float v) {
+  return p.mode == RenderMode::Isosurface ? trace_ray_iso(s, p, cam, u, v)
+                                          : trace_ray_dvr(s, lut, p, cam, u, v);
 }
 
 }  // namespace mueye

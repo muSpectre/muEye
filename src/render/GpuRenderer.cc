@@ -5,16 +5,16 @@
  *
  * Compiled as CUDA (when MUEYE_ENABLE_CUDA) or HIP (when MUEYE_ENABLE_HIP); the
  * CMake target marks this file with LANGUAGE CUDA/HIP. It reuses the exact
- * ray-march kernel from render_core.hh (whose trace_ray() is __host__ __device__
- * and templated on a volume sampler) and muGrid's portability macros from
- * memory/gpu_runtime.hh — so the GPU image matches the CPU/Metal backends.
+ * ray-march kernel from render_core.hh (whose trace_ray_dvr()/trace_ray_iso()
+ * are __host__ __device__ and templated on a volume sampler) and muGrid's
+ * portability macros from memory/gpu_runtime.hh — so the GPU image matches the
+ * CPU/Metal backends.
  *
  * The volume is uploaded into a hardware 3-D texture and sampled through a
- * TextureSampler: the texture unit performs the trilinear interpolation
- * (replacing 8 global loads + 7 lerps per sample with one filtered fetch) and
- * the read is served by the texture cache, which is far better suited to the
- * 3-D-local, mildly divergent access pattern of ray marching than plain global
- * memory. Clamp addressing reproduces ArraySampler's clamp-to-edge exactly.
+ * TextureSampler (hardware trilinear filtering + texture cache). DVR and
+ * isosurface are launched as separate single-path kernels (see render_core.hh
+ * for why). render_to_gl() writes straight into a GL pixel buffer object shared
+ * with CUDA/HIP, so the frame reaches the screen without a device->host copy.
  *
  * NOTE: this file is only built on a CUDA/HIP toolchain; it is not compiled on
  * the (CPU-only macOS) development machine, nor in CI. Treat changes here as
@@ -31,13 +31,26 @@
 #include "memory/gpu_runtime.hh"
 #include "render/render_core.hh"
 
+// OpenGL entry points for the PBO upload path. GL_GLEXT_PROTOTYPES exposes the
+// GL 1.5+ buffer functions (glGenBuffers/glBindBuffer/...) declared in glext.h;
+// on Linux (the usual CUDA/HIP target) these are exported by libGL. Plus the
+// CUDA/HIP <-> GL graphics-interop API.
+#define GL_GLEXT_PROTOTYPES
+#include <GL/gl.h>
+#include <GL/glext.h>
+#if defined(MUGRID_ENABLE_CUDA)
+#include <cuda_gl_interop.h>
+#elif defined(MUGRID_ENABLE_HIP)
+#include <hip/hip_gl_interop.h>
+#endif
+
 namespace mueye {
 
 // ---------------------------------------------------------------------------
-// Backend-API spelling shim. CUDA and HIP expose an identical texture/array
-// runtime API up to the `cuda`/`hip` prefix, so we paste the prefix onto a
-// common spelling and only differ where a name is not a simple prefixing
-// (make_*Extent / make_*PitchedPtr are wrapped below).
+// Backend-API spelling shim. CUDA and HIP expose an identical texture/array/
+// graphics-interop runtime API up to the `cuda`/`hip` prefix, so we paste the
+// prefix onto a common spelling and only differ where a name is not a simple
+// prefixing (make_*Extent / make_*PitchedPtr are wrapped below).
 // ---------------------------------------------------------------------------
 #if defined(MUGRID_ENABLE_CUDA)
 #define GPU_(name) cuda##name
@@ -61,45 +74,73 @@ inline hipPitchedPtr gpu_make_pitched(void *p, std::size_t pitch,
 
 using gpuTextureObject_t = GPU_(TextureObject_t);
 using gpuArray_t = GPU_(Array_t);
+using gpuGraphicsResource_t = GPU_(GraphicsResource_t);
 
 namespace {
 
 /** Hardware-texture volume sampler. Same value_at() interface as
- *  render_core.hh's ArraySampler, so trace_ray() is shared verbatim. The
- *  texture uses normalized coordinates with linear filtering and clamp
- *  addressing, matching ArraySampler's voxel-centre convention and clamp. */
+ *  render_core.hh's ArraySampler, so the trace_ray_* templates are shared
+ *  verbatim. Normalized coords + linear filtering + clamp addressing match
+ *  ArraySampler's voxel-centre convention and clamp. */
 struct TextureSampler {
   gpuTextureObject_t tex;
 
   MUEYE_HD float value_at(const RenderParams & /*p*/, const Vec3 &uvw) const {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-    // tex3D with normalized coords places texel centres at (i+0.5)/dim — the
-    // same continuous-voxel mapping ArraySampler computes as uvw*dim - 0.5.
     return tex3D<float>(tex, uvw.x, uvw.y, uvw.z);
 #else
-    // Host stub: the texture sampler is only ever invoked from device code.
     (void)uvw;
-    return 0.0f;
+    return 0.0f;  // host stub; the texture sampler is only used on device
 #endif
   }
 };
 
-__global__ void render_kernel(gpuTextureObject_t vol,
-                              const Vec4 *MUEYE_RESTRICT lut, RenderParams p,
-                              Camera cam, unsigned char *MUEYE_RESTRICT out,
-                              int w, int h) {
+MUEYE_HD inline void write_rgba(unsigned char *out, std::size_t idx, Vec4 c) {
+  out[idx + 0] = static_cast<unsigned char>(clampf(c.x, 0.f, 1.f) * 255.f + 0.5f);
+  out[idx + 1] = static_cast<unsigned char>(clampf(c.y, 0.f, 1.f) * 255.f + 0.5f);
+  out[idx + 2] = static_cast<unsigned char>(clampf(c.z, 0.f, 1.f) * 255.f + 0.5f);
+  out[idx + 3] = static_cast<unsigned char>(clampf(c.w, 0.f, 1.f) * 255.f + 0.5f);
+}
+
+// DVR and isosurface are separate kernels so each compiles a single path (see
+// render_core.hh): p.mode is grid-uniform — never divergent — but a combined
+// kernel inflates register/instruction footprint and can cap occupancy.
+__global__ void render_kernel_dvr(gpuTextureObject_t vol,
+                                  const Vec4 *MUEYE_RESTRICT lut, RenderParams p,
+                                  Camera cam, unsigned char *MUEYE_RESTRICT out,
+                                  int w, int h) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
   int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= w || y >= h) return;
   float u = (x + 0.5f) / w;
   float v = (y + 0.5f) / h;
-  TextureSampler s{vol};
-  Vec4 c = trace_ray(s, lut, p, cam, u, v);
-  std::size_t idx = (static_cast<std::size_t>(y) * w + x) * 4;
-  out[idx + 0] = static_cast<unsigned char>(clampf(c.x, 0.f, 1.f) * 255.f + 0.5f);
-  out[idx + 1] = static_cast<unsigned char>(clampf(c.y, 0.f, 1.f) * 255.f + 0.5f);
-  out[idx + 2] = static_cast<unsigned char>(clampf(c.z, 0.f, 1.f) * 255.f + 0.5f);
-  out[idx + 3] = static_cast<unsigned char>(clampf(c.w, 0.f, 1.f) * 255.f + 0.5f);
+  Vec4 c = trace_ray_dvr(TextureSampler{vol}, lut, p, cam, u, v);
+  write_rgba(out, (static_cast<std::size_t>(y) * w + x) * 4, c);
+}
+
+__global__ void render_kernel_iso(gpuTextureObject_t vol, RenderParams p,
+                                  Camera cam, unsigned char *MUEYE_RESTRICT out,
+                                  int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  float u = (x + 0.5f) / w;
+  float v = (y + 0.5f) / h;
+  Vec4 c = trace_ray_iso(TextureSampler{vol}, p, cam, u, v);
+  write_rgba(out, (static_cast<std::size_t>(y) * w + x) * 4, c);
+}
+
+/** Launch the kernel matching p.mode, writing RGBA8 into @p out (device ptr). */
+void launch(gpuTextureObject_t tex, const Vec4 *lut, const RenderParams &p,
+            const Camera &cam, unsigned char *out, int w, int h) {
+  dim3 block(16, 16);
+  dim3 grid((w + 15) / 16, (h + 15) / 16);
+  if (p.mode == RenderMode::Isosurface) {
+    GPU_LAUNCH_KERNEL(render_kernel_iso, grid, block, tex, p, cam, out, w, h);
+  } else {
+    GPU_LAUNCH_KERNEL(render_kernel_dvr, grid, block, tex, lut, p, cam, out, w,
+                      h);
+  }
 }
 
 }  // namespace
@@ -117,6 +158,10 @@ bool GpuRenderer::available() {
 GpuRenderer::GpuRenderer() = default;
 
 GpuRenderer::~GpuRenderer() {
+  if (pbo_res_)
+    GPU_(GraphicsUnregisterResource)(
+        static_cast<gpuGraphicsResource_t>(pbo_res_));
+  if (pbo_) glDeleteBuffers(1, &pbo_);
   if (d_tex_) GPU_(DestroyTextureObject)(static_cast<gpuTextureObject_t>(d_tex_));
   if (d_array_) GPU_(FreeArray)(static_cast<gpuArray_t>(d_array_));
   if (d_lut_) GPU_FREE(d_lut_);
@@ -170,8 +215,8 @@ void GpuRenderer::set_volume(const float *data, int nx, int ny, int nz) {
   GPU_(Memcpy3D)(&copy);
 
   // A texture object over that array: linear filtering + clamp addressing +
-  // normalized coordinates so tex3D matches ArraySampler bit-for-bit up to the
-  // texture unit's fixed-point interpolation weights.
+  // normalized coordinates so tex3D matches ArraySampler up to the texture
+  // unit's fixed-point interpolation weights.
   GPU_(ResourceDesc) res = {};
   res.resType = GPU_(ResourceTypeArray);
   res.res.array.array = array;
@@ -216,14 +261,69 @@ void GpuRenderer::render(const RenderParams &params, const Camera &camera,
     out_bytes_ = bytes;
   }
 
-  dim3 block(16, 16);
-  dim3 grid((w + 15) / 16, (h + 15) / 16);
-  GPU_LAUNCH_KERNEL(render_kernel, grid, block,
-                    static_cast<gpuTextureObject_t>(d_tex_), d_lut_, params,
-                    camera, d_output_, w, h);
+  launch(static_cast<gpuTextureObject_t>(d_tex_), d_lut_, params, camera,
+         d_output_, w, h);
   GPU_DEVICE_SYNCHRONIZE();
 
   GPU_MEMCPY_D2H(fb.rgba.data(), d_output_, bytes);
+}
+
+bool GpuRenderer::render_to_gl(const RenderParams &params, const Camera &camera,
+                               unsigned int gl_tex, int width, int height) {
+  if (width <= 0 || height <= 0 || d_tex_ == 0 || d_lut_ == nullptr ||
+      gl_tex == 0)
+    return false;
+
+  // (Re)create the shared pixel buffer object when the size changes.
+  if (pbo_ == 0 || pbo_w_ != width || pbo_h_ != height) {
+    if (pbo_res_) {
+      GPU_(GraphicsUnregisterResource)(
+          static_cast<gpuGraphicsResource_t>(pbo_res_));
+      pbo_res_ = nullptr;
+    }
+    if (pbo_ == 0) glGenBuffers(1, &pbo_);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER,
+                 static_cast<GLsizeiptr>(width) * height * 4, nullptr,
+                 GL_STREAM_DRAW);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+    gpuGraphicsResource_t res = nullptr;
+    if (GPU_(GraphicsGLRegisterBuffer)(
+            &res, pbo_, GPU_(GraphicsRegisterFlagsWriteDiscard)) !=
+        GPU_(Success)) {
+      // Registration failed (e.g. CUDA/GL not on the same device): fall back to
+      // the host copy path for good.
+      glDeleteBuffers(1, &pbo_);
+      pbo_ = 0;
+      return false;
+    }
+    pbo_res_ = res;
+    pbo_w_ = width;
+    pbo_h_ = height;
+  }
+
+  auto res = static_cast<gpuGraphicsResource_t>(pbo_res_);
+  unsigned char *dev_ptr = nullptr;
+  std::size_t mapped_bytes = 0;
+  GPU_(GraphicsMapResources)(1, &res, 0);
+  GPU_(GraphicsResourceGetMappedPointer)(reinterpret_cast<void **>(&dev_ptr),
+                                         &mapped_bytes, res);
+
+  launch(static_cast<gpuTextureObject_t>(d_tex_), d_lut_, params, camera,
+         dev_ptr, width, height);
+
+  // Unmapping synchronizes the render with subsequent GL use of the buffer.
+  GPU_(GraphicsUnmapResources)(1, &res, 0);
+
+  // Device-to-device copy PBO -> texture (no host round trip).
+  glBindTexture(GL_TEXTURE_2D, gl_tex);
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA,
+                  GL_UNSIGNED_BYTE, nullptr);
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  return true;
 }
 
 }  // namespace mueye

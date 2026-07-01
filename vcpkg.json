@@ -1,0 +1,9 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+  "name": "mueye",
+  "version-string": "0.1.0",
+  "description": "muEye — a real-time ray-tracing viewer for muGrid data. This manifest is only used when configuring with the vcpkg toolchain (e.g. the Windows CI job); native Linux/macOS builds use system NetCDF and ignore it.",
+  "dependencies": [
+    "netcdf-c"
+  ]
+}

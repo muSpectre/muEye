@@ -16,9 +16,10 @@
  * for why). render_to_gl() writes straight into a GL pixel buffer object shared
  * with CUDA/HIP, so the frame reaches the screen without a device->host copy.
  *
- * NOTE: this file is only built on a CUDA/HIP toolchain; it is not compiled on
- * the (CPU-only macOS) development machine, nor in CI. Treat changes here as
- * unverified until run on real hardware.
+ * NOTE: this file is only built on a CUDA/HIP toolchain, not on the (CPU-only
+ * macOS) development machine. CI (.github/workflows/gpu-build.yml) does a
+ * compile + link check of both backends, but nothing here is *run* without a
+ * GPU — treat runtime behaviour as unverified until exercised on real hardware.
  *
  * Part of muEye, a viewer for muGrid data.
  */

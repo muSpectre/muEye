@@ -230,6 +230,11 @@ target_link_libraries(muEye_check PRIVATE
     Threads::Threads
     ${NetCDF_LIBRARIES}
     ${MUEYE_BACKEND_LIBS})
+if(MUEYE_ENABLE_CUDA OR MUEYE_ENABLE_HIP)
+    # GpuRenderer.cc pulls in OpenGL for its PBO interop path, so even the
+    # headless check tool must link GL when a CUDA/HIP backend is compiled in.
+    target_link_libraries(muEye_check PRIVATE OpenGL::GL)
+endif()
 if(OpenMP_CXX_FOUND)
     target_link_libraries(muEye_check PRIVATE OpenMP::OpenMP_CXX)
 endif()

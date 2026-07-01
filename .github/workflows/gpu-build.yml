@@ -1,0 +1,116 @@
+name: GPU build
+
+# Compile + link check for the CUDA and HIP backends, which the main build.yml
+# matrix does not cover (its runners have no GPU toolchain). These jobs do not
+# run the binary — a GPU is only needed to execute, not to build — so they use
+# ordinary GitHub-hosted runners and just verify that the shared GpuRenderer.cc
+# compiles and links against each toolchain.
+#
+# muEye consumes muGrid via add_subdirectory, so each job checks out muGrid
+# alongside it. muGrid itself is built CPU-only here — muEye only needs its
+# host-callable gpu_runtime.hh header for the CUDA/HIP path; the ray-march
+# kernels are muEye's own.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MUGRID_REPO: muSpectre/muGrid
+  MUGRID_REF: main
+
+jobs:
+  cuda:
+    name: cuda (compile check)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout muEye
+        uses: actions/checkout@v5
+        with:
+          path: muEye
+
+      - name: Checkout muGrid (dependency)
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.MUGRID_REPO }}
+          ref: ${{ env.MUGRID_REF }}
+          path: muGrid
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: '12.6.3'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart-dev"]'
+
+      - name: Show nvcc version
+        run: nvcc --version
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qy
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libnetcdf-dev libgl1-mesa-dev xorg-dev
+
+      # No GPU on this runner: compile + link only, never launched. A single
+      # architecture keeps the compile fast (the value is checking the code
+      # builds, not which SM it targets).
+      - name: Configure (CUDA)
+        run: >
+          cmake -S muEye -B muEye/build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DMUEYE_MUGRID_SOURCE_DIR=${{ github.workspace }}/muGrid
+          -DMUEYE_ENABLE_CUDA=ON
+          -DCMAKE_CUDA_ARCHITECTURES=75
+
+      - name: Build offscreen check (compile + link only)
+        run: cmake --build muEye/build --target muEye_check --parallel
+
+  hip:
+    name: hip (compile check)
+    runs-on: ubuntu-24.04
+    container: rocm/dev-ubuntu-24.04:6.2.4
+    timeout-minutes: 60
+    steps:
+      - name: Checkout muEye
+        uses: actions/checkout@v5
+        with:
+          path: muEye
+
+      - name: Checkout muGrid (dependency)
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.MUGRID_REPO }}
+          ref: ${{ env.MUGRID_REF }}
+          path: muGrid
+
+      - name: Install build dependencies
+        run: |
+          apt-get update -qy
+          apt-get install -y --no-install-recommends \
+            cmake ninja-build git ca-certificates \
+            libnetcdf-dev libgl1-mesa-dev xorg-dev
+
+      - name: Show HIP info
+        run: hipcc --version
+
+      # No AMD GPU on this runner: compile + link only, never launched. gfx90a
+      # (MI200) is a representative device target.
+      - name: Configure (HIP)
+        run: >
+          cmake -S muEye -B muEye/build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DMUEYE_MUGRID_SOURCE_DIR=${{ github.workspace }}/muGrid
+          -DMUEYE_ENABLE_HIP=ON
+          -DCMAKE_HIP_ARCHITECTURES=gfx90a
+
+      - name: Build offscreen check (compile + link only)
+        run: cmake --build muEye/build --target muEye_check --parallel

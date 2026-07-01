@@ -26,6 +26,15 @@
 #include <cmath>
 #endif
 
+// Restrict qualifier: promises the read-only volume/LUT pointers do not alias
+// the output, letting the compiler keep loads in registers and (on NVIDIA)
+// route them through the read-only data cache.
+#if defined(_MSC_VER)
+#define MUEYE_RESTRICT __restrict
+#else
+#define MUEYE_RESTRICT __restrict__
+#endif
+
 namespace mueye {
 
 // ---------------------------------------------------------------------------
@@ -111,56 +120,68 @@ struct RenderParams {
 
 // ---------------------------------------------------------------------------
 // Sampling.
+//
+// The volume is reached through a lightweight "sampler" object exposing a
+// single value_at(params, uvw) returning the trilinearly filtered value at box
+// coordinate uvw in [0,1]^3. ArraySampler below does the filtering in software
+// from a contiguous column-major float buffer; it is used by the CPU backend
+// and as the reference in muEye_check. GPU backends substitute a sampler backed
+// by a hardware 3-D texture that exposes the SAME value_at() interface (see
+// GpuRenderer.cc's TextureSampler and the MSL in MetalRenderer.mm), so the
+// gradient() and trace_ray() templates below are shared verbatim across all
+// backends — only the sampler type differs.
 // ---------------------------------------------------------------------------
 
-MUEYE_HD inline float voxel_at(const float *vol, const RenderParams &p, int i,
-                               int j, int k) {
-  i = i < 0 ? 0 : (i >= p.nx ? p.nx - 1 : i);
-  j = j < 0 ? 0 : (j >= p.ny ? p.ny - 1 : j);
-  k = k < 0 ? 0 : (k >= p.nz ? p.nz - 1 : k);
-  return vol[i + p.nx * (j + p.ny * k)];
-}
+/** Software trilinear sampler over a column-major float volume. */
+struct ArraySampler {
+  const float *MUEYE_RESTRICT vol;
 
-/**
- * Trilinear sample. @p uvw is in normalized [0,1]^3 box coordinates.
- */
-MUEYE_HD inline float sample(const float *vol, const RenderParams &p,
-                             const Vec3 &uvw) {
-  // Map box coordinate to a continuous voxel-centre coordinate.
-  float fx = uvw.x * p.nx - 0.5f;
-  float fy = uvw.y * p.ny - 0.5f;
-  float fz = uvw.z * p.nz - 0.5f;
-  int i0 = (int)floorf(fx), j0 = (int)floorf(fy), k0 = (int)floorf(fz);
-  float tx = fx - i0, ty = fy - j0, tz = fz - k0;
+  MUEYE_HD float voxel_at(const RenderParams &p, int i, int j, int k) const {
+    i = i < 0 ? 0 : (i >= p.nx ? p.nx - 1 : i);
+    j = j < 0 ? 0 : (j >= p.ny ? p.ny - 1 : j);
+    k = k < 0 ? 0 : (k >= p.nz ? p.nz - 1 : k);
+    return vol[i + p.nx * (j + p.ny * k)];
+  }
 
-  float c000 = voxel_at(vol, p, i0, j0, k0);
-  float c100 = voxel_at(vol, p, i0 + 1, j0, k0);
-  float c010 = voxel_at(vol, p, i0, j0 + 1, k0);
-  float c110 = voxel_at(vol, p, i0 + 1, j0 + 1, k0);
-  float c001 = voxel_at(vol, p, i0, j0, k0 + 1);
-  float c101 = voxel_at(vol, p, i0 + 1, j0, k0 + 1);
-  float c011 = voxel_at(vol, p, i0, j0 + 1, k0 + 1);
-  float c111 = voxel_at(vol, p, i0 + 1, j0 + 1, k0 + 1);
+  /** Trilinear sample. @p uvw is in normalized [0,1]^3 box coordinates. */
+  MUEYE_HD float value_at(const RenderParams &p, const Vec3 &uvw) const {
+    // Map box coordinate to a continuous voxel-centre coordinate.
+    float fx = uvw.x * p.nx - 0.5f;
+    float fy = uvw.y * p.ny - 0.5f;
+    float fz = uvw.z * p.nz - 0.5f;
+    int i0 = (int)floorf(fx), j0 = (int)floorf(fy), k0 = (int)floorf(fz);
+    float tx = fx - i0, ty = fy - j0, tz = fz - k0;
 
-  float c00 = c000 * (1 - tx) + c100 * tx;
-  float c10 = c010 * (1 - tx) + c110 * tx;
-  float c01 = c001 * (1 - tx) + c101 * tx;
-  float c11 = c011 * (1 - tx) + c111 * tx;
-  float c0 = c00 * (1 - ty) + c10 * ty;
-  float c1 = c01 * (1 - ty) + c11 * ty;
-  return c0 * (1 - tz) + c1 * tz;
-}
+    float c000 = voxel_at(p, i0, j0, k0);
+    float c100 = voxel_at(p, i0 + 1, j0, k0);
+    float c010 = voxel_at(p, i0, j0 + 1, k0);
+    float c110 = voxel_at(p, i0 + 1, j0 + 1, k0);
+    float c001 = voxel_at(p, i0, j0, k0 + 1);
+    float c101 = voxel_at(p, i0 + 1, j0, k0 + 1);
+    float c011 = voxel_at(p, i0, j0 + 1, k0 + 1);
+    float c111 = voxel_at(p, i0 + 1, j0 + 1, k0 + 1);
+
+    float c00 = c000 * (1 - tx) + c100 * tx;
+    float c10 = c010 * (1 - tx) + c110 * tx;
+    float c01 = c001 * (1 - tx) + c101 * tx;
+    float c11 = c011 * (1 - tx) + c111 * tx;
+    float c0 = c00 * (1 - ty) + c10 * ty;
+    float c1 = c01 * (1 - ty) + c11 * ty;
+    return c0 * (1 - tz) + c1 * tz;
+  }
+};
 
 /** Central-difference gradient in box coordinates (for surface shading). */
-MUEYE_HD inline Vec3 gradient(const float *vol, const RenderParams &p,
+template <class Sampler>
+MUEYE_HD inline Vec3 gradient(const Sampler &s, const RenderParams &p,
                               const Vec3 &uvw) {
   float hx = 1.0f / p.nx, hy = 1.0f / p.ny, hz = 1.0f / p.nz;
-  float gx = sample(vol, p, Vec3{uvw.x + hx, uvw.y, uvw.z}) -
-             sample(vol, p, Vec3{uvw.x - hx, uvw.y, uvw.z});
-  float gy = sample(vol, p, Vec3{uvw.x, uvw.y + hy, uvw.z}) -
-             sample(vol, p, Vec3{uvw.x, uvw.y - hy, uvw.z});
-  float gz = sample(vol, p, Vec3{uvw.x, uvw.y, uvw.z + hz}) -
-             sample(vol, p, Vec3{uvw.x, uvw.y, uvw.z - hz});
+  float gx = s.value_at(p, Vec3{uvw.x + hx, uvw.y, uvw.z}) -
+             s.value_at(p, Vec3{uvw.x - hx, uvw.y, uvw.z});
+  float gy = s.value_at(p, Vec3{uvw.x, uvw.y + hy, uvw.z}) -
+             s.value_at(p, Vec3{uvw.x, uvw.y - hy, uvw.z});
+  float gz = s.value_at(p, Vec3{uvw.x, uvw.y, uvw.z + hz}) -
+             s.value_at(p, Vec3{uvw.x, uvw.y, uvw.z - hz});
   return Vec3{gx, gy, gz};
 }
 
@@ -221,7 +242,8 @@ MUEYE_HD inline bool intersect_unit_box(const Vec3 &o, const Vec3 &d,
 // The ray-march kernel. (u, v) are normalized image coordinates in [0,1].
 // ---------------------------------------------------------------------------
 
-MUEYE_HD inline Vec4 trace_ray(const float *vol, const Vec4 *lut,
+template <class Sampler>
+MUEYE_HD inline Vec4 trace_ray(const Sampler &s, const Vec4 *MUEYE_RESTRICT lut,
                                const RenderParams &p, const Camera &cam,
                                float u, float v) {
   // Build the primary ray through pixel (u, v).
@@ -237,17 +259,17 @@ MUEYE_HD inline Vec4 trace_ray(const float *vol, const Vec4 *lut,
     // March looking for a sign change relative to the iso value.
     float t = t_near;
     Vec3 prev = cam.eye + dir * t;
-    float prev_v = sample(vol, p, prev) - p.iso_value;
+    float prev_v = s.value_at(p, prev) - p.iso_value;
     t += p.step;
     while (t < t_far) {
       Vec3 pos = cam.eye + dir * t;
-      float cur_v = sample(vol, p, pos) - p.iso_value;
+      float cur_v = s.value_at(p, pos) - p.iso_value;
       if (prev_v * cur_v <= 0.0f) {
         // Linear refinement of the crossing.
         float denom = (cur_v - prev_v);
         float frac = fabsf(denom) > 1e-12f ? prev_v / -denom : 0.0f;
         Vec3 hit = prev + (pos - prev) * frac;
-        Vec3 n = normalize(gradient(vol, p, hit));
+        Vec3 n = normalize(gradient(s, p, hit));
         // Two-sided Phong with a head light along the view direction. A warm,
         // mid-tone material so the surface reads clearly against a light/white
         // background (a near-white material would disappear).
@@ -269,7 +291,7 @@ MUEYE_HD inline Vec4 trace_ray(const float *vol, const Vec4 *lut,
   float trans = 1.0f;  // remaining transparency
   for (float t = t_near; t < t_far; t += p.step) {
     Vec3 pos = cam.eye + dir * t;
-    float val = sample(vol, p, pos);
+    float val = s.value_at(p, pos);
     float nv = normalize_value(p, val);
     Vec4 c = lut_lookup(lut, p, nv);
     // Opacity correction for the step size, then global density scale.

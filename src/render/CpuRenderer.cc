@@ -28,13 +28,14 @@ void CpuRenderer::render(const RenderParams &params, const Camera &camera,
   if (w <= 0 || h <= 0 || volume_ == nullptr) return;
 
   std::uint8_t *out = fb.rgba.data();
+  const ArraySampler sampler{volume_};
 
   // Parallelise across scanlines.
   parallel_for(h, nb_threads_, [&](int y) {
     for (int x = 0; x < w; ++x) {
       float u = (x + 0.5f) / w;
       float v = (y + 0.5f) / h;
-      Vec4 c = trace_ray(volume_, lut_, params, camera, u, v);
+      Vec4 c = trace_ray(sampler, lut_, params, camera, u, v);
       std::size_t idx = (static_cast<std::size_t>(y) * w + x) * 4;
       out[idx + 0] = static_cast<std::uint8_t>(clampf(c.x, 0.f, 1.f) * 255.f + 0.5f);
       out[idx + 1] = static_cast<std::uint8_t>(clampf(c.y, 0.f, 1.f) * 255.f + 0.5f);

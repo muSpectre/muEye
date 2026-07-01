@@ -84,9 +84,13 @@ present; the Device panel lists them and switches at runtime.
 
 The CPU, Metal and CUDA/HIP backends all call the **same** ray-march algorithm —
 `render_core.hh`'s `__host__ __device__` `trace_ray()` (the Metal shader mirrors it in
-MSL) — so their images match. `tools/offscreen_check.cc` renders with every available
-backend and asserts they agree with the CPU reference (Metal currently matches it
-bit-for-bit).
+MSL) — so their images match. `trace_ray()` is templated on a *volume sampler*: the CPU
+does trilinear filtering in software (`ArraySampler`) while the GPU backends sample a
+hardware 3-D texture (linear filtering + texture cache), which is much faster for the
+3-D-local access pattern of ray marching. `tools/offscreen_check.cc` renders with every
+available backend and asserts they agree with the CPU reference; the texture unit's
+fixed-point interpolation weights differ from software floats only in the last bit or two
+(mean |Δ| ≈ 0.007/255 on Apple GPUs, well under the check's tolerance).
 
 ```bash
 # CUDA build on an NVIDIA machine:

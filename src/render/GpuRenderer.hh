@@ -42,7 +42,13 @@ class GpuRenderer : public Renderer {
   Backend backend() const override;
 
  private:
-  float *d_volume_{nullptr};
+  // The volume lives in a hardware 3-D texture (hardware trilinear filtering +
+  // texture cache). The array backing and the texture object are stored as
+  // opaque handles so this header stays free of CUDA/HIP types (it is included
+  // by plain C++ translation units): d_array_ is a cudaArray_t / hipArray_t and
+  // d_tex_ a cudaTextureObject_t / hipTextureObject_t (an unsigned long long).
+  void *d_array_{nullptr};
+  unsigned long long d_tex_{0};
   Vec4 *d_lut_{nullptr};
   unsigned char *d_output_{nullptr};
   int nx_{0}, ny_{0}, nz_{0};

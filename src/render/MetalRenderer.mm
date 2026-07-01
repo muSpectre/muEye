@@ -68,41 +68,21 @@ struct P {
     int width, height;
 };
 
-static float voxel_at(device const float* vol, constant P& p, int i, int j, int k) {
-    i = clamp(i, 0, p.nx - 1);
-    j = clamp(j, 0, p.ny - 1);
-    k = clamp(k, 0, p.nz - 1);
-    return vol[i + p.nx * (j + p.ny * k)];
+// The volume lives in a 3-D texture; the texture unit does the trilinear
+// filtering. Normalized coords + linear filter + clamp-to-edge reproduce
+// render_core.hh's ArraySampler (voxel centre at (i+0.5)/dim, clamped).
+constexpr sampler volSampler(coord::normalized, address::clamp_to_edge,
+                             filter::linear);
+
+static float sample(texture3d<float> vol, float3 uvw) {
+    return vol.sample(volSampler, uvw).r;
 }
 
-static float sample(device const float* vol, constant P& p, float3 uvw) {
-    float fx = uvw.x * p.nx - 0.5;
-    float fy = uvw.y * p.ny - 0.5;
-    float fz = uvw.z * p.nz - 0.5;
-    int i0 = int(floor(fx)), j0 = int(floor(fy)), k0 = int(floor(fz));
-    float tx = fx - i0, ty = fy - j0, tz = fz - k0;
-    float c000 = voxel_at(vol, p, i0, j0, k0);
-    float c100 = voxel_at(vol, p, i0+1, j0, k0);
-    float c010 = voxel_at(vol, p, i0, j0+1, k0);
-    float c110 = voxel_at(vol, p, i0+1, j0+1, k0);
-    float c001 = voxel_at(vol, p, i0, j0, k0+1);
-    float c101 = voxel_at(vol, p, i0+1, j0, k0+1);
-    float c011 = voxel_at(vol, p, i0, j0+1, k0+1);
-    float c111 = voxel_at(vol, p, i0+1, j0+1, k0+1);
-    float c00 = mix(c000, c100, tx);
-    float c10 = mix(c010, c110, tx);
-    float c01 = mix(c001, c101, tx);
-    float c11 = mix(c011, c111, tx);
-    float c0 = mix(c00, c10, ty);
-    float c1 = mix(c01, c11, ty);
-    return mix(c0, c1, tz);
-}
-
-static float3 gradient(device const float* vol, constant P& p, float3 uvw) {
+static float3 gradient(texture3d<float> vol, constant P& p, float3 uvw) {
     float hx = 1.0/p.nx, hy = 1.0/p.ny, hz = 1.0/p.nz;
-    float gx = sample(vol,p,float3(uvw.x+hx,uvw.y,uvw.z)) - sample(vol,p,float3(uvw.x-hx,uvw.y,uvw.z));
-    float gy = sample(vol,p,float3(uvw.x,uvw.y+hy,uvw.z)) - sample(vol,p,float3(uvw.x,uvw.y-hy,uvw.z));
-    float gz = sample(vol,p,float3(uvw.x,uvw.y,uvw.z+hz)) - sample(vol,p,float3(uvw.x,uvw.y,uvw.z-hz));
+    float gx = sample(vol,float3(uvw.x+hx,uvw.y,uvw.z)) - sample(vol,float3(uvw.x-hx,uvw.y,uvw.z));
+    float gy = sample(vol,float3(uvw.x,uvw.y+hy,uvw.z)) - sample(vol,float3(uvw.x,uvw.y-hy,uvw.z));
+    float gz = sample(vol,float3(uvw.x,uvw.y,uvw.z+hz)) - sample(vol,float3(uvw.x,uvw.y,uvw.z-hz));
     return float3(gx, gy, gz);
 }
 
@@ -133,7 +113,7 @@ static bool intersect_unit_box(float3 o, float3 d, thread float& t_near, thread 
     return t_far > t_near;
 }
 
-kernel void raymarch(device const float*  vol [[buffer(0)]],
+kernel void raymarch(texture3d<float>     vol [[texture(0)]],
                      device const float4* lut [[buffer(1)]],
                      constant P&          p   [[buffer(2)]],
                      device uchar4*       out [[buffer(3)]],
@@ -160,12 +140,12 @@ kernel void raymarch(device const float*  vol [[buffer(0)]],
             // Isosurface.
             float t = t_near;
             float3 prev = eye + dir*t;
-            float prev_v = sample(vol, p, prev) - p.iso_value;
+            float prev_v = sample(vol, prev) - p.iso_value;
             t += p.step;
             bool hit = false;
             while (t < t_far) {
                 float3 pos = eye + dir*t;
-                float cur_v = sample(vol, p, pos) - p.iso_value;
+                float cur_v = sample(vol, pos) - p.iso_value;
                 if (prev_v * cur_v <= 0.0) {
                     float denom = cur_v - prev_v;
                     float frac = fabs(denom) > 1e-12 ? prev_v / -denom : 0.0;
@@ -187,7 +167,7 @@ kernel void raymarch(device const float*  vol [[buffer(0)]],
             float trans = 1.0;
             for (float t = t_near; t < t_far; t += p.step) {
                 float3 pos = eye + dir*t;
-                float val = sample(vol, p, pos);
+                float val = sample(vol, pos);
                 float nv = normalize_value(p, val);
                 float f = nv * (p.lut_size - 1);
                 int i0 = clamp(int(f), 0, p.lut_size - 1);
@@ -216,7 +196,7 @@ struct MetalRenderer::Impl {
   id<MTLCommandQueue> queue = nil;
   id<MTLComputePipelineState> pipeline = nil;
 
-  id<MTLBuffer> volume = nil;
+  id<MTLTexture> volume = nil;
   id<MTLBuffer> lut = nil;
   id<MTLBuffer> output = nil;
   int out_w = 0, out_h = 0;
@@ -270,10 +250,30 @@ const char *MetalRenderer::name() const { return "Metal (GPU)"; }
 void MetalRenderer::set_volume(const float *data, int nx, int ny, int nz) {
   if (!ok() || data == nullptr) return;
   @autoreleasepool {
-    std::size_t bytes = static_cast<std::size_t>(nx) * ny * nz * sizeof(float);
-    impl_->volume = [impl_->device newBufferWithBytes:data
-                                               length:bytes
-                                              options:MTLResourceStorageModeShared];
+    // A 3-D R32Float texture so the shader gets hardware trilinear filtering.
+    // (Apple-family GPUs support linear filtering of 32-bit float textures.)
+    MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+    desc.textureType = MTLTextureType3D;
+    desc.pixelFormat = MTLPixelFormatR32Float;
+    desc.width = static_cast<NSUInteger>(nx);
+    desc.height = static_cast<NSUInteger>(ny);
+    desc.depth = static_cast<NSUInteger>(nz);
+    desc.usage = MTLTextureUsageShaderRead;
+    desc.storageMode = MTLStorageModeShared;
+    impl_->volume = [impl_->device newTextureWithDescriptor:desc];
+
+    // Volume is column-major (idx = i + nx*(j + ny*k)), i.e. x fastest, then y
+    // rows, then z slices — matching the texture's (width=x, height=y, depth=z)
+    // row/image strides.
+    MTLRegion region = MTLRegionMake3D(0, 0, 0, static_cast<NSUInteger>(nx),
+                                       static_cast<NSUInteger>(ny),
+                                       static_cast<NSUInteger>(nz));
+    [impl_->volume replaceRegion:region
+                     mipmapLevel:0
+                           slice:0
+                       withBytes:data
+                     bytesPerRow:static_cast<NSUInteger>(nx) * sizeof(float)
+                   bytesPerImage:static_cast<NSUInteger>(nx) * ny * sizeof(float)];
     impl_->nx = nx;
     impl_->ny = ny;
     impl_->nz = nz;
@@ -326,7 +326,7 @@ void MetalRenderer::render(const RenderParams &params, const Camera &camera,
     id<MTLCommandBuffer> cmd = [impl_->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setComputePipelineState:impl_->pipeline];
-    [enc setBuffer:impl_->volume offset:0 atIndex:0];
+    [enc setTexture:impl_->volume atIndex:0];
     [enc setBuffer:impl_->lut offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(GpuParams) atIndex:2];
     [enc setBuffer:impl_->output offset:0 atIndex:3];

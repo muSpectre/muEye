@@ -67,7 +67,7 @@ jobs:
         run: >
           cmake -S muEye -B muEye/build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
-          -DMUEYE_MUGRID_SOURCE_DIR=${{ github.workspace }}/muGrid
+          -DMUEYE_MUGRID_SOURCE_DIR=$GITHUB_WORKSPACE/muGrid
           -DMUEYE_ENABLE_CUDA=ON
           -DCMAKE_CUDA_ARCHITECTURES=75
 
@@ -108,7 +108,7 @@ jobs:
         run: >
           cmake -S muEye -B muEye/build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
-          -DMUEYE_MUGRID_SOURCE_DIR=${{ github.workspace }}/muGrid
+          -DMUEYE_MUGRID_SOURCE_DIR=$GITHUB_WORKSPACE/muGrid
           -DMUEYE_ENABLE_HIP=ON
           -DCMAKE_HIP_ARCHITECTURES=gfx90a
 

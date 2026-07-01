@@ -158,15 +158,21 @@ endif()
 
 if(MUEYE_ENABLE_CUDA)
     list(APPEND MUEYE_RENDER_SOURCES src/render/GpuRenderer.cc)
+    # MUGRID_ENABLE_CUDA switches muGrid's gpu_runtime.hh into its CUDA path,
+    # which pulls in <cuda_runtime.h>. Scope it to the nvcc-compiled source
+    # ONLY — not the whole target — or host TUs that transitively include muGrid
+    # headers (e.g. offscreen_check.cc via file_io_netcdf.hh) would try to
+    # include it under a plain C++ compiler and fail.
     set_source_files_properties(src/render/GpuRenderer.cc PROPERTIES
-        LANGUAGE CUDA)
-    # MUGRID_ENABLE_CUDA switches muGrid's gpu_runtime.hh into its CUDA path.
-    list(APPEND MUEYE_BACKEND_DEFS MUEYE_ENABLE_CUDA MUGRID_ENABLE_CUDA)
+        LANGUAGE CUDA
+        COMPILE_DEFINITIONS MUGRID_ENABLE_CUDA)
+    list(APPEND MUEYE_BACKEND_DEFS MUEYE_ENABLE_CUDA)
 elseif(MUEYE_ENABLE_HIP)
     list(APPEND MUEYE_RENDER_SOURCES src/render/GpuRenderer.cc)
     set_source_files_properties(src/render/GpuRenderer.cc PROPERTIES
-        LANGUAGE HIP)
-    list(APPEND MUEYE_BACKEND_DEFS MUEYE_ENABLE_HIP MUGRID_ENABLE_HIP)
+        LANGUAGE HIP
+        COMPILE_DEFINITIONS MUGRID_ENABLE_HIP)
+    list(APPEND MUEYE_BACKEND_DEFS MUEYE_ENABLE_HIP)
 endif()
 
 # ---------------------------------------------------------------------------

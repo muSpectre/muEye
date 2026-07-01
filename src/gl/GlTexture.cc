@@ -24,6 +24,13 @@
 #include <GL/gl.h>
 #endif
 
+// Windows' <GL/gl.h> is frozen at OpenGL 1.1, which predates GL_CLAMP_TO_EDGE
+// (GL 1.2). The enum is universally supported at runtime — only the header
+// lacks it — so define it if missing.
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE 0x812F
+#endif
+
 namespace mueye {
 
 GlTexture::~GlTexture() {

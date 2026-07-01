@@ -77,6 +77,26 @@ using gpuTextureObject_t = GPU_(TextureObject_t);
 using gpuArray_t = GPU_(Array_t);
 using gpuGraphicsResource_t = GPU_(GraphicsResource_t);
 
+// The texture object is stored backend-neutrally as an unsigned long long in the
+// header (which must not name CUDA/HIP types). cudaTextureObject_t is already an
+// integer handle, but hipTextureObject_t is a pointer — so pack/unpack it with
+// the cast each backend actually permits (static for CUDA's integer, reinterpret
+// for HIP's pointer).
+inline unsigned long long tex_to_handle(gpuTextureObject_t t) {
+#if defined(MUGRID_ENABLE_CUDA)
+  return static_cast<unsigned long long>(t);
+#else
+  return reinterpret_cast<unsigned long long>(t);
+#endif
+}
+inline gpuTextureObject_t handle_to_tex(unsigned long long h) {
+#if defined(MUGRID_ENABLE_CUDA)
+  return static_cast<gpuTextureObject_t>(h);
+#else
+  return reinterpret_cast<gpuTextureObject_t>(h);
+#endif
+}
+
 namespace {
 
 /** Hardware-texture volume sampler. Same value_at() interface as
@@ -163,7 +183,7 @@ GpuRenderer::~GpuRenderer() {
     GPU_(GraphicsUnregisterResource)(
         static_cast<gpuGraphicsResource_t>(pbo_res_));
   if (pbo_) glDeleteBuffers(1, &pbo_);
-  if (d_tex_) GPU_(DestroyTextureObject)(static_cast<gpuTextureObject_t>(d_tex_));
+  if (d_tex_) GPU_(DestroyTextureObject)(handle_to_tex(d_tex_));
   if (d_array_) GPU_(FreeArray)(static_cast<gpuArray_t>(d_array_));
   if (d_lut_) GPU_FREE(d_lut_);
   if (d_output_) GPU_FREE(d_output_);
@@ -190,7 +210,7 @@ void GpuRenderer::set_volume(const float *data, int nx, int ny, int nz) {
 
   // Release any previous texture + backing array.
   if (d_tex_) {
-    GPU_(DestroyTextureObject)(static_cast<gpuTextureObject_t>(d_tex_));
+    GPU_(DestroyTextureObject)(handle_to_tex(d_tex_));
     d_tex_ = 0;
   }
   if (d_array_) {
@@ -204,7 +224,9 @@ void GpuRenderer::set_volume(const float *data, int nx, int ny, int nz) {
   // Allocate a float 3-D array (extent is in elements) and copy the volume in.
   GPU_(ChannelFormatDesc) channel = GPU_(CreateChannelDesc)<float>();
   gpuArray_t array = nullptr;
-  GPU_(Malloc3DArray)(&array, &channel, gpu_make_extent(nx, ny, nz));
+  // The trailing flags arg is required by HIP's hipMalloc3DArray (CUDA defaults
+  // it to 0); pass 0 explicitly so the call compiles under both.
+  GPU_(Malloc3DArray)(&array, &channel, gpu_make_extent(nx, ny, nz), 0);
 
   GPU_(Memcpy3DParms) copy = {};
   copy.srcPtr = gpu_make_pitched(const_cast<float *>(data),
@@ -234,7 +256,7 @@ void GpuRenderer::set_volume(const float *data, int nx, int ny, int nz) {
   GPU_(CreateTextureObject)(&tex, &res, &tex_desc, nullptr);
 
   d_array_ = array;
-  d_tex_ = tex;
+  d_tex_ = tex_to_handle(tex);
 }
 
 void GpuRenderer::set_transfer_function(const Vec4 *lut, int n) {
@@ -262,7 +284,7 @@ void GpuRenderer::render(const RenderParams &params, const Camera &camera,
     out_bytes_ = bytes;
   }
 
-  launch(static_cast<gpuTextureObject_t>(d_tex_), d_lut_, params, camera,
+  launch(handle_to_tex(d_tex_), d_lut_, params, camera,
          d_output_, w, h);
   GPU_DEVICE_SYNCHRONIZE();
 
@@ -311,7 +333,7 @@ bool GpuRenderer::render_to_gl(const RenderParams &params, const Camera &camera,
   GPU_(GraphicsResourceGetMappedPointer)(reinterpret_cast<void **>(&dev_ptr),
                                          &mapped_bytes, res);
 
-  launch(static_cast<gpuTextureObject_t>(d_tex_), d_lut_, params, camera,
+  launch(handle_to_tex(d_tex_), d_lut_, params, camera,
          dev_ptr, width, height);
 
   // Unmapping synchronizes the render with subsequent GL use of the buffer.

@@ -35,6 +35,7 @@ struct GpuParams {
   float tan_half_fov;
   float aspect;
   int nx, ny, nz;
+  float box_x, box_y, box_z;  // world-space extents of the volume box [0,box]
   float step;
   float data_min, data_max;
   int lut_size;
@@ -58,6 +59,7 @@ struct P {
     float tan_half_fov;
     float aspect;
     int nx, ny, nz;
+    float box_x, box_y, box_z;
     float step;
     float data_min, data_max;
     int lut_size;
@@ -92,16 +94,16 @@ static float normalize_value(constant P& p, float v) {
     return clamp((v - p.data_min) / range, 0.0, 1.0);
 }
 
-static bool intersect_unit_box(float3 o, float3 d, thread float& t_near, thread float& t_far) {
+static bool intersect_box(float3 o, float3 d, float3 box, thread float& t_near, thread float& t_far) {
     float tmin = -1e30, tmax = 1e30;
     for (int axis = 0; axis < 3; ++axis) {
-        float oa = o[axis], da = d[axis];
+        float oa = o[axis], da = d[axis], hi = box[axis];
         if (fabs(da) < 1e-8) {
-            if (oa < 0.0 || oa > 1.0) return false;
+            if (oa < 0.0 || oa > hi) return false;
         } else {
             float inv = 1.0 / da;
             float t1 = (0.0 - oa) * inv;
-            float t2 = (1.0 - oa) * inv;
+            float t2 = (hi - oa) * inv;
             if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
             tmin = max(tmin, t1);
             tmax = min(tmax, t2);
@@ -148,12 +150,14 @@ kernel void raymarch_dvr(texture3d<float>     vol [[texture(0)]],
 
     float3 col = bg;
     float t_near, t_far;
-    if (intersect_unit_box(eye, dir, t_near, t_far)) {
+    float3 box = float3(p.box_x, p.box_y, p.box_z);
+    float3 inv_box = 1.0 / box;
+    if (intersect_box(eye, dir, box, t_near, t_far)) {
         float3 accum = float3(0.0);
         float trans = 1.0;
         for (float t = t_near; t < t_far; t += p.step) {
             float3 pos = eye + dir*t;
-            float val = sample(vol, pos);
+            float val = sample(vol, pos * inv_box);
             float nv = normalize_value(p, val);
             float f = nv * (p.lut_size - 1);
             int i0 = clamp(int(f), 0, p.lut_size - 1);
@@ -183,19 +187,21 @@ kernel void raymarch_iso(texture3d<float>     vol [[texture(0)]],
 
     float3 col = bg;
     float t_near, t_far;
-    if (intersect_unit_box(eye, dir, t_near, t_far)) {
+    float3 box = float3(p.box_x, p.box_y, p.box_z);
+    float3 inv_box = 1.0 / box;
+    if (intersect_box(eye, dir, box, t_near, t_far)) {
         float t = t_near;
         float3 prev = eye + dir*t;
-        float prev_v = sample(vol, prev) - p.iso_value;
+        float prev_v = sample(vol, prev * inv_box) - p.iso_value;
         t += p.step;
         while (t < t_far) {
             float3 pos = eye + dir*t;
-            float cur_v = sample(vol, pos) - p.iso_value;
+            float cur_v = sample(vol, pos * inv_box) - p.iso_value;
             if (prev_v * cur_v <= 0.0) {
                 float denom = cur_v - prev_v;
                 float frac = fabs(denom) > 1e-12 ? prev_v / -denom : 0.0;
                 float3 hitp = prev + (pos - prev)*frac;
-                float3 nrm = normalize(gradient(vol, p, hitp));
+                float3 nrm = normalize(gradient(vol, p, hitp * inv_box));
                 float3 l = normalize(eye - hitp);
                 float diff = fabs(dot(nrm, l));
                 float3 base = float3(0.82, 0.45, 0.20);
@@ -343,6 +349,7 @@ void MetalRenderer::render(const RenderParams &params, const Camera &camera,
     p.tan_half_fov = camera.tan_half_fov;
     p.aspect = camera.aspect;
     p.nx = params.nx; p.ny = params.ny; p.nz = params.nz;
+    p.box_x = params.box.x; p.box_y = params.box.y; p.box_z = params.box.z;
     p.step = params.step;
     p.data_min = params.data_min; p.data_max = params.data_max;
     p.lut_size = params.lut_size;

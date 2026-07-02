@@ -101,14 +101,18 @@ struct Camera {
 enum class RenderMode : int { DVR = 0, Isosurface = 1 };
 
 /**
- * Everything the ray-march kernel needs besides the raw buffers. The volume is
- * assumed to live in the axis-aligned box [0,1]^3 in world space; voxel (i,j,k)
- * sits at the centre of its cell. Data is sampled from a contiguous float buffer
- * in column-major (muGrid) order: index = i + nx*(j + ny*k).
+ * Everything the ray-march kernel needs besides the raw buffers. The volume
+ * lives in the axis-aligned box [0,box.x] x [0,box.y] x [0,box.z] in world
+ * space; voxel (i,j,k) sits at the centre of its cell. `box` is the grid shape
+ * normalized so the longest axis is 1 (a cubic grid gives [0,1]^3, unchanged;
+ * a 2D grid with nz==1 gives a thin box of z-extent 1/max(nx,ny) — a plane).
+ * Data is sampled from a contiguous float buffer in column-major (muGrid)
+ * order: index = i + nx*(j + ny*k).
  */
 struct RenderParams {
   int nx, ny, nz;        //!< grid dimensions
-  float step;            //!< ray-march step length in world units (box is unit-size)
+  Vec3 box;              //!< world-space extents of the volume box [0,box]
+  float step;            //!< ray-march step length in world units
   float data_min;        //!< value mapped to LUT entry 0 / iso slider minimum
   float data_max;        //!< value mapped to LUT entry (lut_size-1) / iso maximum
   int lut_size;          //!< number of RGBA entries in the transfer-function LUT
@@ -209,20 +213,20 @@ MUEYE_HD inline Vec4 lut_lookup(const Vec4 *lut, const RenderParams &p,
 // Ray / box intersection.
 // ---------------------------------------------------------------------------
 
-/** Intersect a ray with the unit box [0,1]^3. Returns false if missed. */
-MUEYE_HD inline bool intersect_unit_box(const Vec3 &o, const Vec3 &d,
-                                        float &t_near, float &t_far) {
+/** Intersect a ray with the axis-aligned box [0,box]. Returns false if missed. */
+MUEYE_HD inline bool intersect_box(const Vec3 &o, const Vec3 &d, const Vec3 &box,
+                                   float &t_near, float &t_far) {
   float tmin = -1e30f, tmax = 1e30f;
-  // x
   for (int axis = 0; axis < 3; ++axis) {
     float oa = axis == 0 ? o.x : (axis == 1 ? o.y : o.z);
     float da = axis == 0 ? d.x : (axis == 1 ? d.y : d.z);
+    float hi = axis == 0 ? box.x : (axis == 1 ? box.y : box.z);
     if (fabsf(da) < 1e-8f) {
-      if (oa < 0.0f || oa > 1.0f) return false;
+      if (oa < 0.0f || oa > hi) return false;
     } else {
       float inv = 1.0f / da;
       float t1 = (0.0f - oa) * inv;
-      float t2 = (1.0f - oa) * inv;
+      float t2 = (hi - oa) * inv;
       if (t1 > t2) {
         float tmp = t1;
         t1 = t2;
@@ -266,21 +270,24 @@ MUEYE_HD inline Vec4 trace_ray_iso(const Sampler &s, const RenderParams &p,
   Vec3 dir = primary_ray_dir(cam, u, v);
   float t_near, t_far;
   Vec4 bg = Vec4{p.bg.x, p.bg.y, p.bg.z, 1.0f};
-  if (!intersect_unit_box(cam.eye, dir, t_near, t_far)) return bg;
+  if (!intersect_box(cam.eye, dir, p.box, t_near, t_far)) return bg;
+
+  // Map world position to normalized [0,1]^3 box coordinate for sampling.
+  Vec3 inv_box = make_vec3(1.0f / p.box.x, 1.0f / p.box.y, 1.0f / p.box.z);
 
   float t = t_near;
   Vec3 prev = cam.eye + dir * t;
-  float prev_v = s.value_at(p, prev) - p.iso_value;
+  float prev_v = s.value_at(p, prev * inv_box) - p.iso_value;
   t += p.step;
   while (t < t_far) {
     Vec3 pos = cam.eye + dir * t;
-    float cur_v = s.value_at(p, pos) - p.iso_value;
+    float cur_v = s.value_at(p, pos * inv_box) - p.iso_value;
     if (prev_v * cur_v <= 0.0f) {
       // Linear refinement of the crossing.
       float denom = (cur_v - prev_v);
       float frac = fabsf(denom) > 1e-12f ? prev_v / -denom : 0.0f;
       Vec3 hit = prev + (pos - prev) * frac;
-      Vec3 n = normalize(gradient(s, p, hit));
+      Vec3 n = normalize(gradient(s, p, hit * inv_box));
       // Two-sided Phong with a head light along the view direction. A warm,
       // mid-tone material so the surface reads clearly against a light/white
       // background (a near-white material would disappear).
@@ -305,14 +312,17 @@ MUEYE_HD inline Vec4 trace_ray_dvr(const Sampler &s,
                                    float u, float v) {
   Vec3 dir = primary_ray_dir(cam, u, v);
   float t_near, t_far;
-  if (!intersect_unit_box(cam.eye, dir, t_near, t_far))
+  if (!intersect_box(cam.eye, dir, p.box, t_near, t_far))
     return Vec4{p.bg.x, p.bg.y, p.bg.z, 1.0f};
+
+  // Map world position to normalized [0,1]^3 box coordinate for sampling.
+  Vec3 inv_box = make_vec3(1.0f / p.box.x, 1.0f / p.box.y, 1.0f / p.box.z);
 
   Vec3 accum = make_vec3(0.0f, 0.0f, 0.0f);
   float trans = 1.0f;  // remaining transparency
   for (float t = t_near; t < t_far; t += p.step) {
     Vec3 pos = cam.eye + dir * t;
-    float val = s.value_at(p, pos);
+    float val = s.value_at(p, pos * inv_box);
     float nv = normalize_value(p, val);
     Vec4 c = lut_lookup(lut, p, nv);
     // Opacity correction for the step size, then global density scale.

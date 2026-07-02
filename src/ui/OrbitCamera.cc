@@ -21,6 +21,11 @@ void OrbitCamera::reset() {
   fov_y_deg = 45.0f;
 }
 
+void OrbitCamera::frame_box(const Vec3 &box) {
+  reset();
+  target_ = box * 0.5f;  // centre of the [0,box] volume box
+}
+
 void OrbitCamera::orbit(float dyaw, float dpitch) {
   yaw_ += dyaw;
   pitch_ += dpitch;

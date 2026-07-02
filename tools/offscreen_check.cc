@@ -3,12 +3,14 @@
  *
  * @brief  Headless end-to-end verification of the muEye data + render pipeline.
  *
- * Writes a demo muGrid NetCDF file (a Gaussian blob, two frames) using muGrid's
- * C++ API, reads it back through muEye's VolumeLoader, scalarizes it, ray-traces
- * a frame with the CPU renderer, and writes the result to a PPM image. Prints
- * statistics so the pipeline can be validated without a display or Python.
+ * Writes demo muGrid NetCDF files (a 3D Gaussian/cube blob and a 2D disk) using
+ * muGrid's C++ API, reads them back through muEye's VolumeLoader, scalarizes,
+ * ray-traces a frame with the CPU renderer, and cross-checks every other
+ * compiled-in backend against the CPU reference. Prints statistics so the whole
+ * pipeline can be validated without a display or Python.
  *
- * This exercises exactly the code paths the GUI uses, minus ImGui/OpenGL.
+ * This exercises exactly the code paths the GUI uses, minus ImGui/OpenGL — for
+ * both 3D volumes and 2D fields (which render on a plane).
  *
  * Part of muEye, a viewer for muGrid data.
  */
@@ -63,6 +65,26 @@ void write_demo(const std::string &path, int n) {
   std::printf("wrote %s (%d^3, field 'phi' cube, 2 frames)\n", path.c_str(), n);
 }
 
+// A 2D grid (no nz dimension): a filled disk of radius 0.25, value 1 inside.
+void write_demo_2d(const std::string &path, int n) {
+  muGrid::GlobalFieldCollection fc(muGrid::DynGridIndex{n, n});
+  muGrid::Field &phi = fc.register_real_field("phi", 1);
+  double *d = static_cast<double *>(phi.get_void_data_ptr());
+
+  muGrid::FileIONetCDF file(path, muGrid::FileIOBase::OpenMode::Overwrite);
+  file.register_field_collection(fc);
+
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < n; ++i) {
+      double x = (i + 0.5) / n - 0.5, y = (j + 0.5) / n - 0.5;
+      d[i + n * j] = std::sqrt(x * x + y * y) <= 0.25 ? 1.0 : 0.0;
+    }
+  file.append_frame().write();
+  file.close();
+  std::printf("wrote %s (%d^2 2D, field 'phi' disk, 1 frame)\n", path.c_str(),
+              n);
+}
+
 bool write_ppm(const std::string &path, const mueye::Framebuffer &fb) {
   std::FILE *f = std::fopen(path.c_str(), "wb");
   if (!f) return false;
@@ -78,36 +100,36 @@ bool write_ppm(const std::string &path, const mueye::Framebuffer &fb) {
   return true;
 }
 
-}  // namespace
+std::size_t count_nonbg(const mueye::Framebuffer &fb) {
+  std::size_t n = 0;
+  std::uint8_t bgr = static_cast<std::uint8_t>(0.05f * 255 + 0.5f);
+  for (int i = 0; i < fb.width * fb.height; ++i)
+    if (std::abs(int(fb.rgba[i * 4]) - int(bgr)) > 6 ||
+        fb.rgba[i * 4 + 1] > 16 || fb.rgba[i * 4 + 2] > 24)
+      ++n;
+  return n;
+}
 
-int main(int argc, char **argv) {
-  const std::string path = argc > 1 ? argv[1] : "demo.nc";
-  const int n = argc > 2 ? std::atoi(argv[2]) : 64;
+/**
+ * Introspect @p path, load field 0, render a CPU DVR + isosurface frame, and
+ * cross-check every other available backend against the CPU reference.
+ * @returns 0 on success, non-zero on any failure.
+ */
+int check_file(const std::string &path, const char *ppm_out) {
+  std::printf("\n=== checking %s ===\n", path.c_str());
 
-  // 1. Write a demo file with muGrid's C++ API.
-  try {
-    write_demo(path, n);
-  } catch (const std::exception &e) {
-    std::fprintf(stderr, "write_demo failed: %s\n", e.what());
-    return 1;
-  }
-
-  // 2. Introspect it back through muEye's loader.
   mueye::VolumeLoader loader;
   mueye::FileMeta meta = loader.open(path);
   if (!meta.valid) {
     std::fprintf(stderr, "introspection failed: %s\n", meta.error.c_str());
     return 1;
   }
-  std::printf("introspected: %d x %d x %d, %d frame(s), %zu field(s)\n", meta.nx,
-              meta.ny, meta.nz, meta.nb_frames, meta.fields.size());
-  for (auto &fi : meta.fields)
-    std::printf("  field '%s'  components=%d  sub_pts=%d\n", fi.name.c_str(),
-                fi.nb_components, fi.nb_sub_pts);
-
+  std::printf("introspected: %d x %d x %d (spatial_dim=%d), %d frame(s), "
+              "%zu field(s)\n",
+              meta.nx, meta.ny, meta.nz, meta.spatial_dim, meta.nb_frames,
+              meta.fields.size());
   if (meta.fields.empty()) return 1;
 
-  // 3. Load frame 0 and scalarize.
   mueye::Volume vol;
   std::string err = loader.load(path, meta, meta.fields[0], 0,
                                 mueye::Scalarize::Component, 0, vol);
@@ -117,28 +139,30 @@ int main(int argc, char **argv) {
   }
   std::printf("volume loaded: %dx%dx%d range [%.5f, %.5f]\n", vol.nx, vol.ny,
               vol.nz, vol.vmin, vol.vmax);
-
-  // Expect a solid cube: min ~0, max ~1.
   if (!(vol.vmax > 0.5f && vol.vmin < 0.5f)) {
-    std::fprintf(stderr, "unexpected value range; cube not recovered?\n");
+    std::fprintf(stderr, "unexpected value range; shape not recovered?\n");
     return 1;
   }
 
-  // 4. Set up shared render parameters.
   mueye::TransferFunction tf;
   tf.set_colormap(mueye::Colormap::Viridis);
   tf.set_opacity_scale(1.0f);
 
+  // Frame the box centre the same way App does (planar/non-cubic aware).
+  int md = vol.nx > vol.ny ? vol.nx : vol.ny;
+  if (vol.nz > md) md = vol.nz;
+  if (md < 1) md = 1;
+  float f = 1.0f / static_cast<float>(md);
   mueye::OrbitCamera cam;
+  cam.frame_box(mueye::Vec3{vol.nx * f, vol.ny * f, vol.nz * f});
   const mueye::Camera camv = cam.to_camera(1.0f);
 
   mueye::RenderParams p;
   p.nx = vol.nx;
   p.ny = vol.ny;
   p.nz = vol.nz;
-  int md = vol.nx > vol.ny ? vol.nx : vol.ny;
-  if (vol.nz > md) md = vol.nz;
-  p.step = 0.5f / md;
+  p.box = mueye::Vec3{vol.nx * f, vol.ny * f, vol.nz * f};
+  p.step = 0.5f * f;
   p.data_min = vol.vmin;
   p.data_max = vol.vmax;
   p.lut_size = tf.size();
@@ -154,17 +178,8 @@ int main(int argc, char **argv) {
     r.set_transfer_function(tf.data(), tf.size());
     r.render(p, camv, fb);
   };
-  auto count_nonbg = [](const mueye::Framebuffer &fb) {
-    std::size_t n = 0;
-    std::uint8_t bgr = static_cast<std::uint8_t>(0.05f * 255 + 0.5f);
-    for (int i = 0; i < fb.width * fb.height; ++i)
-      if (std::abs(int(fb.rgba[i * 4]) - int(bgr)) > 6 ||
-          fb.rgba[i * 4 + 1] > 16 || fb.rgba[i * 4 + 2] > 24)
-        ++n;
-    return n;
-  };
 
-  // 5. CPU reference render (DVR + isosurface).
+  // CPU reference render (DVR + isosurface).
   mueye::CpuRenderer cpu;
   mueye::Framebuffer fb_cpu;
   fb_cpu.resize(256, 256);
@@ -173,7 +188,8 @@ int main(int argc, char **argv) {
   double frac = double(nonbg) / (fb_cpu.width * fb_cpu.height);
   std::printf("CPU DVR 256x256: %zu non-background px (%.1f%%)\n", nonbg,
               100.0 * frac);
-  if (write_ppm("offscreen.ppm", fb_cpu)) std::printf("wrote offscreen.ppm\n");
+  if (ppm_out && write_ppm(ppm_out, fb_cpu))
+    std::printf("wrote %s\n", ppm_out);
   if (frac < 0.02) {
     std::fprintf(stderr, "render produced almost nothing; check pipeline.\n");
     return 1;
@@ -187,7 +203,6 @@ int main(int argc, char **argv) {
   // Re-render CPU DVR as the comparison reference.
   render_with(cpu, fb_cpu, mueye::RenderMode::DVR);
 
-  // 6. Cross-check every other available backend against the CPU image.
   int mismatches = 0;
   for (const mueye::BackendInfo &bi : mueye::enumerate_backends()) {
     if (bi.backend == mueye::Backend::CPU) continue;
@@ -210,17 +225,37 @@ int main(int argc, char **argv) {
     double mean_abs_diff = sum / fb.rgba.size();
     std::printf("backend %-14s : mean|Δ| vs CPU = %.3f / 255\n", bi.name,
                 mean_abs_diff);
-    // Allow small differences from float math / rounding across devices.
     if (mean_abs_diff > 4.0) ++mismatches;
   }
-
   if (mismatches) {
     std::fprintf(stderr, "%d backend(s) diverged from the CPU reference.\n",
                  mismatches);
     return 1;
   }
+  return 0;
+}
+
+}  // namespace
+
+int main(int argc, char **argv) {
+  const std::string path = argc > 1 ? argv[1] : "demo.nc";
+  const int n = argc > 2 ? std::atoi(argv[2]) : 64;
+
+  // Write demo files with muGrid's C++ API (a 3D volume and a 2D field).
+  const std::string path2d = path + ".2d.nc";
+  try {
+    write_demo(path, n);
+    write_demo_2d(path2d, n);
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "write_demo failed: %s\n", e.what());
+    return 1;
+  }
+
+  if (check_file(path, "offscreen.ppm") != 0) return 1;
+  if (check_file(path2d, "offscreen_2d.ppm") != 0) return 1;
 
   std::printf(
-      "OK: muGrid I/O -> scalarize -> ray-trace verified; backends agree.\n");
+      "\nOK: muGrid I/O -> scalarize -> ray-trace verified (2D + 3D); "
+      "backends agree.\n");
   return 0;
 }

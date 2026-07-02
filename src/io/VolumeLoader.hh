@@ -24,14 +24,18 @@ namespace mueye {
 /** Metadata describing one renderable field variable in the file. */
 struct FieldInfo {
   std::string name;
-  int nb_components{1};   //!< tensor components per sub-point
-  std::string sub_tag;    //!< sub-division tag, empty => pixel subdivision
-  int nb_sub_pts{1};      //!< sub-points per pixel
+  int nb_components{1};      //!< tensor components per sub-point
+  std::string sub_tag;       //!< sub-division tag, empty => pixel subdivision
+  int nb_sub_pts{1};         //!< sub-points per pixel
+  bool has_tensor_dim{false};  //!< file has a tensor_dim__ axis for this field;
+                               //!< if false the field is a true scalar and must
+                               //!< be read back with an empty component shape
 };
 
 /** Metadata describing the whole file. */
 struct FileMeta {
   int nx{0}, ny{0}, nz{1};
+  int spatial_dim{3};  //!< 2 for a genuine 2D grid (no nz), 3 otherwise
   int nb_frames{1};
   std::vector<FieldInfo> fields;
   bool valid{false};

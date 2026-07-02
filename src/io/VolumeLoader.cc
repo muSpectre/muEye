@@ -68,6 +68,10 @@ FileMeta VolumeLoader::open(const std::string &path) {
   meta.nx = static_cast<int>(dim_len(ncid, dx));
   meta.ny = static_cast<int>(dim_len(ncid, dy));
   meta.nz = dz >= 0 ? static_cast<int>(dim_len(ncid, dz)) : 1;
+  // A file without an 'nz' dimension is a genuine 2D grid; we must read it back
+  // through a 2D muGrid collection (a 3D collection would demand an nz axis the
+  // file lacks). It still renders as a single-slice (nz==1) volume on a plane.
+  meta.spatial_dim = dz >= 0 ? 3 : 2;
 
   // Frame (unlimited) dimension.
   int unlim = -1;
@@ -127,6 +131,7 @@ FileMeta VolumeLoader::open(const std::string &path) {
         fi.sub_tag = rest.empty() ? "quad" : rest;
       } else {
         // tensor_dim__* (or any other extra axis) multiplies the components.
+        if (starts_with(dn, "tensor_dim")) fi.has_tensor_dim = true;
         fi.nb_components *= static_cast<int>(len);
       }
     }
@@ -147,9 +152,13 @@ std::string VolumeLoader::load(const std::string &path, const FileMeta &meta,
                                const FieldInfo &field, int frame,
                                Scalarize mode, int component, Volume &out) {
   try {
-    // Build a matching field collection. We always carry three spatial
-    // dimensions; a 2D file simply has nz == 1.
-    std::vector<muGrid::Index_t> dims{meta.nx, meta.ny, meta.nz};
+    // Build a field collection matching the file's spatial dimension. A genuine
+    // 2D file (no nz axis) must be read through a 2D collection; a 3D file (or
+    // one we treat as 3D) carries all three axes.
+    std::vector<muGrid::Index_t> dims =
+        meta.spatial_dim == 2 ? std::vector<muGrid::Index_t>{meta.nx, meta.ny}
+                              : std::vector<muGrid::Index_t>{meta.nx, meta.ny,
+                                                             meta.nz};
 
     muGrid::DynGridIndex domain(dims);
     muGrid::DynGridIndex locations(static_cast<muGrid::Dim_t>(dims.size()),
@@ -165,7 +174,16 @@ std::string VolumeLoader::load(const std::string &path, const FileMeta &meta,
 
     const std::string sub_division =
         (field.nb_sub_pts > 1 && !tag.empty()) ? tag : muGrid::PixelTag;
-    fc.register_real_field(field.name, field.nb_components, sub_division);
+    // muGrid derives the expected NetCDF dimensions from the field's component
+    // shape. A field stored with a tensor_dim__ axis must be registered with a
+    // matching component count; a true scalar (no tensor_dim in the file, e.g.
+    // muFFTTO's 'density') must be registered with an EMPTY component shape, or
+    // muGrid demands a nonexistent tensor_dim__<name>-0 axis and the read fails.
+    if (field.has_tensor_dim) {
+      fc.register_real_field(field.name, field.nb_components, sub_division);
+    } else {
+      fc.register_real_field(field.name, muGrid::Shape_t{}, sub_division);
+    }
 
     muGrid::FileIONetCDF file(path, muGrid::FileIOBase::OpenMode::Read);
     file.register_field_collection(fc);
@@ -179,16 +197,24 @@ std::string VolumeLoader::load(const std::string &path, const FileMeta &meta,
       return "Field data pointer is null (is the field on device memory?).";
     }
 
-    // The last 3 entries of the pixel strides are the per-voxel strides for the
-    // x, y, z axes (already scaled by nb_dof_per_pixel in muGrid's AoS layout).
+    // The last `spatial_dim` entries of the pixel strides are the per-voxel
+    // strides for the x, y (, z) axes (already scaled by nb_dof_per_pixel in
+    // muGrid's AoS layout). A 2D field has no z stride; nz==1 so z never varies.
     muGrid::Shape_t strides = f.get_strides(muGrid::IterUnit::Pixel);
-    if (strides.size() < 3) {
+    if (strides.size() < static_cast<std::size_t>(meta.spatial_dim)) {
       file.close();
-      return "Unexpected field stride layout (need 3 spatial dimensions).";
+      return "Unexpected field stride layout (fewer strides than spatial dims).";
     }
-    std::ptrdiff_t sx = strides[strides.size() - 3];
-    std::ptrdiff_t sy = strides[strides.size() - 2];
-    std::ptrdiff_t sz = strides[strides.size() - 1];
+    std::ptrdiff_t sx, sy, sz;
+    if (meta.spatial_dim == 2) {
+      sx = strides[strides.size() - 2];
+      sy = strides[strides.size() - 1];
+      sz = 0;
+    } else {
+      sx = strides[strides.size() - 3];
+      sy = strides[strides.size() - 2];
+      sz = strides[strides.size() - 1];
+    }
 
     int nb_comp = static_cast<int>(f.get_nb_components());
     out.from_field(src, meta.nx, meta.ny, meta.nz, nb_comp, sx, sy, sz, mode,

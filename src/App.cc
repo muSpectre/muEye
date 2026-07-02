@@ -12,6 +12,22 @@
 
 namespace mueye {
 
+namespace {
+
+// World-space extents of the volume box: the grid shape normalized so the
+// longest axis is 1. Cubic grids give {1,1,1}; a 2D grid (nz==1) gives a thin
+// box that renders as a plane. Keep in sync with RenderParams::box.
+Vec3 box_extent(int nx, int ny, int nz) {
+  int m = nx;
+  if (ny > m) m = ny;
+  if (nz > m) m = nz;
+  if (m < 1) m = 1;
+  float f = 1.0f / static_cast<float>(m);
+  return Vec3{nx * f, ny * f, nz * f};
+}
+
+}  // namespace
+
 App::App() {
   backends_ = enumerate_backends();
 
@@ -67,6 +83,8 @@ void App::open_path(const std::string &path) {
             std::to_string(meta_.ny) + "x" + std::to_string(meta_.nz) + ", " +
             std::to_string(meta_.nb_frames) + " frame(s), " +
             std::to_string(meta_.fields.size()) + " field(s)).";
+  // Aim the camera at the centre of the (possibly non-cubic / planar) box.
+  camera_.frame_box(box_extent(meta_.nx, meta_.ny, meta_.nz));
   reload_volume();
 }
 
@@ -138,8 +156,9 @@ void App::render(int width, int height) {
   p.nx = volume_.nx;
   p.ny = volume_.ny;
   p.nz = volume_.nz;
-  // step_ is in voxels; the volume spans the unit box, so one voxel along the
-  // longest axis is 1/max(nx,ny,nz) in world units.
+  p.box = box_extent(volume_.nx, volume_.ny, volume_.nz);
+  // step_ is in voxels; the box's longest axis is 1 world unit, so one voxel
+  // along that axis is 1/max(nx,ny,nz) in world units.
   int max_dim = volume_.nx;
   if (volume_.ny > max_dim) max_dim = volume_.ny;
   if (volume_.nz > max_dim) max_dim = volume_.nz;

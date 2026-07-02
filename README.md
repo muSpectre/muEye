@@ -2,7 +2,8 @@
 
 A real-time **ray-tracing viewer for [muGrid](https://github.com/muSpectre/muGrid)
 data**. muEye opens muGrid NetCDF files and renders 3D scalar/tensor fields as a
-volume with a **CPU ray tracer** (and, in a later pass, a GPU one). The UI is built
+volume with a **CPU ray tracer** (and, in a later pass, a GPU one). **2D fields**
+(files with only `nx`/`ny`) are supported too — they render on a plane. The UI is built
 with [Dear ImGui](https://github.com/ocornut/imgui).
 
 muEye reuses muGrid internally:

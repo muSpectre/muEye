@@ -86,9 +86,8 @@ void App::draw_ui() {
 
   // First-run default layout: only build it if this dockspace has no nodes yet
   // (i.e. no imgui.ini restored a previous arrangement).
-  static bool layout_initialized = false;
-  if (!layout_initialized) {
-    layout_initialized = true;
+  if (!layout_initialized_) {
+    layout_initialized_ = true;
     ImGuiDockNode *node = ImGui::DockBuilderGetNode(dockspace_id);
     if (node == nullptr || node->IsLeafNode()) {
       build_default_layout(dockspace_id);
@@ -101,14 +100,10 @@ void App::draw_ui() {
     ImGui::TextWrapped("muGrid NetCDF viewer — real-time volume ray tracer.");
     ImGui::Separator();
 
-    static char path[1024] = {0};
-    if (!path_buf_.empty() && path[0] == '\0') {
-      std::snprintf(path, sizeof(path), "%s", path_buf_.c_str());
-    }
-    ImGui::InputText("File", path, sizeof(path));
+    ImGui::InputText("File", path_edit_, sizeof(path_edit_));
     ImGui::SameLine();
     if (ImGui::Button("Load")) {
-      open_path(path);
+      open_path(path_edit_);
     }
     ImGui::TextWrapped("%s", status_.c_str());
   }
@@ -219,10 +214,9 @@ void App::draw_ui() {
     ImGui::Separator();
     // Snapshot of the ray-traced scene (at full viewport resolution; the box
     // outline is a UI overlay and is not part of the saved image).
-    static char png_path[1024] = "mueye.png";
-    ImGui::InputText("PNG file", png_path, sizeof(png_path));
+    ImGui::InputText("PNG file", png_path_, sizeof(png_path_));
     ImGui::BeginDisabled(volume_.empty());
-    if (ImGui::Button("Save PNG")) save_png(png_path);
+    if (ImGui::Button("Save PNG")) save_png(png_path_);
     ImGui::EndDisabled();
   }
   ImGui::End();

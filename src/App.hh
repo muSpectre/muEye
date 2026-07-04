@@ -70,6 +70,9 @@ class App {
   // --- UI / selection state -------------------------------------------
   std::string path_buf_;
   std::string status_ = "Open a muGrid NetCDF (.nc) file to begin.";
+  char path_edit_[1024] = {0};          //!< File-panel path input buffer
+  char png_path_[1024] = "mueye.png";   //!< Render-panel PNG file name buffer
+  bool layout_initialized_{false};      //!< default docking layout built once
   bool has_file_{false};
   int field_index_{0};
   int frame_{0};

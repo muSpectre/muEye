@@ -50,15 +50,11 @@ void OrbitCamera::zoom(float delta) {
 }
 
 void OrbitCamera::pan(float dx, float dy) {
-  // Translate the target in the current view plane.
-  float cy = std::cos(yaw_), sy = std::sin(yaw_);
-  float cp = std::cos(pitch_), sp = std::sin(pitch_);
-  Vec3 forward{cp * cy, sp, cp * sy};
-  Vec3 world_up{0.0f, 1.0f, 0.0f};
-  Vec3 right = normalize(cross(forward, world_up));
-  Vec3 up = normalize(cross(right, forward));
+  // Translate the target in the current view plane, using the same basis the
+  // renderer uses (aspect does not affect right/up).
+  Camera cam = to_camera(1.0f);
   float scale = distance_ * 0.5f;
-  target_ = target_ + right * (-dx * scale) + up * (dy * scale);
+  target_ = target_ + cam.right * (dx * scale) + cam.up * (dy * scale);
 }
 
 Camera OrbitCamera::to_camera(float aspect) const {

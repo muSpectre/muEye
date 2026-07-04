@@ -108,11 +108,14 @@ set(GLFW_BUILD_X11      ON  CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(glfw)
 
 # Dear ImGui has no CMake build of its own; we fetch sources and compile a small
-# static library here. The docking branch provides DockSpaceOverViewport.
+# static library here. Pinned to a release tag of the *docking* line (plain
+# vX.Y.Z tags are master and lack DockSpaceOverViewport / DockBuilder, which
+# the panel layout needs) rather than the moving `docking` branch, whose head
+# makes builds non-reproducible. Bump deliberately.
 FetchContent_Declare(
     imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG        docking
+    GIT_TAG        v1.92.8-docking
     GIT_SHALLOW    TRUE)
 FetchContent_MakeAvailable(imgui)
 
@@ -176,45 +179,64 @@ elseif(MUEYE_ENABLE_HIP)
 endif()
 
 # ---------------------------------------------------------------------------
-# muEye executable
+# mueye_core: everything shared between the muEye executable and the
+# muEye_check tool (I/O, camera, transfer function, rendering backends) —
+# compiled once, and the two consumers cannot drift apart. Usage requirements
+# (includes, backend defines, libraries) are PUBLIC so consumers inherit them.
+# ---------------------------------------------------------------------------
+add_library(mueye_core STATIC
+    src/io/Volume.cc
+    src/io/VolumeLoader.cc
+    src/io/PngWriter.cc
+    src/ui/OrbitCamera.cc
+    src/ui/TransferFunction.cc
+    ${MUEYE_RENDER_SOURCES})
+
+target_include_directories(mueye_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${NetCDF_INCLUDE_DIRS})
+# Vendored single-header libs (stb_image_write); SYSTEM keeps -Wall quiet there.
+target_include_directories(mueye_core SYSTEM PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+
+target_compile_definitions(mueye_core PUBLIC ${MUEYE_BACKEND_DEFS})
+
+target_link_libraries(mueye_core PUBLIC
+    muGrid           # note: under add_subdirectory the target is `muGrid`, no namespace alias
+    Threads::Threads
+    ${NetCDF_LIBRARIES}
+    ${MUEYE_BACKEND_LIBS})
+
+if(MUEYE_ENABLE_CUDA OR MUEYE_ENABLE_HIP)
+    # GpuRenderer.cc pulls in OpenGL for its PBO interop path, so even headless
+    # consumers (muEye_check) must link GL when a CUDA/HIP backend is built in.
+    target_link_libraries(mueye_core PUBLIC OpenGL::GL)
+endif()
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(mueye_core PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+# ---------------------------------------------------------------------------
+# muEye executable (the GUI: GLFW window, ImGui panels, GL display texture)
 # ---------------------------------------------------------------------------
 add_executable(muEye
     src/main.cc
     src/App.cc
     src/ui/panels.cc
-    src/ui/OrbitCamera.cc
-    src/ui/TransferFunction.cc
-    src/io/Volume.cc
-    src/io/VolumeLoader.cc
-    src/io/PngWriter.cc
-    src/gl/GlTexture.cc
-    ${MUEYE_RENDER_SOURCES})
-
-target_include_directories(muEye PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${NetCDF_INCLUDE_DIRS})
-# Vendored single-header libs (stb_image_write); SYSTEM keeps -Wall quiet there.
-target_include_directories(muEye SYSTEM PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
-
-target_compile_definitions(muEye PRIVATE ${MUEYE_BACKEND_DEFS})
+    src/gl/GlTexture.cc)
 
 target_link_libraries(muEye PRIVATE
-    muGrid           # note: under add_subdirectory the target is `muGrid`, no namespace alias
+    mueye_core
     imgui
     glfw
-    OpenGL::GL
-    Threads::Threads
-    ${NetCDF_LIBRARIES}
-    ${MUEYE_BACKEND_LIBS})
+    OpenGL::GL)
 
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(muEye PRIVATE OpenMP::OpenMP_CXX)
-endif()
-
-# Helpful warnings (kept non-fatal for a draft).
+# Helpful warnings (kept non-fatal for a draft); scoped to C++ TUs so they are
+# not handed to a CUDA/HIP device compiler.
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(muEye PRIVATE -Wall -Wextra)
+    target_compile_options(mueye_core PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -223,34 +245,9 @@ endif()
 # cross-checks every available backend against the CPU reference.
 # Build with: cmake --build build --target muEye_check
 # ---------------------------------------------------------------------------
-add_executable(muEye_check
-    tools/offscreen_check.cc
-    src/io/Volume.cc
-    src/io/VolumeLoader.cc
-    src/io/PngWriter.cc
-    src/ui/OrbitCamera.cc
-    src/ui/TransferFunction.cc
-    ${MUEYE_RENDER_SOURCES})
+add_executable(muEye_check tools/offscreen_check.cc)
 set_target_properties(muEye_check PROPERTIES EXCLUDE_FROM_ALL TRUE)
-target_include_directories(muEye_check PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${NetCDF_INCLUDE_DIRS})
-target_include_directories(muEye_check SYSTEM PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
-target_compile_definitions(muEye_check PRIVATE ${MUEYE_BACKEND_DEFS})
-target_link_libraries(muEye_check PRIVATE
-    muGrid
-    Threads::Threads
-    ${NetCDF_LIBRARIES}
-    ${MUEYE_BACKEND_LIBS})
-if(MUEYE_ENABLE_CUDA OR MUEYE_ENABLE_HIP)
-    # GpuRenderer.cc pulls in OpenGL for its PBO interop path, so even the
-    # headless check tool must link GL when a CUDA/HIP backend is compiled in.
-    target_link_libraries(muEye_check PRIVATE OpenGL::GL)
-endif()
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(muEye_check PRIVATE OpenMP::OpenMP_CXX)
-endif()
+target_link_libraries(muEye_check PRIVATE mueye_core)
 
 set(_mueye_backends "CPU")
 if(MUEYE_ENABLE_METAL)

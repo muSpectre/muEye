@@ -9,6 +9,7 @@
 #include "App.hh"
 
 #include <chrono>
+#include <cstdio>
 
 #include "io/PngWriter.hh"
 
@@ -62,6 +63,8 @@ void App::open_path(const std::string &path) {
   }
   has_file_ = true;
   path_buf_ = path;
+  // Mirror into the File panel's edit buffer (e.g. for a command-line load).
+  std::snprintf(path_edit_, sizeof(path_edit_), "%s", path.c_str());
   field_index_ = 0;
   frame_ = 0;
   component_ = 0;

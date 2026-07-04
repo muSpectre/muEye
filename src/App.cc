@@ -86,8 +86,12 @@ void App::reload_volume() {
   int comp = component_;
   if (comp >= fi.nb_components) comp = fi.nb_components - 1;
 
+  auto t0 = std::chrono::high_resolution_clock::now();
   std::string err = loader_.load(path_buf_, meta_, fi, frame_, scalarize_, comp,
                                  volume_);
+  last_load_ms_ = std::chrono::duration<double, std::milli>(
+                      std::chrono::high_resolution_clock::now() - t0)
+                      .count();
   if (!err.empty()) {
     status_ = err;
     volume_ = Volume{};

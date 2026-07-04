@@ -75,6 +75,8 @@ class App {
   int frame_{0};
   int component_{0};
   Scalarize scalarize_{Scalarize::Component};
+  double last_load_ms_{0.0};   //!< duration of the most recent volume load
+  bool frame_pending_{false};  //!< frame changed while scrubbing; load on release
 
   // --- view / appearance ----------------------------------------------
   OrbitCamera camera_;

@@ -133,12 +133,33 @@ int main(int argc, char **argv) {
       app.load_file(argv[1]);
     }
 
+    // Idle throttle: while the user interacts, render at full rate; once the
+    // input goes quiet for a few frames, park in glfwWaitEventsTimeout so an
+    // idle viewer costs almost no CPU. Any event (mouse, key, resize) wakes
+    // the loop immediately and renders a frame, so responsiveness is
+    // unaffected; the timeout keeps slow animations (cursor blink, fades)
+    // ticking over. Start hot so the initial docking layout settles.
+    int hot_frames = 10;
     while (!glfwWindowShouldClose(window)) {
-      glfwPollEvents();
+      if (hot_frames > 0) {
+        --hot_frames;
+        glfwPollEvents();
+      } else {
+        glfwWaitEventsTimeout(0.25);
+      }
 
       ImGui_ImplOpenGL3_NewFrame();
       ImGui_ImplGlfw_NewFrame();
       ImGui::NewFrame();
+
+      // Mouse activity re-arms continuous rendering (drags stream events, but
+      // ImGui needs a few extra frames after the last one for hover state and
+      // animations to settle).
+      ImGuiIO &loop_io = ImGui::GetIO();
+      if (loop_io.MouseDelta.x != 0.0f || loop_io.MouseDelta.y != 0.0f ||
+          loop_io.MouseWheel != 0.0f || ImGui::IsAnyMouseDown()) {
+        hot_frames = 3;
+      }
 
       app.draw_ui();
 

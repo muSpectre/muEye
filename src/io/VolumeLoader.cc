@@ -55,7 +55,8 @@ bool starts_with(const std::string &s, const char *prefix) {
  * (frame, [tensor_dim...], [subpt], nx, ny, nz) — muGrid writes with an imap,
  * so the nx/ny/nz axes in the file are the true x/y/z axes — and handed to
  * Volume::from_field with the matching per-axis and per-component strides.
- * Only sub-point 0 is read, like the muGrid path renders.
+ * Only sub-point 0 is read, like the muGrid path renders; in Component mode
+ * only the selected component is fetched.
  */
 std::string load_via_netcdf(const std::string &path, const FileMeta &meta,
                             const FieldInfo &field, int frame, Scalarize mode,
@@ -84,19 +85,44 @@ std::string load_via_netcdf(const std::string &path, const FileMeta &meta,
   int dz = find_dim(ncid, "nz");
   int frame_dim = find_dim(ncid, "frame");
 
-  // One hyperslab covering the selected frame, sub-point 0, all components
-  // and the full grid.
+  // One hyperslab covering the selected frame, sub-point 0 and the full grid.
   std::vector<std::size_t> start(ndims, 0), count(ndims, 1);
+  std::vector<bool> is_comp(ndims, false);
   for (int d = 0; d < ndims; ++d) {
     int did = dimids[d];
     if (did == frame_dim) {
       start[d] = static_cast<std::size_t>(frame);
       continue;  // count stays 1
     }
+    if (did == dx || did == dy || (dz >= 0 && did == dz)) {
+      count[d] = dim_len(ncid, did);  // grid axis: full extent
+      continue;
+    }
     char dname[NC_MAX_NAME + 1] = {0};
     nc_inq_dimname(ncid, did, dname);
     if (starts_with(dname, "subpt")) continue;  // sub-point 0 only
-    count[d] = dim_len(ncid, did);              // grid or component axis
+    is_comp[d] = true;                          // tensor_dim__* component axis
+    count[d] = dim_len(ncid, did);
+  }
+
+  // In Component mode fetch only the selected component — 1/9th of the bytes
+  // for a 3x3 tensor field. The other reductions need every component. The
+  // flat component index nests row-major across the (adjacent) tensor axes,
+  // so it decomposes fastest-axis-first from the back.
+  const bool one_component = mode == Scalarize::Component;
+  if (one_component) {
+    std::ptrdiff_t total_comp = 1;
+    for (int d = 0; d < ndims; ++d)
+      if (is_comp[d]) total_comp *= static_cast<std::ptrdiff_t>(count[d]);
+    std::ptrdiff_t rem = component < 0 ? 0 : component;
+    if (rem >= total_comp) rem = total_comp - 1;
+    for (int d = ndims - 1; d >= 0; --d) {
+      if (!is_comp[d]) continue;
+      std::ptrdiff_t len = static_cast<std::ptrdiff_t>(count[d]);
+      start[d] = static_cast<std::size_t>(rem % len);
+      rem /= len;
+      count[d] = 1;
+    }
   }
 
   // Row-major element strides within the fetched buffer.
@@ -139,8 +165,9 @@ std::string load_via_netcdf(const std::string &path, const FileMeta &meta,
   if (status != NC_NOERR)
     return std::string("nc_get_vara_double failed: ") + nc_strerror(status);
 
+  // With component subsetting the buffer holds exactly one component.
   out.from_field(buf.data(), meta.nx, meta.ny, meta.nz, nb_comp, sx, sy, sz,
-                 mode, component, sc);
+                 mode, one_component ? 0 : component, sc);
   return "";
 }
 

@@ -11,6 +11,11 @@
  * and int, no vector types) so its memory layout is identical between this
  * Objective-C++ translation unit and the MSL source string.
  *
+ * render() is deliberately synchronous (waitUntilCompleted + a memcpy out of a
+ * shared buffer): muEye renders on demand rather than continuously, so
+ * pipelining / double-buffering would add complexity for little gain. This is
+ * the known ceiling on Metal frame rate.
+ *
  * Part of muEye, a viewer for muGrid data.
  */
 

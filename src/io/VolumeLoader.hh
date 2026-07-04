@@ -48,6 +48,10 @@ struct FileMeta {
   std::string error;  //!< populated when valid == false
 };
 
+/** Stateless loader: every open()/load() opens the file, reads and closes it
+ *  again, so the viewer never holds a simulation's output file open. The
+ *  per-load open/registration overhead is sub-millisecond — deliberately not
+ *  cached (simplicity over micro-optimization). */
 class VolumeLoader {
  public:
   /** Introspect @p path. On failure returns a FileMeta with valid==false and a

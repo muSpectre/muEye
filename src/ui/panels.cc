@@ -127,8 +127,19 @@ void App::draw_ui() {
 
     if (meta_.nb_frames > 1) {
       int f = frame_;
-      if (ImGui::SliderInt("Frame", &f, 0, meta_.nb_frames - 1)) {
+      if (ImGui::SliderInt("Frame", &f, 0, meta_.nb_frames - 1) &&
+          f != frame_) {
         frame_ = f;
+        // Live-reload while dragging only when loads are quick; a slow load
+        // per slider tick would freeze the UI, so defer it to release.
+        if (last_load_ms_ <= 50.0) {
+          reload = true;
+        } else {
+          frame_pending_ = true;
+        }
+      }
+      if (frame_pending_ && ImGui::IsItemDeactivatedAfterEdit()) {
+        frame_pending_ = false;
         reload = true;
       }
     }

@@ -54,6 +54,19 @@ void write_demo(const std::string &path, int n) {
   muGrid::GlobalFieldCollection fc(muGrid::DynGridIndex{n, n, n});
   muGrid::Field &phi = fc.register_real_field("phi", 1);
   double *d = static_cast<double *>(phi.get_void_data_ptr());
+  // A 9-component (3x3 tensor) field whose value is distinct for every
+  // (voxel, component) pair, used to cross-check per-component reads of the
+  // direct netcdf path against muGrid's (component or axis mix-ups cannot
+  // cancel out).
+  muGrid::Field &sig = fc.register_real_field("sig", 9);
+  double *s = static_cast<double *>(sig.get_void_data_ptr());
+  {
+    std::size_t nb_entries = static_cast<std::size_t>(n) * n * n * 9;
+    // Layout-agnostic distinctness: value = flat buffer index. Both readers
+    // fetch the same file, so only their mutual agreement matters.
+    for (std::size_t e = 0; e < nb_entries; ++e)
+      s[e] = static_cast<double>(e);
+  }
 
   muGrid::FileIONetCDF file(path, muGrid::FileIOBase::OpenMode::Overwrite);
   file.register_field_collection(fc);
@@ -63,7 +76,8 @@ void write_demo(const std::string &path, int n) {
   fill_cube(d, n, 0.62, 0.40, 0.55, 0.18);
   file.append_frame().write();
   file.close();
-  std::printf("wrote %s (%d^3, field 'phi' cube, 2 frames)\n", path.c_str(), n);
+  std::printf("wrote %s (%d^3, fields 'phi' cube + 'sig' 3x3, 2 frames)\n",
+              path.c_str(), n);
 }
 
 // A 2D grid (no nz dimension): a filled disk of radius 0.25, value 1 inside.
@@ -336,6 +350,47 @@ int check_file(const std::string &path, const char *ppm_out) {
       std::fprintf(stderr, "direct read path disagrees with muGrid read.\n");
       return 1;
     }
+  }
+
+  // Same cross-check for multi-component fields: every component plus the
+  // magnitude reduction must agree between the muGrid path and the direct
+  // netcdf path (which fetches only the selected component in Component mode).
+  for (const mueye::FieldInfo &finfo : meta.fields) {
+    if (finfo.nb_components <= 1) continue;
+    mueye::FieldInfo direct = finfo;
+    direct.is_double = false;  // force the netcdf-c path
+    for (int c = 0; c <= finfo.nb_components; ++c) {
+      // c == nb_components is the magnitude pass (component index unused).
+      bool magnitude = c == finfo.nb_components;
+      mueye::Scalarize sm =
+          magnitude ? mueye::Scalarize::Magnitude : mueye::Scalarize::Component;
+      mueye::Volume vg, vd;
+      std::string e1 = loader.load(path, meta, finfo, 0, sm, c, vg);
+      std::string e2 = loader.load(path, meta, direct, 0, sm, c, vd);
+      if (!e1.empty() || !e2.empty() || vg.data.size() != vd.data.size() ||
+          vg.data.empty()) {
+        std::fprintf(stderr,
+                     "multi-component cross-check failed to load '%s' (%s%s)\n",
+                     finfo.name.c_str(), e1.c_str(), e2.c_str());
+        return 1;
+      }
+      float max_diff = 0.0f;
+      for (std::size_t i = 0; i < vg.data.size(); ++i) {
+        float dv = std::fabs(vg.data[i] - vd.data[i]);
+        if (dv > max_diff) max_diff = dv;
+      }
+      if (max_diff > 0.0f) {
+        std::fprintf(stderr,
+                     "direct read of '%s' (%s %d) disagrees with muGrid read "
+                     "(max|Δ| = %g).\n",
+                     finfo.name.c_str(), magnitude ? "magnitude" : "component",
+                     c, double(max_diff));
+        return 1;
+      }
+    }
+    std::printf("field '%s': %d components + magnitude, direct vs muGrid "
+                "reads agree\n",
+                finfo.name.c_str(), finfo.nb_components);
   }
 
   mueye::TransferFunction tf;

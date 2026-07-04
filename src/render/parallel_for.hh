@@ -4,8 +4,11 @@
  * @brief  Minimal parallel-for over an index range.
  *
  * Uses OpenMP when the compiler provides it; otherwise falls back to a
- * std::thread split so the CPU renderer is genuinely parallel even on toolchains
- * without OpenMP (e.g. Apple clang).
+ * std::thread split so the CPU renderer is genuinely parallel even on
+ * toolchains without OpenMP (e.g. Apple clang). The fallback spawns threads
+ * per call — deliberately simple: the toolchains it serves are essentially
+ * only macOS, where Metal is the primary backend and the CPU path is a
+ * reference/fallback, so it is not worth a persistent pool.
  *
  * Part of muEye, a viewer for muGrid data.
  */

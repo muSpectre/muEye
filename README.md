@@ -72,8 +72,9 @@ python scripts/make_test_volume.py demo.nc
 ./build/muEye demo.nc
 ```
 
-Then: type a path and **Load** (or pass it on the command line), pick a field/frame,
-toggle **DVR**/**Isosurface**, drag to orbit, scroll to zoom.
+Then: pick a file with **Browse...** (native dialog), type a path and **Load**, or
+pass it on the command line; pick a field/frame, toggle **DVR**/**Isosurface**,
+drag to orbit, scroll to zoom.
 
 ## Rendering backends
 

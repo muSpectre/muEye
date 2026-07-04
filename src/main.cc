@@ -34,9 +34,11 @@ static void glfw_error_callback(int error, const char *description) {
 //   - Linux:   no single default; try Ubuntu / Cantarell / Noto, falling back
 //              to the near-ubiquitous DejaVu Sans / Liberation Sans.
 //
-// The font is rasterised at base_px * content_scale and then scaled back down
-// with FontGlobalScale so text stays crisp on HiDPI / Retina displays.
-static void load_platform_font(GLFWwindow *window) {
+// The size given here is a base size in UI points: ImGui >= 1.92 rasterizes
+// fonts dynamically at the effective scale (framebuffer scale for Retina
+// crispness, style.FontScaleDpi for monitor DPI — see io.ConfigDpiScaleFonts
+// in main()), so no manual content-scale baking is needed.
+static void load_platform_font() {
   ImGuiIO &io = ImGui::GetIO();
 
 #if defined(__APPLE__)
@@ -62,16 +64,12 @@ static void load_platform_font(GLFWwindow *window) {
   };
 #endif
 
-  float xscale = 1.0f, yscale = 1.0f;
-  glfwGetWindowContentScale(window, &xscale, &yscale);
-  if (xscale <= 0.0f) xscale = 1.0f;
   const float base_px = 16.0f;
 
   for (const char *path : candidates) {
     std::error_code ec;
     if (!std::filesystem::exists(path, ec)) continue;
-    if (io.Fonts->AddFontFromFileTTF(path, base_px * xscale) != nullptr) {
-      io.FontGlobalScale = 1.0f / xscale;
+    if (io.Fonts->AddFontFromFileTTF(path, base_px) != nullptr) {
       std::printf("muEye: using UI font %s\n", path);
       return;
     }
@@ -117,12 +115,16 @@ int main(int argc, char **argv) {
   ImGui::CreateContext();
   ImGuiIO &io = ImGui::GetIO();
   io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+  // Rescale fonts automatically when the window moves to a monitor with a
+  // different DPI (the GLFW backend reports per-monitor content scale, and
+  // ImGui >= 1.92 rasterizes fonts dynamically at the effective scale).
+  io.ConfigDpiScaleFonts = true;
   ImGui::StyleColorsLight();
   ImGui_ImplGlfw_InitForOpenGL(window, true);
   ImGui_ImplOpenGL3_Init(glsl_version);
 
   // Use the host platform's native UI font.
-  load_platform_font(window);
+  load_platform_font();
 
   // Scope the app so its GL-owning members (display texture, GPU renderers
   // with GL-interop buffers) are destroyed while the GL context is still

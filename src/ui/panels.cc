@@ -7,12 +7,14 @@
  */
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
 #include "App.hh"
 #include "imgui.h"
 #include "imgui_internal.h"  // DockBuilder* for the default layout
+#include "portable-file-dialogs.h"  // native file chooser (third_party/)
 
 namespace mueye {
 
@@ -105,6 +107,26 @@ void App::draw_ui() {
     if (ImGui::Button("Load")) {
       open_path(path_edit_);
     }
+    ImGui::SameLine();
+    // Probed once: on Linux, available() runs subprocesses to look for a
+    // dialog backend (zenity/kdialog/...), so it must not run every frame.
+    // An immutable capability, not UI state — a static const is fine.
+    static const bool can_browse = pfd::settings::available();
+    ImGui::BeginDisabled(!can_browse);
+    // Native file chooser; blocks the UI loop while the modal dialog is open.
+    if (ImGui::Button("Browse...")) {
+      auto sel = pfd::open_file("Open muGrid NetCDF file", path_edit_,
+                                {"NetCDF files (*.nc)", "*.nc",
+                                 "All files", "*"})
+                     .result();
+      if (!sel.empty()) {
+        // Show the choice in the field even if the load then fails.
+        std::snprintf(path_edit_, sizeof(path_edit_), "%s",
+                      sel.front().c_str());
+        open_path(sel.front());
+      }
+    }
+    ImGui::EndDisabled();
     ImGui::TextWrapped("%s", status_.c_str());
   }
   ImGui::End();

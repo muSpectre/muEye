@@ -46,14 +46,17 @@ struct Volume {
    * @param nx,ny,nz      grid dimensions
    * @param nb_components number of components stored per voxel
    * @param stride_x/y/z  element strides between adjacent voxels along each axis
-   *                      (from Field::get_strides(IterUnit::Pixel)); the
-   *                      component stride is assumed to be 1 (muGrid AoS layout)
+   *                      (from Field::get_strides(IterUnit::Pixel))
    * @param mode          scalarization mode
    * @param component     component index used by Scalarize::Component
+   * @param stride_c      element stride between components of one voxel: 1 for
+   *                      muGrid's AoS layout (default), large for the planar
+   *                      layout of a raw NetCDF hyperslab
    */
   void from_field(const double *src, int nx, int ny, int nz, int nb_components,
                   std::ptrdiff_t stride_x, std::ptrdiff_t stride_y,
-                  std::ptrdiff_t stride_z, Scalarize mode, int component);
+                  std::ptrdiff_t stride_z, Scalarize mode, int component,
+                  std::ptrdiff_t stride_c = 1);
 };
 
 }  // namespace mueye

@@ -26,6 +26,15 @@ void OrbitCamera::frame_box(const Vec3 &box) {
   target_ = box * 0.5f;  // centre of the [0,box] volume box
 }
 
+void OrbitCamera::retarget_box(const Vec3 &box) {
+  target_ = box * 0.5f;
+  // Same distance-to-extent ratio as reset() uses for the unit box.
+  float m = box.x;
+  if (box.y > m) m = box.y;
+  if (box.z > m) m = box.z;
+  distance_ = 2.5f * (m > 0.0f ? m : 1.0f);
+}
+
 void OrbitCamera::orbit(float dyaw, float dpitch) {
   yaw_ += dyaw;
   pitch_ += dpitch;
@@ -35,7 +44,9 @@ void OrbitCamera::orbit(float dyaw, float dpitch) {
 
 void OrbitCamera::zoom(float delta) {
   distance_ *= std::exp(-delta * 0.15f);
-  distance_ = std::clamp(distance_, 0.3f, 20.0f);
+  // The upper bound must stay comfortably beyond retarget_box()'s distance
+  // for the largest allowed replica tiling.
+  distance_ = std::clamp(distance_, 0.3f, 50.0f);
 }
 
 void OrbitCamera::pan(float dx, float dy) {

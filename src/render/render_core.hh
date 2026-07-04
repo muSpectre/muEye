@@ -106,12 +106,18 @@ enum class RenderMode : int { DVR = 0, Isosurface = 1 };
  * space; voxel (i,j,k) sits at the centre of its cell. `box` is the grid shape
  * normalized so the longest axis is 1 (a cubic grid gives [0,1]^3, unchanged;
  * a 2D grid with nz==1 gives a thin box of z-extent 1/max(nx,ny) — a plane).
+ * With periodic replicas (rep_* > 1) the rendered box grows to
+ * [0, box.x*rep_x] x [0, box.y*rep_y] x [0, box.z*rep_z] and sampling
+ * coordinates wrap back into the unit cell.
  * Data is sampled from a contiguous float buffer in column-major (muGrid)
  * order: index = i + nx*(j + ny*k).
  */
 struct RenderParams {
   int nx, ny, nz;        //!< grid dimensions
-  Vec3 box;              //!< world-space extents of the volume box [0,box]
+  Vec3 box;              //!< world-space extents of one volume box [0,box]
+  int rep_x{1};          //!< periodic replicas along x (>= 1; 1 = no tiling)
+  int rep_y{1};          //!< periodic replicas along y
+  int rep_z{1};          //!< periodic replicas along z
   float step;            //!< ray-march step length in world units
   float data_min;        //!< value mapped to LUT entry 0 / iso slider minimum
   float data_max;        //!< value mapped to LUT entry (lut_size-1) / iso maximum
@@ -175,17 +181,34 @@ struct ArraySampler {
   }
 };
 
+/**
+ * Wrap a box coordinate into [0,1) when the axis is periodically replicated
+ * (rep > 1); pass it through untouched otherwise, so single-box rendering is
+ * bit-identical to the non-replicated path. Samplers clamp at cell faces, so
+ * interpolation does not cross replica seams — a half-voxel-wide seam that is
+ * identical across backends.
+ */
+MUEYE_HD inline float wrap_coord(float u, int rep) {
+  return rep > 1 ? u - floorf(u) : u;
+}
+
+/** Wrap a box coordinate per axis according to the replica counts. */
+MUEYE_HD inline Vec3 wrap_uvw(const RenderParams &p, const Vec3 &uvw) {
+  return Vec3{wrap_coord(uvw.x, p.rep_x), wrap_coord(uvw.y, p.rep_y),
+              wrap_coord(uvw.z, p.rep_z)};
+}
+
 /** Central-difference gradient in box coordinates (for surface shading). */
 template <class Sampler>
 MUEYE_HD inline Vec3 gradient(const Sampler &s, const RenderParams &p,
                               const Vec3 &uvw) {
   float hx = 1.0f / p.nx, hy = 1.0f / p.ny, hz = 1.0f / p.nz;
-  float gx = s.value_at(p, Vec3{uvw.x + hx, uvw.y, uvw.z}) -
-             s.value_at(p, Vec3{uvw.x - hx, uvw.y, uvw.z});
-  float gy = s.value_at(p, Vec3{uvw.x, uvw.y + hy, uvw.z}) -
-             s.value_at(p, Vec3{uvw.x, uvw.y - hy, uvw.z});
-  float gz = s.value_at(p, Vec3{uvw.x, uvw.y, uvw.z + hz}) -
-             s.value_at(p, Vec3{uvw.x, uvw.y, uvw.z - hz});
+  float gx = s.value_at(p, Vec3{wrap_coord(uvw.x + hx, p.rep_x), uvw.y, uvw.z}) -
+             s.value_at(p, Vec3{wrap_coord(uvw.x - hx, p.rep_x), uvw.y, uvw.z});
+  float gy = s.value_at(p, Vec3{uvw.x, wrap_coord(uvw.y + hy, p.rep_y), uvw.z}) -
+             s.value_at(p, Vec3{uvw.x, wrap_coord(uvw.y - hy, p.rep_y), uvw.z});
+  float gz = s.value_at(p, Vec3{uvw.x, uvw.y, wrap_coord(uvw.z + hz, p.rep_z)}) -
+             s.value_at(p, Vec3{uvw.x, uvw.y, wrap_coord(uvw.z - hz, p.rep_z)});
   return Vec3{gx, gy, gz};
 }
 
@@ -270,24 +293,27 @@ MUEYE_HD inline Vec4 trace_ray_iso(const Sampler &s, const RenderParams &p,
   Vec3 dir = primary_ray_dir(cam, u, v);
   float t_near, t_far;
   Vec4 bg = Vec4{p.bg.x, p.bg.y, p.bg.z, 1.0f};
-  if (!intersect_box(cam.eye, dir, p.box, t_near, t_far)) return bg;
+  // The ray traverses the periodically tiled box [0, box*rep].
+  Vec3 tiled_box = make_vec3(p.box.x * p.rep_x, p.box.y * p.rep_y,
+                             p.box.z * p.rep_z);
+  if (!intersect_box(cam.eye, dir, tiled_box, t_near, t_far)) return bg;
 
-  // Map world position to normalized [0,1]^3 box coordinate for sampling.
+  // Map world position to a box coordinate; sampling wraps it into [0,1]^3.
   Vec3 inv_box = make_vec3(1.0f / p.box.x, 1.0f / p.box.y, 1.0f / p.box.z);
 
   float t = t_near;
   Vec3 prev = cam.eye + dir * t;
-  float prev_v = s.value_at(p, prev * inv_box) - p.iso_value;
+  float prev_v = s.value_at(p, wrap_uvw(p, prev * inv_box)) - p.iso_value;
   t += p.step;
   while (t < t_far) {
     Vec3 pos = cam.eye + dir * t;
-    float cur_v = s.value_at(p, pos * inv_box) - p.iso_value;
+    float cur_v = s.value_at(p, wrap_uvw(p, pos * inv_box)) - p.iso_value;
     if (prev_v * cur_v <= 0.0f) {
       // Linear refinement of the crossing.
       float denom = (cur_v - prev_v);
       float frac = fabsf(denom) > 1e-12f ? prev_v / -denom : 0.0f;
       Vec3 hit = prev + (pos - prev) * frac;
-      Vec3 n = normalize(gradient(s, p, hit * inv_box));
+      Vec3 n = normalize(gradient(s, p, wrap_uvw(p, hit * inv_box)));
       // Two-sided Phong with a head light along the view direction. A warm,
       // mid-tone material so the surface reads clearly against a light/white
       // background (a near-white material would disappear).
@@ -312,17 +338,20 @@ MUEYE_HD inline Vec4 trace_ray_dvr(const Sampler &s,
                                    float u, float v) {
   Vec3 dir = primary_ray_dir(cam, u, v);
   float t_near, t_far;
-  if (!intersect_box(cam.eye, dir, p.box, t_near, t_far))
+  // The ray traverses the periodically tiled box [0, box*rep].
+  Vec3 tiled_box = make_vec3(p.box.x * p.rep_x, p.box.y * p.rep_y,
+                             p.box.z * p.rep_z);
+  if (!intersect_box(cam.eye, dir, tiled_box, t_near, t_far))
     return Vec4{p.bg.x, p.bg.y, p.bg.z, 1.0f};
 
-  // Map world position to normalized [0,1]^3 box coordinate for sampling.
+  // Map world position to a box coordinate; sampling wraps it into [0,1]^3.
   Vec3 inv_box = make_vec3(1.0f / p.box.x, 1.0f / p.box.y, 1.0f / p.box.z);
 
   Vec3 accum = make_vec3(0.0f, 0.0f, 0.0f);
   float trans = 1.0f;  // remaining transparency
   for (float t = t_near; t < t_far; t += p.step) {
     Vec3 pos = cam.eye + dir * t;
-    float val = s.value_at(p, pos * inv_box);
+    float val = s.value_at(p, wrap_uvw(p, pos * inv_box));
     float nv = normalize_value(p, val);
     Vec4 c = lut_lookup(lut, p, nv);
     // Opacity correction for the step size, then global density scale.

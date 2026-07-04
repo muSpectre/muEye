@@ -10,23 +10,9 @@
 
 #include <chrono>
 
+#include "io/PngWriter.hh"
+
 namespace mueye {
-
-namespace {
-
-// World-space extents of the volume box: the grid shape normalized so the
-// longest axis is 1. Cubic grids give {1,1,1}; a 2D grid (nz==1) gives a thin
-// box that renders as a plane. Keep in sync with RenderParams::box.
-Vec3 box_extent(int nx, int ny, int nz) {
-  int m = nx;
-  if (ny > m) m = ny;
-  if (nz > m) m = nz;
-  if (m < 1) m = 1;
-  float f = 1.0f / static_cast<float>(m);
-  return Vec3{nx * f, ny * f, nz * f};
-}
-
-}  // namespace
 
 App::App() {
   backends_ = enumerate_backends();
@@ -116,6 +102,75 @@ void App::reload_volume() {
   needs_render_ = true;
 }
 
+// Upload data to the backend only when it changed (cheap for CPU, avoids a
+// device round-trip every frame for Metal/CUDA/HIP).
+void App::sync_renderer_data() {
+  if (volume_dirty_) {
+    renderer_->set_volume(volume_.data.data(), volume_.nx, volume_.ny,
+                          volume_.nz);
+    volume_dirty_ = false;
+  }
+  if (tf_dirty_) {
+    renderer_->set_transfer_function(tf_.data(), tf_.size());
+    tf_dirty_ = false;
+  }
+}
+
+RenderParams App::make_render_params() const {
+  RenderParams p;
+  p.nx = volume_.nx;
+  p.ny = volume_.ny;
+  p.nz = volume_.nz;
+  p.box = box_extent(volume_.nx, volume_.ny, volume_.nz);
+  p.rep_x = rep(0);
+  p.rep_y = rep(1);
+  p.rep_z = rep(2);
+  // step_ is in voxels; the box's longest axis is 1 world unit, so one voxel
+  // along that axis is 1/max(nx,ny,nz) in world units.
+  int max_dim = volume_.nx;
+  if (volume_.ny > max_dim) max_dim = volume_.ny;
+  if (volume_.nz > max_dim) max_dim = volume_.nz;
+  p.step = step_ / static_cast<float>(max_dim > 0 ? max_dim : 1);
+  p.data_min = volume_.vmin;
+  p.data_max = volume_.vmax;
+  p.lut_size = tf_.size();
+  p.density_scale = density_scale_;
+  p.iso_value = iso_value_;
+  p.mode = mode_;
+  p.bg = Vec3{bg_[0], bg_[1], bg_[2]};
+  return p;
+}
+
+void App::save_png(const std::string &path) {
+  if (path.empty()) {
+    status_ = "Enter a file name to save the PNG.";
+    return;
+  }
+  if (volume_.empty() || !renderer_) {
+    status_ = "Nothing to save — load a file first.";
+    return;
+  }
+  // Full viewport resolution regardless of the interactive downscale.
+  int w = last_render_w_ > 0 ? last_render_w_ * render_downscale_ : 1280;
+  int h = last_render_h_ > 0 ? last_render_h_ * render_downscale_ : 720;
+
+  // Always go through the host-framebuffer path: with a zero-copy backend
+  // (render_to_gl) the pixels never reach fb_, so render afresh either way.
+  sync_renderer_data();
+  renderer_->set_num_threads(cpu_threads_);
+  Framebuffer fb;
+  fb.resize(w, h);
+  renderer_->render(make_render_params(),
+                    camera_.to_camera(static_cast<float>(w) / h), fb);
+
+  if (write_png(path, fb)) {
+    status_ = "Saved '" + path + "' (" + std::to_string(w) + "x" +
+              std::to_string(h) + ").";
+  } else {
+    status_ = "Failed to write '" + path + "'.";
+  }
+}
+
 void App::render(int width, int height) {
   if (width <= 0 || height <= 0) return;
   int rw = width / render_downscale_;
@@ -139,38 +194,10 @@ void App::render(int width, int height) {
     return;
   }
 
-  // Upload data to the backend only when it changed (cheap for CPU, avoids a
-  // device round-trip every frame for Metal/CUDA/HIP).
-  if (volume_dirty_) {
-    renderer_->set_volume(volume_.data.data(), volume_.nx, volume_.ny,
-                          volume_.nz);
-    volume_dirty_ = false;
-  }
-  if (tf_dirty_) {
-    renderer_->set_transfer_function(tf_.data(), tf_.size());
-    tf_dirty_ = false;
-  }
+  sync_renderer_data();
   renderer_->set_num_threads(cpu_threads_);  // no-op for GPU backends
 
-  RenderParams p;
-  p.nx = volume_.nx;
-  p.ny = volume_.ny;
-  p.nz = volume_.nz;
-  p.box = box_extent(volume_.nx, volume_.ny, volume_.nz);
-  // step_ is in voxels; the box's longest axis is 1 world unit, so one voxel
-  // along that axis is 1/max(nx,ny,nz) in world units.
-  int max_dim = volume_.nx;
-  if (volume_.ny > max_dim) max_dim = volume_.ny;
-  if (volume_.nz > max_dim) max_dim = volume_.nz;
-  p.step = step_ / static_cast<float>(max_dim > 0 ? max_dim : 1);
-  p.data_min = volume_.vmin;
-  p.data_max = volume_.vmax;
-  p.lut_size = tf_.size();
-  p.density_scale = density_scale_;
-  p.iso_value = iso_value_;
-  p.mode = mode_;
-  p.bg = Vec3{bg_[0], bg_[1], bg_[2]};
-
+  RenderParams p = make_render_params();
   Camera cam = camera_.to_camera(static_cast<float>(rw) / rh);
 
   auto t0 = std::chrono::high_resolution_clock::now();

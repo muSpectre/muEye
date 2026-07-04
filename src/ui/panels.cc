@@ -16,6 +16,40 @@
 
 namespace mueye {
 
+namespace {
+
+// Project a world-space point through the pinhole camera into pixel
+// coordinates on the viewport image (the inverse of render_core's
+// primary_ray_dir). Callers must ensure the point is in front of the camera.
+ImVec2 project_to_image(const Camera &cam, const Vec3 &pt, const ImVec2 &origin,
+                        float w, float h) {
+  Vec3 d = pt - cam.eye;
+  float z = dot(d, cam.forward);
+  float u = 0.5f * (dot(d, cam.right) / (z * cam.tan_half_fov * cam.aspect) +
+                    1.0f);
+  float v = 0.5f * (1.0f - dot(d, cam.up) / (z * cam.tan_half_fov));
+  return ImVec2(origin.x + u * w, origin.y + v * h);
+}
+
+// Draw one box edge as an overlay line, clipping it at the camera near plane
+// so edges partially behind the eye still draw correctly.
+void draw_box_edge(ImDrawList *dl, const Camera &cam, Vec3 a, Vec3 b,
+                   const ImVec2 &origin, float w, float h, ImU32 col) {
+  const float z_near = 1e-3f;
+  float za = dot(a - cam.eye, cam.forward);
+  float zb = dot(b - cam.eye, cam.forward);
+  if (za < z_near && zb < z_near) return;
+  if (za < z_near) {
+    a = a + (b - a) * ((z_near - za) / (zb - za));
+  } else if (zb < z_near) {
+    b = b + (a - b) * ((z_near - zb) / (za - zb));
+  }
+  dl->AddLine(project_to_image(cam, a, origin, w, h),
+              project_to_image(cam, b, origin, w, h), col, 1.5f);
+}
+
+}  // namespace
+
 // Arrange the panels into a default layout: a left control column (grouped into
 // three stacked tab-nodes) and a large viewport filling the rest. Called once
 // when there is no docking layout yet, so a saved imgui.ini still wins.
@@ -152,6 +186,33 @@ void App::draw_ui() {
 
     if (ImGui::SliderInt("Downscale", &render_downscale_, 1, 4))
       needs_render_ = true;
+
+    ImGui::Separator();
+    // Drawn as a viewport overlay, so toggling needs no re-render.
+    ImGui::Checkbox("Show box", &show_box_);
+
+    bool tiling_changed = ImGui::Checkbox("Periodic images", &periodic_);
+    if (periodic_) {
+      tiling_changed |= ImGui::InputInt3("Replicas", replicas_);
+    }
+    if (tiling_changed) {
+      for (int &r : replicas_) r = r < 1 ? 1 : (r > 8 ? 8 : r);
+      // Keep the view direction but recentre on the tiled box.
+      if (!volume_.empty()) {
+        Vec3 b = box_extent(volume_.nx, volume_.ny, volume_.nz);
+        camera_.retarget_box(Vec3{b.x * rep(0), b.y * rep(1), b.z * rep(2)});
+      }
+      needs_render_ = true;
+    }
+
+    ImGui::Separator();
+    // Snapshot of the ray-traced scene (at full viewport resolution; the box
+    // outline is a UI overlay and is not part of the saved image).
+    static char png_path[1024] = "mueye.png";
+    ImGui::InputText("PNG file", png_path, sizeof(png_path));
+    ImGui::BeginDisabled(volume_.empty());
+    if (ImGui::Button("Save PNG")) save_png(png_path);
+    ImGui::EndDisabled();
   }
   ImGui::End();
 
@@ -260,6 +321,40 @@ void App::draw_ui() {
       // ImGui) or an integer handle (ImU64 in recent versions).
       ImGui::Image((ImTextureID)(std::uintptr_t)texture_.id(),
                    ImVec2(static_cast<float>(vw), static_cast<float>(vh)));
+
+      // Box outline: project the edges of the (possibly tiled) volume box
+      // with the render camera and draw them over the image. Backend-agnostic
+      // by construction — no ray-march kernel is involved.
+      if (show_box_ && !volume_.empty()) {
+        ImVec2 img_pos = ImGui::GetItemRectMin();
+        Vec3 b = box_extent(volume_.nx, volume_.ny, volume_.nz);
+        Vec3 tb{b.x * rep(0), b.y * rep(1), b.z * rep(2)};
+        // Use the aspect the frame was actually rendered with (the downscaled
+        // framebuffer is stretched onto the viewport), so the outline lands
+        // exactly on the rendered box.
+        float aspect = last_render_h_ > 0
+                           ? static_cast<float>(last_render_w_) / last_render_h_
+                           : static_cast<float>(vw) / vh;
+        Camera cam = camera_.to_camera(aspect);
+        // Contrast the line with the background.
+        float lum = 0.2126f * bg_[0] + 0.7152f * bg_[1] + 0.0722f * bg_[2];
+        ImU32 col = lum > 0.5f ? IM_COL32(30, 30, 30, 200)
+                               : IM_COL32(225, 225, 225, 200);
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        // The 12 edges connect the corner pairs differing in one axis bit.
+        for (int i = 0; i < 8; ++i) {
+          Vec3 c0{(i & 1) ? tb.x : 0.0f, (i & 2) ? tb.y : 0.0f,
+                  (i & 4) ? tb.z : 0.0f};
+          for (int bit = 1; bit <= 4; bit <<= 1) {
+            if (i & bit) continue;
+            int j = i | bit;
+            Vec3 c1{(j & 1) ? tb.x : 0.0f, (j & 2) ? tb.y : 0.0f,
+                    (j & 4) ? tb.z : 0.0f};
+            draw_box_edge(dl, cam, c0, c1, img_pos,
+                          static_cast<float>(vw), static_cast<float>(vh), col);
+          }
+        }
+      }
 
       // Mouse interaction over the image drives the orbit camera.
       if (ImGui::IsItemHovered()) {

@@ -25,6 +25,18 @@
 
 namespace mueye {
 
+/** World-space extents of the volume box: the grid shape normalized so the
+ *  longest axis is 1. Cubic grids give {1,1,1}; a 2D grid (nz==1) gives a thin
+ *  box that renders as a plane. Keep in sync with RenderParams::box. */
+inline Vec3 box_extent(int nx, int ny, int nz) {
+  int m = nx;
+  if (ny > m) m = ny;
+  if (nz > m) m = nz;
+  if (m < 1) m = 1;
+  float f = 1.0f / static_cast<float>(m);
+  return Vec3{nx * f, ny * f, nz * f};
+}
+
 class App {
  public:
   App();
@@ -44,6 +56,12 @@ class App {
   // --- rendering -------------------------------------------------------
   void render(int width, int height);
   void set_backend(Backend backend);
+  RenderParams make_render_params() const;
+  void sync_renderer_data();  //!< (re-)upload volume / LUT if dirty
+
+  /** Re-render the current scene into a host framebuffer at full viewport
+   *  resolution (ignoring the interactive downscale) and write it as a PNG. */
+  void save_png(const std::string &path);
 
   VolumeLoader loader_;
   FileMeta meta_;
@@ -66,6 +84,13 @@ class App {
   float density_scale_{1.0f};
   float iso_value_{0.5f};
   float bg_[3] = {1.0f, 1.0f, 1.0f};  // white scene background
+  bool show_box_{true};   //!< draw the volume box outline over the viewport
+  bool periodic_{false};  //!< tile the volume periodically
+  int replicas_[3] = {2, 2, 2};  //!< replicas per axis while periodic_ is on
+
+  /** Replica count actually applied along @p axis (1 unless periodic tiling
+   *  is enabled). */
+  int rep(int axis) const { return periodic_ ? replicas_[axis] : 1; }
 
   // --- renderer / output ----------------------------------------------
   std::unique_ptr<Renderer> renderer_;

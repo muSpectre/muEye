@@ -30,6 +30,12 @@ struct FieldInfo {
   bool has_tensor_dim{false};  //!< file has a tensor_dim__ axis for this field;
                                //!< if false the field is a true scalar and must
                                //!< be read back with an empty component shape
+  bool is_double{true};  //!< variable is stored as NC_DOUBLE. muGrid's read
+                         //!< path transfers raw bytes into its Real (double)
+                         //!< fields without type conversion, so only double
+                         //!< variables can go through it; float variables
+                         //!< (e.g. muFFTTO output) are read directly via
+                         //!< netcdf-c instead.
 };
 
 /** Metadata describing the whole file. */

@@ -25,6 +25,7 @@
 #include "collection/field_collection_global.hh"
 #include "core/types.hh"
 #include "field/field.hh"
+#include "io/PngWriter.hh"
 #include "io/Volume.hh"
 #include "io/VolumeLoader.hh"
 #include "io/file_io_base.hh"
@@ -144,6 +145,38 @@ int check_file(const std::string &path, const char *ppm_out) {
     return 1;
   }
 
+  // Cross-check the direct netcdf-c read path (used for non-double variables,
+  // e.g. muFFTTO's float32 output) against the muGrid read path on the same
+  // double variable: both must produce the identical volume. The last frame of
+  // the 3D demo holds an off-centre cube, so an axis mix-up cannot cancel out.
+  {
+    int fcheck = meta.nb_frames - 1;
+    mueye::Volume vg, vd;
+    mueye::FieldInfo direct = meta.fields[0];
+    direct.is_double = false;  // force the netcdf-c path
+    std::string e1 = loader.load(path, meta, meta.fields[0], fcheck,
+                                 mueye::Scalarize::Component, 0, vg);
+    std::string e2 = loader.load(path, meta, direct, fcheck,
+                                 mueye::Scalarize::Component, 0, vd);
+    if (!e1.empty() || !e2.empty() || vg.data.size() != vd.data.size() ||
+        vg.data.empty()) {
+      std::fprintf(stderr, "direct-read cross-check failed to load (%s%s)\n",
+                   e1.c_str(), e2.c_str());
+      return 1;
+    }
+    float max_diff = 0.0f;
+    for (std::size_t i = 0; i < vg.data.size(); ++i) {
+      float d = std::fabs(vg.data[i] - vd.data[i]);
+      if (d > max_diff) max_diff = d;
+    }
+    std::printf("direct netcdf read vs muGrid read: max|Δ| = %g\n",
+                double(max_diff));
+    if (max_diff > 0.0f) {
+      std::fprintf(stderr, "direct read path disagrees with muGrid read.\n");
+      return 1;
+    }
+  }
+
   mueye::TransferFunction tf;
   tf.set_colormap(mueye::Colormap::Viridis);
   tf.set_opacity_scale(1.0f);
@@ -155,7 +188,7 @@ int check_file(const std::string &path, const char *ppm_out) {
   float f = 1.0f / static_cast<float>(md);
   mueye::OrbitCamera cam;
   cam.frame_box(mueye::Vec3{vol.nx * f, vol.ny * f, vol.nz * f});
-  const mueye::Camera camv = cam.to_camera(1.0f);
+  mueye::Camera camv = cam.to_camera(1.0f);
 
   mueye::RenderParams p;
   p.nx = vol.nx;
@@ -188,8 +221,16 @@ int check_file(const std::string &path, const char *ppm_out) {
   double frac = double(nonbg) / (fb_cpu.width * fb_cpu.height);
   std::printf("CPU DVR 256x256: %zu non-background px (%.1f%%)\n", nonbg,
               100.0 * frac);
-  if (ppm_out && write_ppm(ppm_out, fb_cpu))
-    std::printf("wrote %s\n", ppm_out);
+  if (ppm_out) {
+    if (write_ppm(ppm_out, fb_cpu)) std::printf("wrote %s\n", ppm_out);
+    // Also exercise the PNG writer the GUI's "Save PNG" button uses.
+    std::string png_out = std::string(ppm_out) + ".png";
+    if (!mueye::write_png(png_out, fb_cpu)) {
+      std::fprintf(stderr, "PNG write failed: %s\n", png_out.c_str());
+      return 1;
+    }
+    std::printf("wrote %s\n", png_out.c_str());
+  }
   if (frac < 0.02) {
     std::fprintf(stderr, "render produced almost nothing; check pipeline.\n");
     return 1;
@@ -200,33 +241,60 @@ int check_file(const std::string &path, const char *ppm_out) {
     if (fb_cpu.rgba[i * 4] > 60) ++iso_hits;
   std::printf("CPU isosurface: %zu lit px\n", iso_hits);
 
-  // Re-render CPU DVR as the comparison reference.
+  // Render a CPU DVR reference with the current params, then require every
+  // other available backend to agree with it.
+  auto compare_backends = [&](const char *what) {
+    render_with(cpu, fb_cpu, mueye::RenderMode::DVR);
+    int bad = 0;
+    for (const mueye::BackendInfo &bi : mueye::enumerate_backends()) {
+      if (bi.backend == mueye::Backend::CPU) continue;
+      if (!bi.available) {
+        std::printf("backend %-14s : unavailable (%s)\n", bi.name, bi.note);
+        continue;
+      }
+      auto r = mueye::create_renderer(bi.backend);
+      if (!r) {
+        std::printf("backend %-14s : create failed\n", bi.name);
+        continue;
+      }
+      mueye::Framebuffer fb;
+      fb.resize(256, 256);
+      render_with(*r, fb, mueye::RenderMode::DVR);
+
+      double sum = 0.0;
+      for (std::size_t i = 0; i < fb.rgba.size(); ++i)
+        sum += std::abs(int(fb.rgba[i]) - int(fb_cpu.rgba[i]));
+      double mean_abs_diff = sum / fb.rgba.size();
+      std::printf("backend %-14s : %s mean|Δ| vs CPU = %.3f / 255\n", bi.name,
+                  what, mean_abs_diff);
+      if (mean_abs_diff > 4.0) ++bad;
+    }
+    return bad;
+  };
+
+  int mismatches = compare_backends("DVR");
+
+  // Periodic tiling: 2x2x2 replicas, camera reframed on the enlarged box.
+  p.rep_x = 2;
+  p.rep_y = 2;
+  p.rep_z = 2;
+  cam.frame_box(
+      mueye::Vec3{2 * vol.nx * f, 2 * vol.ny * f, 2 * vol.nz * f});
+  camv = cam.to_camera(1.0f);
   render_with(cpu, fb_cpu, mueye::RenderMode::DVR);
-
-  int mismatches = 0;
-  for (const mueye::BackendInfo &bi : mueye::enumerate_backends()) {
-    if (bi.backend == mueye::Backend::CPU) continue;
-    if (!bi.available) {
-      std::printf("backend %-14s : unavailable (%s)\n", bi.name, bi.note);
-      continue;
-    }
-    auto r = mueye::create_renderer(bi.backend);
-    if (!r) {
-      std::printf("backend %-14s : create failed\n", bi.name);
-      continue;
-    }
-    mueye::Framebuffer fb;
-    fb.resize(256, 256);
-    render_with(*r, fb, mueye::RenderMode::DVR);
-
-    double sum = 0.0;
-    for (std::size_t i = 0; i < fb.rgba.size(); ++i)
-      sum += std::abs(int(fb.rgba[i]) - int(fb_cpu.rgba[i]));
-    double mean_abs_diff = sum / fb.rgba.size();
-    std::printf("backend %-14s : mean|Δ| vs CPU = %.3f / 255\n", bi.name,
-                mean_abs_diff);
-    if (mean_abs_diff > 4.0) ++mismatches;
+  std::size_t nonbg_rep = count_nonbg(fb_cpu);
+  double frac_rep = double(nonbg_rep) / (fb_cpu.width * fb_cpu.height);
+  std::printf("CPU DVR 2x2x2 replicas: %zu non-background px (%.1f%%)\n",
+              nonbg_rep, 100.0 * frac_rep);
+  if (ppm_out &&
+      mueye::write_png(std::string(ppm_out) + ".rep.png", fb_cpu))
+    std::printf("wrote %s.rep.png\n", ppm_out);
+  if (frac_rep < 0.02) {
+    std::fprintf(stderr, "replicated render produced almost nothing.\n");
+    return 1;
   }
+  mismatches += compare_backends("DVR 2x2x2");
+
   if (mismatches) {
     std::fprintf(stderr, "%d backend(s) diverged from the CPU reference.\n",
                  mismatches);
@@ -235,9 +303,87 @@ int check_file(const std::string &path, const char *ppm_out) {
   return 0;
 }
 
+/**
+ * View mode (`muEye_check --view file.nc [field]`): render an existing file
+ * with the GUI's default appearance (DVR, default transfer function, white
+ * background) to view.png / view_rep.png (2x2x2 periodic replicas). Purely a
+ * preview/diagnosis aid; the file is only read, never written.
+ */
+int view_file(const std::string &path, const char *field_name) {
+  mueye::VolumeLoader loader;
+  mueye::FileMeta meta = loader.open(path);
+  if (!meta.valid) {
+    std::fprintf(stderr, "introspection failed: %s\n", meta.error.c_str());
+    return 1;
+  }
+  std::printf("%s: %d x %d x %d (spatial_dim=%d), %d frame(s)\n", path.c_str(),
+              meta.nx, meta.ny, meta.nz, meta.spatial_dim, meta.nb_frames);
+  int fi = 0;
+  for (std::size_t i = 0; i < meta.fields.size(); ++i) {
+    const mueye::FieldInfo &f = meta.fields[i];
+    std::printf("  field %zu: %s (%d comp)\n", i, f.name.c_str(),
+                f.nb_components);
+    if (field_name && f.name == field_name) fi = static_cast<int>(i);
+  }
+
+  mueye::Volume vol;
+  std::string err = loader.load(path, meta, meta.fields[fi], 0,
+                                mueye::Scalarize::Component, 0, vol);
+  if (!err.empty()) {
+    std::fprintf(stderr, "load failed: %s\n", err.c_str());
+    return 1;
+  }
+  std::printf("rendering field '%s': %dx%dx%d range [%g, %g]\n",
+              meta.fields[fi].name.c_str(), vol.nx, vol.ny, vol.nz, vol.vmin,
+              vol.vmax);
+
+  mueye::TransferFunction tf;  // GUI defaults
+  int md = vol.nx > vol.ny ? vol.nx : vol.ny;
+  if (vol.nz > md) md = vol.nz;
+  if (md < 1) md = 1;
+  float f = 1.0f / static_cast<float>(md);
+  mueye::Vec3 box{vol.nx * f, vol.ny * f, vol.nz * f};
+
+  mueye::RenderParams p;
+  p.nx = vol.nx;
+  p.ny = vol.ny;
+  p.nz = vol.nz;
+  p.box = box;
+  p.step = 0.5f * f;
+  p.data_min = vol.vmin;
+  p.data_max = vol.vmax;
+  p.lut_size = tf.size();
+  p.density_scale = 1.0f;
+  p.iso_value = 0.5f * (vol.vmin + vol.vmax);
+  p.mode = mueye::RenderMode::DVR;
+  p.bg = mueye::Vec3{1.0f, 1.0f, 1.0f};  // GUI default: white
+
+  mueye::CpuRenderer cpu;
+  cpu.set_volume(vol.data.data(), vol.nx, vol.ny, vol.nz);
+  cpu.set_transfer_function(tf.data(), tf.size());
+  mueye::Framebuffer fb;
+  fb.resize(512, 512);
+
+  mueye::OrbitCamera cam;
+  cam.frame_box(box);
+  cpu.render(p, cam.to_camera(1.0f), fb);
+  if (!mueye::write_png("view.png", fb)) return 1;
+  std::printf("wrote view.png (1x1x1)\n");
+
+  p.rep_x = p.rep_y = p.rep_z = 2;
+  cam.retarget_box(mueye::Vec3{2 * box.x, 2 * box.y, 2 * box.z});
+  cpu.render(p, cam.to_camera(1.0f), fb);
+  if (!mueye::write_png("view_rep.png", fb)) return 1;
+  std::printf("wrote view_rep.png (2x2x2 replicas)\n");
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
+  if (argc > 2 && std::string(argv[1]) == "--view") {
+    return view_file(argv[2], argc > 3 ? argv[3] : nullptr);
+  }
   const std::string path = argc > 1 ? argv[1] : "demo.nc";
   const int n = argc > 2 ? std::atoi(argv[2]) : 64;
 

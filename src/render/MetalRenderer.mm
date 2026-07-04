@@ -35,7 +35,8 @@ struct GpuParams {
   float tan_half_fov;
   float aspect;
   int nx, ny, nz;
-  float box_x, box_y, box_z;  // world-space extents of the volume box [0,box]
+  float box_x, box_y, box_z;  // world-space extents of one volume box [0,box]
+  int rep_x, rep_y, rep_z;    // periodic replicas per axis (>= 1)
   float step;
   float data_min, data_max;
   int lut_size;
@@ -60,6 +61,7 @@ struct P {
     float aspect;
     int nx, ny, nz;
     float box_x, box_y, box_z;
+    int rep_x, rep_y, rep_z;
     float step;
     float data_min, data_max;
     int lut_size;
@@ -80,11 +82,22 @@ static float sample(texture3d<float> vol, float3 uvw) {
     return vol.sample(volSampler, uvw).r;
 }
 
+// Wrap a box coordinate into [0,1) when the axis is periodically replicated;
+// untouched otherwise (mirrors render_core.hh's wrap_coord/wrap_uvw).
+static float wrap_coord(float u, int rep) {
+    return rep > 1 ? u - floor(u) : u;
+}
+
+static float3 wrap_uvw(constant P& p, float3 uvw) {
+    return float3(wrap_coord(uvw.x, p.rep_x), wrap_coord(uvw.y, p.rep_y),
+                  wrap_coord(uvw.z, p.rep_z));
+}
+
 static float3 gradient(texture3d<float> vol, constant P& p, float3 uvw) {
     float hx = 1.0/p.nx, hy = 1.0/p.ny, hz = 1.0/p.nz;
-    float gx = sample(vol,float3(uvw.x+hx,uvw.y,uvw.z)) - sample(vol,float3(uvw.x-hx,uvw.y,uvw.z));
-    float gy = sample(vol,float3(uvw.x,uvw.y+hy,uvw.z)) - sample(vol,float3(uvw.x,uvw.y-hy,uvw.z));
-    float gz = sample(vol,float3(uvw.x,uvw.y,uvw.z+hz)) - sample(vol,float3(uvw.x,uvw.y,uvw.z-hz));
+    float gx = sample(vol,float3(wrap_coord(uvw.x+hx,p.rep_x),uvw.y,uvw.z)) - sample(vol,float3(wrap_coord(uvw.x-hx,p.rep_x),uvw.y,uvw.z));
+    float gy = sample(vol,float3(uvw.x,wrap_coord(uvw.y+hy,p.rep_y),uvw.z)) - sample(vol,float3(uvw.x,wrap_coord(uvw.y-hy,p.rep_y),uvw.z));
+    float gz = sample(vol,float3(uvw.x,uvw.y,wrap_coord(uvw.z+hz,p.rep_z))) - sample(vol,float3(uvw.x,uvw.y,wrap_coord(uvw.z-hz,p.rep_z)));
     return float3(gx, gy, gz);
 }
 
@@ -152,12 +165,14 @@ kernel void raymarch_dvr(texture3d<float>     vol [[texture(0)]],
     float t_near, t_far;
     float3 box = float3(p.box_x, p.box_y, p.box_z);
     float3 inv_box = 1.0 / box;
-    if (intersect_box(eye, dir, box, t_near, t_far)) {
+    // The ray traverses the periodically tiled box [0, box*rep].
+    float3 tiled_box = box * float3(p.rep_x, p.rep_y, p.rep_z);
+    if (intersect_box(eye, dir, tiled_box, t_near, t_far)) {
         float3 accum = float3(0.0);
         float trans = 1.0;
         for (float t = t_near; t < t_far; t += p.step) {
             float3 pos = eye + dir*t;
-            float val = sample(vol, pos * inv_box);
+            float val = sample(vol, wrap_uvw(p, pos * inv_box));
             float nv = normalize_value(p, val);
             float f = nv * (p.lut_size - 1);
             int i0 = clamp(int(f), 0, p.lut_size - 1);
@@ -189,19 +204,21 @@ kernel void raymarch_iso(texture3d<float>     vol [[texture(0)]],
     float t_near, t_far;
     float3 box = float3(p.box_x, p.box_y, p.box_z);
     float3 inv_box = 1.0 / box;
-    if (intersect_box(eye, dir, box, t_near, t_far)) {
+    // The ray traverses the periodically tiled box [0, box*rep].
+    float3 tiled_box = box * float3(p.rep_x, p.rep_y, p.rep_z);
+    if (intersect_box(eye, dir, tiled_box, t_near, t_far)) {
         float t = t_near;
         float3 prev = eye + dir*t;
-        float prev_v = sample(vol, prev * inv_box) - p.iso_value;
+        float prev_v = sample(vol, wrap_uvw(p, prev * inv_box)) - p.iso_value;
         t += p.step;
         while (t < t_far) {
             float3 pos = eye + dir*t;
-            float cur_v = sample(vol, pos * inv_box) - p.iso_value;
+            float cur_v = sample(vol, wrap_uvw(p, pos * inv_box)) - p.iso_value;
             if (prev_v * cur_v <= 0.0) {
                 float denom = cur_v - prev_v;
                 float frac = fabs(denom) > 1e-12 ? prev_v / -denom : 0.0;
                 float3 hitp = prev + (pos - prev)*frac;
-                float3 nrm = normalize(gradient(vol, p, hitp * inv_box));
+                float3 nrm = normalize(gradient(vol, p, wrap_uvw(p, hitp * inv_box)));
                 float3 l = normalize(eye - hitp);
                 float diff = fabs(dot(nrm, l));
                 float3 base = float3(0.82, 0.45, 0.20);
@@ -350,6 +367,7 @@ void MetalRenderer::render(const RenderParams &params, const Camera &camera,
     p.aspect = camera.aspect;
     p.nx = params.nx; p.ny = params.ny; p.nz = params.nz;
     p.box_x = params.box.x; p.box_y = params.box.y; p.box_z = params.box.z;
+    p.rep_x = params.rep_x; p.rep_y = params.rep_y; p.rep_z = params.rep_z;
     p.step = params.step;
     p.data_min = params.data_min; p.data_max = params.data_max;
     p.lut_size = params.lut_size;

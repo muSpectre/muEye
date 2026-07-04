@@ -186,12 +186,16 @@ add_executable(muEye
     src/ui/TransferFunction.cc
     src/io/Volume.cc
     src/io/VolumeLoader.cc
+    src/io/PngWriter.cc
     src/gl/GlTexture.cc
     ${MUEYE_RENDER_SOURCES})
 
 target_include_directories(muEye PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${NetCDF_INCLUDE_DIRS})
+# Vendored single-header libs (stb_image_write); SYSTEM keeps -Wall quiet there.
+target_include_directories(muEye SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
 target_compile_definitions(muEye PRIVATE ${MUEYE_BACKEND_DEFS})
 
@@ -223,6 +227,7 @@ add_executable(muEye_check
     tools/offscreen_check.cc
     src/io/Volume.cc
     src/io/VolumeLoader.cc
+    src/io/PngWriter.cc
     src/ui/OrbitCamera.cc
     src/ui/TransferFunction.cc
     ${MUEYE_RENDER_SOURCES})
@@ -230,6 +235,8 @@ set_target_properties(muEye_check PROPERTIES EXCLUDE_FROM_ALL TRUE)
 target_include_directories(muEye_check PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${NetCDF_INCLUDE_DIRS})
+target_include_directories(muEye_check SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 target_compile_definitions(muEye_check PRIVATE ${MUEYE_BACKEND_DEFS})
 target_link_libraries(muEye_check PRIVATE
     muGrid

@@ -29,34 +29,35 @@ const char *to_string(Scalarize s) {
 
 namespace {
 
-// Reduce the nb_components values at one voxel (component stride 1) to a scalar.
+// Reduce the nb_components values at one voxel (component stride sc) to a
+// scalar.
 double reduce(const double *base, int nb_components, Scalarize mode,
-              int component) {
+              int component, std::ptrdiff_t sc) {
   switch (mode) {
     case Scalarize::Component: {
       int c = component;
       if (c < 0) c = 0;
       if (c >= nb_components) c = nb_components - 1;
-      return base[c];
+      return base[c * sc];
     }
     case Scalarize::Magnitude: {
       double s = 0.0;
-      for (int c = 0; c < nb_components; ++c) s += base[c] * base[c];
+      for (int c = 0; c < nb_components; ++c) s += base[c * sc] * base[c * sc];
       return std::sqrt(s);
     }
     case Scalarize::Trace: {
       // Interpret the 9 components as a row-major 3x3 tensor: diag = 0,4,8.
-      if (nb_components >= 9) return base[0] + base[4] + base[8];
+      if (nb_components >= 9) return base[0] + base[4 * sc] + base[8 * sc];
       // Fallback: sum of available components.
       double s = 0.0;
-      for (int c = 0; c < nb_components; ++c) s += base[c];
+      for (int c = 0; c < nb_components; ++c) s += base[c * sc];
       return s;
     }
     case Scalarize::VonMises: {
       if (nb_components >= 9) {
         // sigma indices (row-major 3x3): 0 1 2 / 3 4 5 / 6 7 8
-        double sxx = base[0], syy = base[4], szz = base[8];
-        double sxy = base[1], syz = base[5], sxz = base[2];
+        double sxx = base[0], syy = base[4 * sc], szz = base[8 * sc];
+        double sxy = base[1 * sc], syz = base[5 * sc], sxz = base[2 * sc];
         double a = sxx - syy, b = syy - szz, c = szz - sxx;
         double j2 = 0.5 * (a * a + b * b + c * c) +
                     3.0 * (sxy * sxy + syz * syz + sxz * sxz);
@@ -64,7 +65,7 @@ double reduce(const double *base, int nb_components, Scalarize mode,
       }
       // Fallback to magnitude for non-3x3 fields.
       double s = 0.0;
-      for (int c = 0; c < nb_components; ++c) s += base[c] * base[c];
+      for (int c = 0; c < nb_components; ++c) s += base[c * sc] * base[c * sc];
       return std::sqrt(s);
     }
   }
@@ -76,7 +77,8 @@ double reduce(const double *base, int nb_components, Scalarize mode,
 void Volume::from_field(const double *src, int nx_, int ny_, int nz_,
                         int nb_components, std::ptrdiff_t stride_x,
                         std::ptrdiff_t stride_y, std::ptrdiff_t stride_z,
-                        Scalarize mode, int component) {
+                        Scalarize mode, int component,
+                        std::ptrdiff_t stride_c) {
   nx = nx_;
   ny = ny_;
   nz = nz_;
@@ -90,7 +92,7 @@ void Volume::from_field(const double *src, int nx_, int ny_, int nz_,
       for (int i = 0; i < nx; ++i) {
         const double *base =
             src + i * stride_x + j * stride_y + k * stride_z;
-        double v = reduce(base, nb_components, mode, component);
+        double v = reduce(base, nb_components, mode, component, stride_c);
         if (v < lo) lo = v;
         if (v > hi) hi = v;
         data[static_cast<std::size_t>(i) + nx * (j + static_cast<std::size_t>(ny) * k)] =

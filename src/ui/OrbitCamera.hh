@@ -25,6 +25,11 @@ class OrbitCamera {
    *  (see RenderParams::box) — so 2D/planar and non-cubic grids frame nicely. */
   void frame_box(const Vec3 &box);
 
+  /** Re-centre the target and viewing distance on a box of the given extents
+   *  *without* resetting the orbit angles — used when periodic tiling grows or
+   *  shrinks the rendered box under an existing view. */
+  void retarget_box(const Vec3 &box);
+
   /** Orbit by mouse drag deltas (in radians-equivalent screen units). */
   void orbit(float dyaw, float dpitch);
   /** Dolly in/out (e.g. mouse wheel); positive zooms in. */

@@ -45,6 +45,106 @@ bool starts_with(const std::string &s, const char *prefix) {
   return s.rfind(prefix, 0) == 0;
 }
 
+/**
+ * Read one frame of @p field straight through the netcdf-c API, bypassing
+ * muGrid. Used for variables not stored as NC_DOUBLE: muGrid's read path
+ * (serial nc_get_varm) transfers raw bytes into its Real (double) fields with
+ * no type conversion, so an NC_FLOAT variable read through it comes back as
+ * reinterpreted garbage. nc_get_vara_double converts on read instead.
+ *
+ * The hyperslab is fetched in the file's row-major dimension order
+ * (frame, [tensor_dim...], [subpt], nx, ny, nz) — muGrid writes with an imap,
+ * so the nx/ny/nz axes in the file are the true x/y/z axes — and handed to
+ * Volume::from_field with the matching per-axis and per-component strides.
+ * Only sub-point 0 is read, like the muGrid path renders.
+ */
+std::string load_via_netcdf(const std::string &path, const FileMeta &meta,
+                            const FieldInfo &field, int frame, Scalarize mode,
+                            int component, Volume &out) {
+  int ncid = -1;
+  int status = nc_open(path.c_str(), NC_NOWRITE, &ncid);
+  if (status != NC_NOERR)
+    return std::string("nc_open failed: ") + nc_strerror(status);
+
+  int varid = -1;
+  status = nc_inq_varid(ncid, field.name.c_str(), &varid);
+  if (status != NC_NOERR) {
+    nc_close(ncid);
+    return "Variable '" + field.name + "' vanished from the file.";
+  }
+  int ndims = 0;
+  int dimids[NC_MAX_VAR_DIMS];
+  if (nc_inq_var(ncid, varid, nullptr, nullptr, &ndims, dimids, nullptr) !=
+      NC_NOERR) {
+    nc_close(ncid);
+    return "Failed to inquire variable '" + field.name + "'.";
+  }
+
+  int dx = find_dim(ncid, "nx");
+  int dy = find_dim(ncid, "ny");
+  int dz = find_dim(ncid, "nz");
+  int frame_dim = find_dim(ncid, "frame");
+
+  // One hyperslab covering the selected frame, sub-point 0, all components
+  // and the full grid.
+  std::vector<std::size_t> start(ndims, 0), count(ndims, 1);
+  for (int d = 0; d < ndims; ++d) {
+    int did = dimids[d];
+    if (did == frame_dim) {
+      start[d] = static_cast<std::size_t>(frame);
+      continue;  // count stays 1
+    }
+    char dname[NC_MAX_NAME + 1] = {0};
+    nc_inq_dimname(ncid, did, dname);
+    if (starts_with(dname, "subpt")) continue;  // sub-point 0 only
+    count[d] = dim_len(ncid, did);              // grid or component axis
+  }
+
+  // Row-major element strides within the fetched buffer.
+  std::vector<std::ptrdiff_t> stride(ndims, 0);
+  std::ptrdiff_t total = 1;
+  for (int d = ndims - 1; d >= 0; --d) {
+    stride[d] = total;
+    total *= static_cast<std::ptrdiff_t>(count[d]);
+  }
+
+  std::ptrdiff_t sx = 0, sy = 0, sz = 0, sc = 1;
+  int nb_comp = 1;
+  for (int d = 0; d < ndims; ++d) {
+    int did = dimids[d];
+    if (did == dx) {
+      sx = stride[d];
+    } else if (did == dy) {
+      sy = stride[d];
+    } else if (dz >= 0 && did == dz) {
+      sz = stride[d];
+    } else if (did != frame_dim && count[d] > 1) {
+      // Component (tensor_dim__*) axis. Adjacent axes nest row-major, so the
+      // flat component index advances by the stride of the fastest one.
+      nb_comp *= static_cast<int>(count[d]);
+      sc = stride[d];
+    }
+  }
+  std::ptrdiff_t expect = static_cast<std::ptrdiff_t>(meta.nx) * meta.ny *
+                          meta.nz * nb_comp;
+  if (sx == 0 || sy == 0 || total != expect) {
+    nc_close(ncid);
+    return "Unexpected layout of variable '" + field.name + "'.";
+  }
+
+  // Typed read: netcdf converts the stored type (float, ...) to double.
+  std::vector<double> buf(static_cast<std::size_t>(total));
+  status =
+      nc_get_vara_double(ncid, varid, start.data(), count.data(), buf.data());
+  nc_close(ncid);
+  if (status != NC_NOERR)
+    return std::string("nc_get_vara_double failed: ") + nc_strerror(status);
+
+  out.from_field(buf.data(), meta.nx, meta.ny, meta.nz, nb_comp, sx, sy, sz,
+                 mode, component, sc);
+  return "";
+}
+
 }  // namespace
 
 FileMeta VolumeLoader::open(const std::string &path) {
@@ -109,6 +209,7 @@ FileMeta VolumeLoader::open(const std::string &path) {
     fi.name = vname;
     fi.nb_components = 1;
     fi.nb_sub_pts = 1;
+    fi.is_double = (vtype == NC_DOUBLE);
 
     // Classify the remaining dimensions: tensor_dim__* -> components,
     // subpt__* -> sub-points, frame/grid -> ignored.
@@ -151,6 +252,11 @@ FileMeta VolumeLoader::open(const std::string &path) {
 std::string VolumeLoader::load(const std::string &path, const FileMeta &meta,
                                const FieldInfo &field, int frame,
                                Scalarize mode, int component, Volume &out) {
+  // Non-double variables (e.g. muFFTTO's float32 output) cannot go through
+  // muGrid's byte-copying read path; fetch them directly via netcdf-c.
+  if (!field.is_double) {
+    return load_via_netcdf(path, meta, field, frame, mode, component, out);
+  }
   try {
     // Build a field collection matching the file's spatial dimension. A genuine
     // 2D file (no nz axis) must be read through a 2D collection; a 3D file (or

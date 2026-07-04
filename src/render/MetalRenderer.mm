@@ -170,6 +170,9 @@ kernel void raymarch_dvr(texture3d<float>     vol [[texture(0)]],
     if (intersect_box(eye, dir, tiled_box, t_near, t_far)) {
         float3 accum = float3(0.0);
         float trans = 1.0;
+        // Opacity correction uses the longest grid axis so density does not
+        // depend on axis order (mirrors render_core.hh's trace_ray_dvr).
+        float max_dim = float(max(max(p.nx, p.ny), p.nz));
         for (float t = t_near; t < t_far; t += p.step) {
             float3 pos = eye + dir*t;
             float val = sample(vol, wrap_uvw(p, pos * inv_box));
@@ -178,7 +181,7 @@ kernel void raymarch_dvr(texture3d<float>     vol [[texture(0)]],
             int i0 = clamp(int(f), 0, p.lut_size - 1);
             int i1 = min(i0 + 1, p.lut_size - 1);
             float4 c = mix(lut[i0], lut[i1], f - i0);
-            float alpha = clamp(c.w * p.density_scale * p.step * p.nx, 0.0, 1.0);
+            float alpha = clamp(c.w * p.density_scale * p.step * max_dim, 0.0, 1.0);
             accum += c.rgb * (alpha * trans);
             trans *= (1.0 - alpha);
             if (trans < 0.003) break;

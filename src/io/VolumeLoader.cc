@@ -11,8 +11,7 @@
 #include <netcdf.h>
 
 #include <algorithm>
-#include <map>
-#include <stdexcept>
+#include <exception>
 
 // muGrid headers (resolved via the muGrid target's build-interface include dirs)
 #include "collection/field_collection.hh"
@@ -174,8 +173,6 @@ FileMeta VolumeLoader::open(const std::string &path) {
   meta.spatial_dim = dz >= 0 ? 3 : 2;
 
   // Frame (unlimited) dimension.
-  int unlim = -1;
-  nc_inq_unlimdim(ncid, &unlim);
   int frame_dim = find_dim(ncid, "frame");
   if (frame_dim >= 0) {
     meta.nb_frames = std::max<int>(1, static_cast<int>(dim_len(ncid, frame_dim)));

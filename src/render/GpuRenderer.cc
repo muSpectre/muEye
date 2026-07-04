@@ -26,6 +26,8 @@
 
 #include "render/GpuRenderer.hh"
 
+#include <string>
+
 // muGrid's gpu_runtime.hh keys off MUGRID_ENABLE_CUDA / MUGRID_ENABLE_HIP and
 // pulls in <cuda_runtime.h> / <hip/hip_runtime.h>. The muEye CMake defines the
 // matching MUGRID_* macro alongside MUEYE_* when a GPU backend is enabled.
@@ -207,8 +209,11 @@ Backend GpuRenderer::backend() const {
 
 void GpuRenderer::set_volume(const float *data, int nx, int ny, int nz) {
   if (data == nullptr) return;
+  error_.clear();
 
-  // Release any previous texture + backing array.
+  // Release any previous texture + backing array. On any failure below we
+  // return with d_tex_ == 0, which makes render()/render_to_gl() no-ops until
+  // a later upload succeeds.
   if (d_tex_) {
     GPU_(DestroyTextureObject)(handle_to_tex(d_tex_));
     d_tex_ = 0;
@@ -226,7 +231,14 @@ void GpuRenderer::set_volume(const float *data, int nx, int ny, int nz) {
   gpuArray_t array = nullptr;
   // The trailing flags arg is required by HIP's hipMalloc3DArray (CUDA defaults
   // it to 0); pass 0 explicitly so the call compiles under both.
-  GPU_(Malloc3DArray)(&array, &channel, gpu_make_extent(nx, ny, nz), 0);
+  GPU_(Error_t) err =
+      GPU_(Malloc3DArray)(&array, &channel, gpu_make_extent(nx, ny, nz), 0);
+  if (err != GPU_(Success) || array == nullptr) {
+    error_ = std::string("volume allocation failed (is the volume too large "
+                         "for device memory?): ") +
+             GPU_(GetErrorString)(err);
+    return;
+  }
 
   GPU_(Memcpy3DParms) copy = {};
   copy.srcPtr = gpu_make_pitched(const_cast<float *>(data),
@@ -235,7 +247,12 @@ void GpuRenderer::set_volume(const float *data, int nx, int ny, int nz) {
   copy.dstArray = array;
   copy.extent = gpu_make_extent(nx, ny, nz);
   copy.kind = GPU_(MemcpyHostToDevice);
-  GPU_(Memcpy3D)(&copy);
+  err = GPU_(Memcpy3D)(&copy);
+  if (err != GPU_(Success)) {
+    GPU_(FreeArray)(array);
+    error_ = std::string("volume upload failed: ") + GPU_(GetErrorString)(err);
+    return;
+  }
 
   // A texture object over that array: linear filtering + clamp addressing +
   // normalized coordinates so tex3D matches ArraySampler up to the texture
@@ -253,7 +270,13 @@ void GpuRenderer::set_volume(const float *data, int nx, int ny, int nz) {
   tex_desc.normalizedCoords = 1;
 
   gpuTextureObject_t tex = 0;
-  GPU_(CreateTextureObject)(&tex, &res, &tex_desc, nullptr);
+  err = GPU_(CreateTextureObject)(&tex, &res, &tex_desc, nullptr);
+  if (err != GPU_(Success)) {
+    GPU_(FreeArray)(array);
+    error_ = std::string("volume texture creation failed: ") +
+             GPU_(GetErrorString)(err);
+    return;
+  }
 
   d_array_ = array;
   d_tex_ = tex_to_handle(tex);
@@ -261,13 +284,26 @@ void GpuRenderer::set_volume(const float *data, int nx, int ny, int nz) {
 
 void GpuRenderer::set_transfer_function(const Vec4 *lut, int n) {
   if (lut == nullptr || n <= 0) return;
+  error_.clear();
   if (d_lut_) {
     GPU_FREE(d_lut_);
     d_lut_ = nullptr;
   }
   std::size_t bytes = static_cast<std::size_t>(n) * sizeof(Vec4);
-  GPU_MALLOC(reinterpret_cast<void **>(&d_lut_), bytes);
-  GPU_MEMCPY_H2D(d_lut_, lut, bytes);
+  GPU_(Error_t) err = GPU_(Malloc)(reinterpret_cast<void **>(&d_lut_), bytes);
+  if (err != GPU_(Success)) {
+    d_lut_ = nullptr;
+    error_ = std::string("transfer-function allocation failed: ") +
+             GPU_(GetErrorString)(err);
+    return;
+  }
+  err = GPU_(Memcpy)(d_lut_, lut, bytes, GPU_(MemcpyHostToDevice));
+  if (err != GPU_(Success)) {
+    GPU_FREE(d_lut_);
+    d_lut_ = nullptr;
+    error_ = std::string("transfer-function upload failed: ") +
+             GPU_(GetErrorString)(err);
+  }
 }
 
 void GpuRenderer::render(const RenderParams &params, const Camera &camera,
@@ -277,11 +313,22 @@ void GpuRenderer::render(const RenderParams &params, const Camera &camera,
 
   std::size_t bytes = static_cast<std::size_t>(w) * h * 4;
   if (d_output_ == nullptr || out_w_ != w || out_h_ != h) {
-    if (d_output_) GPU_FREE(d_output_);
-    GPU_MALLOC(reinterpret_cast<void **>(&d_output_), bytes);
+    if (d_output_) {
+      GPU_FREE(d_output_);
+      d_output_ = nullptr;
+    }
+    GPU_(Error_t) err =
+        GPU_(Malloc)(reinterpret_cast<void **>(&d_output_), bytes);
+    if (err != GPU_(Success)) {
+      d_output_ = nullptr;
+      out_w_ = 0;
+      out_h_ = 0;
+      error_ = std::string("output framebuffer allocation failed: ") +
+               GPU_(GetErrorString)(err);
+      return;
+    }
     out_w_ = w;
     out_h_ = h;
-    out_bytes_ = bytes;
   }
 
   launch(handle_to_tex(d_tex_), d_lut_, params, camera,
@@ -293,8 +340,8 @@ void GpuRenderer::render(const RenderParams &params, const Camera &camera,
 
 bool GpuRenderer::render_to_gl(const RenderParams &params, const Camera &camera,
                                unsigned int gl_tex, int width, int height) {
-  if (width <= 0 || height <= 0 || d_tex_ == 0 || d_lut_ == nullptr ||
-      gl_tex == 0)
+  if (interop_failed_ || width <= 0 || height <= 0 || d_tex_ == 0 ||
+      d_lut_ == nullptr || gl_tex == 0)
     return false;
 
   // (Re)create the shared pixel buffer object when the size changes.
@@ -315,10 +362,13 @@ bool GpuRenderer::render_to_gl(const RenderParams &params, const Camera &camera,
     if (GPU_(GraphicsGLRegisterBuffer)(
             &res, pbo_, GPU_(GraphicsRegisterFlagsWriteDiscard)) !=
         GPU_(Success)) {
-      // Registration failed (e.g. CUDA/GL not on the same device): fall back to
-      // the host copy path for good.
+      // Registration failed (e.g. CUDA/GL not on the same device). It will
+      // keep failing, so remember that and fall back to the host copy path
+      // for good — without the flag, every frame would recreate the buffer
+      // and retry the registration.
       glDeleteBuffers(1, &pbo_);
       pbo_ = 0;
+      interop_failed_ = true;
       return false;
     }
     pbo_res_ = res;

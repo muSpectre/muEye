@@ -86,6 +86,177 @@ void write_demo_2d(const std::string &path, int n) {
               n);
 }
 
+std::size_t count_nonbg(const mueye::Framebuffer &fb) {
+  std::size_t n = 0;
+  std::uint8_t bgr = static_cast<std::uint8_t>(0.05f * 255 + 0.5f);
+  for (int i = 0; i < fb.width * fb.height; ++i)
+    if (std::abs(int(fb.rgba[i * 4]) - int(bgr)) > 6 ||
+        fb.rgba[i * 4 + 1] > 16 || fb.rgba[i * 4 + 2] > 24)
+      ++n;
+  return n;
+}
+
+// A Volume holding a cube centred in *normalized grid* (uvw) coordinates:
+// value 1 where max(|u-0.5|,|v-0.5|,|w-0.5|) <= 0.25. The value depends only
+// on uvw, so grids with permuted extents hold identical data by construction.
+mueye::Volume make_cube_volume(int nx, int ny, int nz) {
+  mueye::Volume v;
+  v.nx = nx;
+  v.ny = ny;
+  v.nz = nz;
+  v.data.assign(v.size(), 0.0f);
+  for (int k = 0; k < nz; ++k)
+    for (int j = 0; j < ny; ++j)
+      for (int i = 0; i < nx; ++i) {
+        double u = (i + 0.5) / nx, w = (j + 0.5) / ny, s = (k + 0.5) / nz;
+        double cheby = std::fmax(std::fabs(u - 0.5),
+                                 std::fmax(std::fabs(w - 0.5),
+                                           std::fabs(s - 0.5)));
+        v.data[i + static_cast<std::size_t>(nx) * (j + static_cast<std::size_t>(ny) * k)] =
+            cheby <= 0.25 ? 1.0f : 0.0f;
+      }
+  v.vmin = 0.0f;
+  v.vmax = 1.0f;
+  return v;
+}
+
+/**
+ * DVR opacity must not depend on the axis order of the data. Render the same
+ * cube on a 48x16x16 grid and on its x<->z permutation (16x16x48), with
+ * cameras looking down -y whose right/up bases are permuted to match. Under
+ * the swap the two scenes are congruent, so the images must agree pixel-wise
+ * (up to float rounding). A per-voxel opacity correction that uses nx instead
+ * of the longest axis makes the permuted render ~3x more transparent and
+ * fails this check. Also cross-checks every other available backend against
+ * the CPU reference on the anisotropic grid, which exercises the hand-written
+ * Metal mirror's opacity term.
+ * @returns 0 on success, non-zero on any failure.
+ */
+int check_anisotropic() {
+  std::printf("\n=== checking anisotropic grid (opacity vs axis order) ===\n");
+
+  mueye::TransferFunction tf;
+  tf.set_colormap(mueye::Colormap::Viridis);
+
+  mueye::Volume va = make_cube_volume(48, 16, 16);
+  mueye::Volume vb = make_cube_volume(16, 16, 48);
+
+  auto make_params = [&tf](const mueye::Volume &v) {
+    int md = v.nx > v.ny ? v.nx : v.ny;
+    if (v.nz > md) md = v.nz;
+    float f = 1.0f / static_cast<float>(md);
+    mueye::RenderParams p;
+    p.nx = v.nx;
+    p.ny = v.ny;
+    p.nz = v.nz;
+    p.box = mueye::Vec3{v.nx * f, v.ny * f, v.nz * f};
+    p.step = 0.5f * f;
+    p.data_min = 0.0f;
+    p.data_max = 1.0f;
+    p.lut_size = tf.size();
+    // Low density so per-sample opacity stays well below saturation — a wrong
+    // opacity-correction factor then shows up as a large brightness change
+    // instead of vanishing into an equally opaque pixel.
+    p.density_scale = 0.3f;
+    p.iso_value = 0.5f;
+    p.mode = mueye::RenderMode::DVR;
+    p.bg = mueye::Vec3{0.05f, 0.06f, 0.08f};
+    return p;
+  };
+
+  // Top-down camera (forward = -y); right/up select which world axes map to
+  // the image axes, so a permuted grid can be given a matching view.
+  auto make_cam = [](const mueye::RenderParams &p, const mueye::Vec3 &right,
+                     const mueye::Vec3 &up) {
+    mueye::Camera cam;
+    // Close enough that the cube fills a good fraction of the image.
+    cam.eye = mueye::Vec3{0.5f * p.box.x, 0.5f * p.box.y + 1.0f,
+                          0.5f * p.box.z};
+    cam.forward = mueye::Vec3{0.0f, -1.0f, 0.0f};
+    cam.right = right;
+    cam.up = up;
+    cam.tan_half_fov = 0.45f;
+    cam.aspect = 1.0f;
+    return cam;
+  };
+
+  mueye::CpuRenderer cpu;
+  cpu.set_transfer_function(tf.data(), tf.size());
+  mueye::Framebuffer fa, fb;
+  fa.resize(256, 256);
+  fb.resize(256, 256);
+
+  mueye::RenderParams pa = make_params(va);
+  mueye::Camera cam_a = make_cam(pa, mueye::Vec3{1.0f, 0.0f, 0.0f},
+                                 mueye::Vec3{0.0f, 0.0f, 1.0f});
+  cpu.set_volume(va.data.data(), va.nx, va.ny, va.nz);
+  cpu.render(pa, cam_a, fa);
+
+  mueye::RenderParams pb = make_params(vb);
+  mueye::Camera cam_b = make_cam(pb, mueye::Vec3{0.0f, 0.0f, 1.0f},
+                                 mueye::Vec3{1.0f, 0.0f, 0.0f});
+  cpu.set_volume(vb.data.data(), vb.nx, vb.ny, vb.nz);
+  cpu.render(pb, cam_b, fb);
+
+  // Sanity: the render must actually contain the cube.
+  std::size_t nonbg = count_nonbg(fa);
+  double frac = double(nonbg) / (fa.width * fa.height);
+  std::printf("CPU DVR 48x16x16: %zu non-background px (%.1f%%)\n", nonbg,
+              100.0 * frac);
+  if (frac < 0.02) {
+    std::fprintf(stderr, "anisotropic render produced almost nothing.\n");
+    return 1;
+  }
+
+  double sum = 0.0;
+  for (std::size_t i = 0; i < fa.rgba.size(); ++i)
+    sum += std::abs(int(fa.rgba[i]) - int(fb.rgba[i]));
+  double mean_abs_diff = sum / fa.rgba.size();
+  std::printf("axis-permuted render (16x16x48): mean|Δ| = %.3f / 255\n",
+              mean_abs_diff);
+  int failures = 0;
+  if (mean_abs_diff > 0.5) {
+    std::fprintf(stderr,
+                 "DVR opacity depends on the data's axis order (permuted "
+                 "grid renders differently).\n");
+    ++failures;
+  }
+
+  // Every other available backend must agree with the CPU reference on the
+  // anisotropic grid too.
+  cpu.set_volume(va.data.data(), va.nx, va.ny, va.nz);
+  cpu.render(pa, cam_a, fa);
+  for (const mueye::BackendInfo &bi : mueye::enumerate_backends()) {
+    if (bi.backend == mueye::Backend::CPU) continue;
+    if (!bi.available) {
+      std::printf("backend %-14s : unavailable (%s)\n", bi.name, bi.note);
+      continue;
+    }
+    auto r = mueye::create_renderer(bi.backend);
+    if (!r) {
+      std::printf("backend %-14s : create failed\n", bi.name);
+      continue;
+    }
+    mueye::Framebuffer fg;
+    fg.resize(256, 256);
+    r->set_volume(va.data.data(), va.nx, va.ny, va.nz);
+    r->set_transfer_function(tf.data(), tf.size());
+    r->render(pa, cam_a, fg);
+    sum = 0.0;
+    for (std::size_t i = 0; i < fg.rgba.size(); ++i)
+      sum += std::abs(int(fg.rgba[i]) - int(fa.rgba[i]));
+    double backend_diff = sum / fg.rgba.size();
+    std::printf("backend %-14s : anisotropic DVR mean|Δ| vs CPU = %.3f / 255\n",
+                bi.name, backend_diff);
+    if (backend_diff > 4.0) {
+      std::fprintf(stderr, "backend %s diverged on the anisotropic grid.\n",
+                   bi.name);
+      ++failures;
+    }
+  }
+  return failures;
+}
+
 bool write_ppm(const std::string &path, const mueye::Framebuffer &fb) {
   std::FILE *f = std::fopen(path.c_str(), "wb");
   if (!f) return false;
@@ -99,16 +270,6 @@ bool write_ppm(const std::string &path, const mueye::Framebuffer &fb) {
     }
   std::fclose(f);
   return true;
-}
-
-std::size_t count_nonbg(const mueye::Framebuffer &fb) {
-  std::size_t n = 0;
-  std::uint8_t bgr = static_cast<std::uint8_t>(0.05f * 255 + 0.5f);
-  for (int i = 0; i < fb.width * fb.height; ++i)
-    if (std::abs(int(fb.rgba[i * 4]) - int(bgr)) > 6 ||
-        fb.rgba[i * 4 + 1] > 16 || fb.rgba[i * 4 + 2] > 24)
-      ++n;
-  return n;
 }
 
 /**
@@ -399,9 +560,10 @@ int main(int argc, char **argv) {
 
   if (check_file(path, "offscreen.ppm") != 0) return 1;
   if (check_file(path2d, "offscreen_2d.ppm") != 0) return 1;
+  if (check_anisotropic() != 0) return 1;
 
   std::printf(
-      "\nOK: muGrid I/O -> scalarize -> ray-trace verified (2D + 3D); "
-      "backends agree.\n");
+      "\nOK: muGrid I/O -> scalarize -> ray-trace verified (2D + 3D + "
+      "anisotropic); backends agree.\n");
   return 0;
 }

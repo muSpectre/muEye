@@ -349,13 +349,19 @@ MUEYE_HD inline Vec4 trace_ray_dvr(const Sampler &s,
 
   Vec3 accum = make_vec3(0.0f, 0.0f, 0.0f);
   float trans = 1.0f;  // remaining transparency
+  // Opacity correction: p.step is in world units and the longest grid axis
+  // spans one world unit, so step * max_dim is the step length in voxels —
+  // the unit the LUT's per-voxel opacity is defined in. Using the longest
+  // axis (not nx) keeps the density independent of the data's axis order.
+  int max_dim = p.nx > p.ny ? p.nx : p.ny;
+  if (p.nz > max_dim) max_dim = p.nz;
   for (float t = t_near; t < t_far; t += p.step) {
     Vec3 pos = cam.eye + dir * t;
     float val = s.value_at(p, wrap_uvw(p, pos * inv_box));
     float nv = normalize_value(p, val);
     Vec4 c = lut_lookup(lut, p, nv);
     // Opacity correction for the step size, then global density scale.
-    float alpha = clampf(c.w * p.density_scale * p.step * p.nx, 0.0f, 1.0f);
+    float alpha = clampf(c.w * p.density_scale * p.step * max_dim, 0.0f, 1.0f);
     Vec3 crgb = make_vec3(c.x, c.y, c.z);
     accum = accum + crgb * (alpha * trans);
     trans *= (1.0f - alpha);

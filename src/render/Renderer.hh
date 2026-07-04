@@ -91,6 +91,12 @@ class Renderer {
     return false;
   }
 
+  /** Empty string, or a description of the most recent data-upload / render
+   *  failure (e.g. device out of memory for the volume). Cleared by the next
+   *  successful upload. The default (for backends that cannot fail this way)
+   *  is always-empty. */
+  virtual const char *last_error() const { return ""; }
+
   /** Human-readable backend name for the UI. */
   virtual const char *name() const = 0;
 

@@ -28,6 +28,11 @@ class CpuRenderer : public Renderer {
   void set_num_threads(int n) override { nb_threads_ = n; }
 
  private:
+  // Borrowed pointers into caller-owned storage (App's Volume::data and
+  // TransferFunction LUT) — no copy is taken, unlike the GPU backends.
+  // Invariant: whoever frees or reallocates those buffers must mark them
+  // dirty (App::volume_dirty_ / tf_dirty_) so set_volume() /
+  // set_transfer_function() re-point us before the next render().
   const float *volume_{nullptr};
   const Vec4 *lut_{nullptr};
   int nb_threads_{0};

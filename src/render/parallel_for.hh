@@ -33,8 +33,11 @@ void parallel_for(int n, int nb_threads, Body &&body) {
   if (n <= 0) return;
 
 #if defined(_OPENMP)
-  if (nb_threads > 0) omp_set_num_threads(nb_threads);
-#pragma omp parallel for schedule(dynamic, 8)
+  // Pass the count via the num_threads clause rather than omp_set_num_threads:
+  // the latter mutates process-global state, so a later "auto" (<= 0) request
+  // would silently keep the previous manual value.
+  int nt = nb_threads > 0 ? nb_threads : omp_get_max_threads();
+#pragma omp parallel for schedule(dynamic, 8) num_threads(nt)
   for (int i = 0; i < n; ++i) body(i);
 #else
   unsigned hw = nb_threads > 0

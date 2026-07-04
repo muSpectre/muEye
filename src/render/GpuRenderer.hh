@@ -17,7 +17,7 @@
 #ifndef MUEYE_GPU_RENDERER_HH_
 #define MUEYE_GPU_RENDERER_HH_
 
-#include <cstddef>
+#include <string>
 
 #include "render/Renderer.hh"
 
@@ -43,6 +43,7 @@ class GpuRenderer : public Renderer {
    *  device->host round trip. */
   bool render_to_gl(const RenderParams &params, const Camera &camera,
                     unsigned int gl_tex, int width, int height) override;
+  const char *last_error() const override { return error_.c_str(); }
   const char *name() const override;
   Backend backend() const override;
 
@@ -58,14 +59,20 @@ class GpuRenderer : public Renderer {
   unsigned char *d_output_{nullptr};
   int nx_{0}, ny_{0}, nz_{0};
   int out_w_{0}, out_h_{0};
-  std::size_t out_bytes_{0};
+
+  // Most recent upload/allocation failure (empty when everything succeeded);
+  // surfaced to the UI via last_error().
+  std::string error_;
 
   // GL-interop scratch for render_to_gl(): a GL pixel-unpack buffer registered
   // with CUDA/HIP. pbo_res_ is an opaque cudaGraphicsResource_t / hipGraphics-
   // Resource_t (kept as void* so this header stays free of CUDA/HIP + GL types).
+  // Once registration fails (e.g. CUDA and GL on different devices) it will
+  // keep failing; interop_failed_ makes the fallback to render() permanent.
   unsigned int pbo_{0};
   void *pbo_res_{nullptr};
   int pbo_w_{0}, pbo_h_{0};
+  bool interop_failed_{false};
 };
 
 }  // namespace mueye

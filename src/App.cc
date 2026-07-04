@@ -105,14 +105,25 @@ void App::reload_volume() {
 // Upload data to the backend only when it changed (cheap for CPU, avoids a
 // device round-trip every frame for Metal/CUDA/HIP).
 void App::sync_renderer_data() {
+  bool uploaded = false;
   if (volume_dirty_) {
     renderer_->set_volume(volume_.data.data(), volume_.nx, volume_.ny,
                           volume_.nz);
     volume_dirty_ = false;
+    uploaded = true;
   }
   if (tf_dirty_) {
     renderer_->set_transfer_function(tf_.data(), tf_.size());
     tf_dirty_ = false;
+    uploaded = true;
+  }
+  // Surface upload failures (e.g. volume too large for device memory) instead
+  // of silently rendering a blank viewport.
+  if (uploaded) {
+    const char *err = renderer_->last_error();
+    if (err != nullptr && err[0] != '\0') {
+      status_ = std::string(renderer_->name()) + ": " + err;
+    }
   }
 }
 
@@ -178,10 +189,9 @@ void App::render(int width, int height) {
   if (rw < 1) rw = 1;
   if (rh < 1) rh = 1;
 
-  fb_.resize(rw, rh);
-
   if (volume_.empty() || !renderer_) {
     // Clear to background.
+    fb_.resize(rw, rh);
     for (std::size_t i = 0; i < fb_.rgba.size(); i += 4) {
       fb_.rgba[i + 0] = static_cast<std::uint8_t>(bg_[0] * 255);
       fb_.rgba[i + 1] = static_cast<std::uint8_t>(bg_[1] * 255);
@@ -206,6 +216,9 @@ void App::render(int width, int height) {
   // Framebuffer and upload it.
   unsigned int gl_tex = texture_.ensure(rw, rh);
   if (!renderer_->render_to_gl(p, cam, gl_tex, rw, rh)) {
+    // Host-framebuffer fallback; fb_ is only (re)sized on this path so the
+    // zero-copy path does not keep a dead host-side copy around.
+    fb_.resize(rw, rh);
     renderer_->render(p, cam, fb_);
     texture_.upload(fb_);
   }

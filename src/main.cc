@@ -124,29 +124,34 @@ int main(int argc, char **argv) {
   // Use the host platform's native UI font.
   load_platform_font(window);
 
-  mueye::App app;
-  if (argc > 1) {
-    app.load_file(argv[1]);
-  }
+  // Scope the app so its GL-owning members (display texture, GPU renderers
+  // with GL-interop buffers) are destroyed while the GL context is still
+  // current — i.e. before the ImGui/GLFW teardown below destroys it.
+  {
+    mueye::App app;
+    if (argc > 1) {
+      app.load_file(argv[1]);
+    }
 
-  while (!glfwWindowShouldClose(window)) {
-    glfwPollEvents();
+    while (!glfwWindowShouldClose(window)) {
+      glfwPollEvents();
 
-    ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplGlfw_NewFrame();
-    ImGui::NewFrame();
+      ImGui_ImplOpenGL3_NewFrame();
+      ImGui_ImplGlfw_NewFrame();
+      ImGui::NewFrame();
 
-    app.draw_ui();
+      app.draw_ui();
 
-    ImGui::Render();
-    int display_w, display_h;
-    glfwGetFramebufferSize(window, &display_w, &display_h);
-    glViewport(0, 0, display_w, display_h);
-    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+      ImGui::Render();
+      int display_w, display_h;
+      glfwGetFramebufferSize(window, &display_w, &display_h);
+      glViewport(0, 0, display_w, display_h);
+      glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+      glClear(GL_COLOR_BUFFER_BIT);
+      ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-    glfwSwapBuffers(window);
+      glfwSwapBuffers(window);
+    }
   }
 
   ImGui_ImplOpenGL3_Shutdown();

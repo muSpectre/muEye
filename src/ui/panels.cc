@@ -72,6 +72,7 @@ static void build_default_layout(ImGuiID dockspace_id) {
 
   ImGui::DockBuilderDockWindow("muEye", left_top);
   ImGui::DockBuilderDockWindow("Dataset", left_top);
+  ImGui::DockBuilderDockWindow("Cell", left_top);
   ImGui::DockBuilderDockWindow("Render", left_mid);
   ImGui::DockBuilderDockWindow("Transfer function", left_mid);
   ImGui::DockBuilderDockWindow("Device", left_bot);

@@ -41,6 +41,8 @@ struct GpuParams {
   float aspect;
   int nx, ny, nz;
   float box_x, box_y, box_z;  // world-space extents of one volume box [0,box]
+  // world->fractional cell map, row-major 3x3 (see RenderParams::inv_cell).
+  float ic0, ic1, ic2, ic3, ic4, ic5, ic6, ic7, ic8;
   int rep_x, rep_y, rep_z;    // periodic replicas per axis (>= 1)
   float step;
   float data_min, data_max;
@@ -50,6 +52,12 @@ struct GpuParams {
   int mode;  // 0 = DVR, 1 = isosurface
   float bg_x, bg_y, bg_z;
   int width, height;
+  // displacement warp (deformed geometry)
+  int warp_enabled;
+  float warp_scale;
+  int warp_iters;
+  float warp_lo_x, warp_lo_y, warp_lo_z;
+  float warp_hi_x, warp_hi_y, warp_hi_z;
 };
 
 // The compute kernel. Kept close to render_core.hh so CPU and Metal match.
@@ -66,6 +74,7 @@ struct P {
     float aspect;
     int nx, ny, nz;
     float box_x, box_y, box_z;
+    float ic0, ic1, ic2, ic3, ic4, ic5, ic6, ic7, ic8;
     int rep_x, rep_y, rep_z;
     float step;
     float data_min, data_max;
@@ -75,6 +84,11 @@ struct P {
     int mode;
     float bg_x, bg_y, bg_z;
     int width, height;
+    int warp_enabled;
+    float warp_scale;
+    int warp_iters;
+    float warp_lo_x, warp_lo_y, warp_lo_z;
+    float warp_hi_x, warp_hi_y, warp_hi_z;
 };
 
 // The volume lives in a 3-D texture; the texture unit does the trilinear
@@ -87,6 +101,11 @@ static float sample(texture3d<float> vol, float3 uvw) {
     return vol.sample(volSampler, uvw).r;
 }
 
+// Displacement field (float4 texture, xyz used). Same sampler as the volume.
+static float3 sample_disp(texture3d<float> disp, float3 uvw) {
+    return disp.sample(volSampler, uvw).xyz;
+}
+
 // Wrap a box coordinate into [0,1) when the axis is periodically replicated;
 // untouched otherwise (mirrors render_core.hh's wrap_coord/wrap_uvw).
 static float wrap_coord(float u, int rep) {
@@ -96,6 +115,19 @@ static float wrap_coord(float u, int rep) {
 static float3 wrap_uvw(constant P& p, float3 uvw) {
     return float3(wrap_coord(uvw.x, p.rep_x), wrap_coord(uvw.y, p.rep_y),
                   wrap_coord(uvw.z, p.rep_z));
+}
+
+// world->fractional cell map inv_cell * v (row-major 3x3 in ic0..ic8), and its
+// transpose (for mapping a fractional-space gradient to a world-space normal).
+static float3 icell_mul(constant P& p, float3 v) {
+    return float3(p.ic0*v.x + p.ic1*v.y + p.ic2*v.z,
+                  p.ic3*v.x + p.ic4*v.y + p.ic5*v.z,
+                  p.ic6*v.x + p.ic7*v.y + p.ic8*v.z);
+}
+static float3 icellT_mul(constant P& p, float3 v) {
+    return float3(p.ic0*v.x + p.ic3*v.y + p.ic6*v.z,
+                  p.ic1*v.x + p.ic4*v.y + p.ic7*v.z,
+                  p.ic2*v.x + p.ic5*v.y + p.ic8*v.z);
 }
 
 static float3 gradient(texture3d<float> vol, constant P& p, float3 uvw) {
@@ -133,6 +165,44 @@ static bool intersect_box(float3 o, float3 d, float3 box, thread float& t_near, 
     return t_far > t_near;
 }
 
+static bool intersect_aabb(float3 o, float3 d, float3 lo, float3 hi, thread float& t_near, thread float& t_far) {
+    float tmin = -1e30, tmax = 1e30;
+    for (int axis = 0; axis < 3; ++axis) {
+        float oa = o[axis], da = d[axis], l = lo[axis], h = hi[axis];
+        if (fabs(da) < 1e-8) {
+            if (oa < l || oa > h) return false;
+        } else {
+            float inv = 1.0 / da;
+            float t1 = (l - oa) * inv;
+            float t2 = (h - oa) * inv;
+            if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+            tmin = max(tmin, t1);
+            tmax = min(tmax, t2);
+            if (tmin > tmax) return false;
+        }
+    }
+    t_near = max(tmin, 0.0);
+    t_far = tmax;
+    return t_far > t_near;
+}
+
+// Recover the fractional cell coord of world point x under the warp
+// x = C*s + D(s), by fixed-point iteration (mirrors render_core.hh's
+// world_to_reference). Sets `outside` when x is not inside the deformed body.
+static float3 world_to_reference(texture3d<float> disp, constant P& p, float3 x, thread bool& outside) {
+    float3 s = icell_mul(p, x);
+    int md = max(max(p.nx, p.ny), p.nz);
+    float g = p.warp_scale / float(md > 0 ? md : 1);
+    for (int it = 0; it < p.warp_iters; ++it) {
+        float3 sc = clamp(s, 0.0, 1.0);
+        float3 world_d = sample_disp(disp, sc) * g;
+        s = icell_mul(p, x - world_d);
+    }
+    float e = 1e-4;
+    outside = s.x < -e || s.x > 1.0+e || s.y < -e || s.y > 1.0+e || s.z < -e || s.z > 1.0+e;
+    return s;
+}
+
 // Primary (pinhole) ray direction through normalized image coordinate (u,v).
 static float3 primary_dir(constant P& p, float u, float v) {
     float3 fwd = float3(p.fwd_x, p.fwd_y, p.fwd_z);
@@ -154,10 +224,11 @@ static void store_pixel(device uchar4* out, constant P& p, uint2 gid, float3 col
 // so each compiles a single path: p.mode is grid-uniform so the branch never
 // diverges, but a combined kernel inflates register/instruction footprint and
 // can cap occupancy. The host binds the matching pipeline (see render()).
-kernel void raymarch_dvr(texture3d<float>     vol [[texture(0)]],
-                         device const float4* lut [[buffer(1)]],
-                         constant P&          p   [[buffer(2)]],
-                         device uchar4*       out [[buffer(3)]],
+kernel void raymarch_dvr(texture3d<float>     vol  [[texture(0)]],
+                         texture3d<float>     disp [[texture(4)]],
+                         device const float4* lut  [[buffer(1)]],
+                         constant P&          p    [[buffer(2)]],
+                         device uchar4*       out  [[buffer(3)]],
                          uint2 gid [[thread_position_in_grid]]) {
     if (int(gid.x) >= p.width || int(gid.y) >= p.height) return;
     float3 eye = float3(p.eye_x, p.eye_y, p.eye_z);
@@ -168,19 +239,50 @@ kernel void raymarch_dvr(texture3d<float>     vol [[texture(0)]],
 
     float3 col = bg;
     float t_near, t_far;
-    float3 box = float3(p.box_x, p.box_y, p.box_z);
-    float3 inv_box = 1.0 / box;
-    // The ray traverses the periodically tiled box [0, box*rep].
-    float3 tiled_box = box * float3(p.rep_x, p.rep_y, p.rep_z);
-    if (intersect_box(eye, dir, tiled_box, t_near, t_far)) {
+    // Opacity correction uses the longest grid axis so density does not depend
+    // on axis order (mirrors render_core.hh's trace_ray_dvr).
+    float max_dim = float(max(max(p.nx, p.ny), p.nz));
+
+    if (p.warp_enabled != 0) {
+        // Deformed geometry: march the world AABB, invert the warp per sample.
+        float3 lo = float3(p.warp_lo_x, p.warp_lo_y, p.warp_lo_z);
+        float3 hi = float3(p.warp_hi_x, p.warp_hi_y, p.warp_hi_z);
+        if (intersect_aabb(eye, dir, lo, hi, t_near, t_far)) {
+            float3 accum = float3(0.0);
+            float trans = 1.0;
+            for (float t = t_near; t < t_far; t += p.step) {
+                float3 x = eye + dir*t;
+                bool outside;
+                float3 s = world_to_reference(disp, p, x, outside);
+                if (outside) continue;
+                float val = sample(vol, s);
+                float nv = normalize_value(p, val);
+                float f = nv * (p.lut_size - 1);
+                int i0 = clamp(int(f), 0, p.lut_size - 1);
+                int i1 = min(i0 + 1, p.lut_size - 1);
+                float4 c = mix(lut[i0], lut[i1], f - i0);
+                float alpha = clamp(c.w * p.density_scale * p.step * max_dim, 0.0, 1.0);
+                accum += c.rgb * (alpha * trans);
+                trans *= (1.0 - alpha);
+                if (trans < 0.003) break;
+            }
+            col = accum + bg * trans;
+        }
+        store_pixel(out, p, gid, col);
+        return;
+    }
+
+    // Work in fractional cell coordinates (uvw = inv_cell * world), so the
+    // sheared cell becomes the unit box and the ray-parameter t is preserved.
+    float3 o_frac = icell_mul(p, eye);
+    float3 d_frac = icell_mul(p, dir);
+    float3 tiled_box = float3(p.rep_x, p.rep_y, p.rep_z);
+    if (intersect_box(o_frac, d_frac, tiled_box, t_near, t_far)) {
         float3 accum = float3(0.0);
         float trans = 1.0;
-        // Opacity correction uses the longest grid axis so density does not
-        // depend on axis order (mirrors render_core.hh's trace_ray_dvr).
-        float max_dim = float(max(max(p.nx, p.ny), p.nz));
         for (float t = t_near; t < t_far; t += p.step) {
-            float3 pos = eye + dir*t;
-            float val = sample(vol, wrap_uvw(p, pos * inv_box));
+            float3 uvw = o_frac + d_frac*t;
+            float val = sample(vol, wrap_uvw(p, uvw));
             float nv = normalize_value(p, val);
             float f = nv * (p.lut_size - 1);
             int i0 = clamp(int(f), 0, p.lut_size - 1);
@@ -196,10 +298,11 @@ kernel void raymarch_dvr(texture3d<float>     vol [[texture(0)]],
     store_pixel(out, p, gid, col);
 }
 
-kernel void raymarch_iso(texture3d<float>     vol [[texture(0)]],
-                         device const float4* lut [[buffer(1)]],
-                         constant P&          p   [[buffer(2)]],
-                         device uchar4*       out [[buffer(3)]],
+kernel void raymarch_iso(texture3d<float>     vol  [[texture(0)]],
+                         texture3d<float>     disp [[texture(4)]],
+                         device const float4* lut  [[buffer(1)]],
+                         constant P&          p    [[buffer(2)]],
+                         device uchar4*       out  [[buffer(3)]],
                          uint2 gid [[thread_position_in_grid]]) {
     if (int(gid.x) >= p.width || int(gid.y) >= p.height) return;
     float3 eye = float3(p.eye_x, p.eye_y, p.eye_z);
@@ -210,30 +313,73 @@ kernel void raymarch_iso(texture3d<float>     vol [[texture(0)]],
 
     float3 col = bg;
     float t_near, t_far;
-    float3 box = float3(p.box_x, p.box_y, p.box_z);
-    float3 inv_box = 1.0 / box;
-    // The ray traverses the periodically tiled box [0, box*rep].
-    float3 tiled_box = box * float3(p.rep_x, p.rep_y, p.rep_z);
-    if (intersect_box(eye, dir, tiled_box, t_near, t_far)) {
+
+    if (p.warp_enabled != 0) {
+        float3 lo = float3(p.warp_lo_x, p.warp_lo_y, p.warp_lo_z);
+        float3 hi = float3(p.warp_hi_x, p.warp_hi_y, p.warp_hi_z);
+        if (intersect_aabb(eye, dir, lo, hi, t_near, t_far)) {
+            float t = t_near;
+            bool have_prev = false;
+            float prev_v = 0.0;
+            float prev_t = t_near;
+            while (t < t_far) {
+                float3 x = eye + dir*t;
+                bool outside;
+                float3 s = world_to_reference(disp, p, x, outside);
+                if (!outside) {
+                    float cur_v = sample(vol, s) - p.iso_value;
+                    if (have_prev && prev_v * cur_v <= 0.0) {
+                        float denom = cur_v - prev_v;
+                        float frac = fabs(denom) > 1e-12 ? prev_v / -denom : 0.0;
+                        float t_hit = prev_t + (t - prev_t)*frac;
+                        float3 xh = eye + dir*t_hit;
+                        bool o2;
+                        float3 sh = world_to_reference(disp, p, xh, o2);
+                        float3 nrm = normalize(icellT_mul(p, gradient(vol, p, sh)));
+                        float3 l = normalize(eye - xh);
+                        float diff = fabs(dot(nrm, l));
+                        float3 base = float3(0.82, 0.45, 0.20);
+                        col = base * (0.20 + 0.80*diff);
+                        break;
+                    }
+                    prev_v = cur_v; prev_t = t; have_prev = true;
+                } else {
+                    have_prev = false;
+                }
+                t += p.step;
+            }
+        }
+        store_pixel(out, p, gid, col);
+        return;
+    }
+
+    // Fractional-coordinate ray (uvw = inv_cell * world); see raymarch_dvr.
+    float3 o_frac = icell_mul(p, eye);
+    float3 d_frac = icell_mul(p, dir);
+    float3 tiled_box = float3(p.rep_x, p.rep_y, p.rep_z);
+    if (intersect_box(o_frac, d_frac, tiled_box, t_near, t_far)) {
         float t = t_near;
-        float3 prev = eye + dir*t;
-        float prev_v = sample(vol, wrap_uvw(p, prev * inv_box)) - p.iso_value;
+        float3 prev = o_frac + d_frac*t;
+        float prev_v = sample(vol, wrap_uvw(p, prev)) - p.iso_value;
         t += p.step;
         while (t < t_far) {
-            float3 pos = eye + dir*t;
-            float cur_v = sample(vol, wrap_uvw(p, pos * inv_box)) - p.iso_value;
+            float3 uvw = o_frac + d_frac*t;
+            float cur_v = sample(vol, wrap_uvw(p, uvw)) - p.iso_value;
             if (prev_v * cur_v <= 0.0) {
                 float denom = cur_v - prev_v;
                 float frac = fabs(denom) > 1e-12 ? prev_v / -denom : 0.0;
-                float3 hitp = prev + (pos - prev)*frac;
-                float3 nrm = normalize(gradient(vol, p, wrap_uvw(p, hitp * inv_box)));
-                float3 l = normalize(eye - hitp);
+                float3 hitp = prev + (uvw - prev)*frac;
+                // fractional gradient -> world normal via inv_cell^T.
+                float3 nrm = normalize(icellT_mul(p, gradient(vol, p, wrap_uvw(p, hitp))));
+                float t_hit = (t - p.step) + p.step*frac;
+                float3 world_hit = eye + dir*t_hit;
+                float3 l = normalize(eye - world_hit);
                 float diff = fabs(dot(nrm, l));
                 float3 base = float3(0.82, 0.45, 0.20);
                 col = base * (0.20 + 0.80*diff);
                 break;
             }
-            prev = pos; prev_v = cur_v; t += p.step;
+            prev = uvw; prev_v = cur_v; t += p.step;
         }
     }
     store_pixel(out, p, gid, col);
@@ -249,6 +395,7 @@ struct MetalRenderer::Impl {
   id<MTLComputePipelineState> pipeline_iso = nil;
 
   id<MTLTexture> volume = nil;
+  id<MTLTexture> displacement = nil;  // float4 3-D texture, or nil (no warp)
   id<MTLBuffer> lut = nil;
   id<MTLBuffer> output = nil;
   int out_w = 0, out_h = 0;
@@ -340,6 +487,35 @@ void MetalRenderer::set_volume(const float *data, int nx, int ny, int nz) {
   }
 }
 
+void MetalRenderer::set_displacement(const float *data, int nx, int ny, int nz) {
+  if (!ok()) return;
+  @autoreleasepool {
+    if (data == nullptr) {
+      impl_->displacement = nil;  // clears the warp
+      return;
+    }
+    // RGBA32Float 3-D texture; the host buffer stores 4 floats per voxel.
+    MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+    desc.textureType = MTLTextureType3D;
+    desc.pixelFormat = MTLPixelFormatRGBA32Float;
+    desc.width = static_cast<NSUInteger>(nx);
+    desc.height = static_cast<NSUInteger>(ny);
+    desc.depth = static_cast<NSUInteger>(nz);
+    desc.usage = MTLTextureUsageShaderRead;
+    desc.storageMode = MTLStorageModeShared;
+    impl_->displacement = [impl_->device newTextureWithDescriptor:desc];
+    MTLRegion region = MTLRegionMake3D(0, 0, 0, static_cast<NSUInteger>(nx),
+                                       static_cast<NSUInteger>(ny),
+                                       static_cast<NSUInteger>(nz));
+    [impl_->displacement replaceRegion:region
+                           mipmapLevel:0
+                                 slice:0
+                             withBytes:data
+                           bytesPerRow:static_cast<NSUInteger>(nx) * 4 * sizeof(float)
+                         bytesPerImage:static_cast<NSUInteger>(nx) * ny * 4 * sizeof(float)];
+  }
+}
+
 void MetalRenderer::set_transfer_function(const Vec4 *lut, int n) {
   if (!ok() || lut == nullptr) return;
   @autoreleasepool {
@@ -375,6 +551,11 @@ void MetalRenderer::render(const RenderParams &params, const Camera &camera,
     p.aspect = camera.aspect;
     p.nx = params.nx; p.ny = params.ny; p.nz = params.nz;
     p.box_x = params.box.x; p.box_y = params.box.y; p.box_z = params.box.z;
+    p.ic0 = params.inv_cell.m[0]; p.ic1 = params.inv_cell.m[1];
+    p.ic2 = params.inv_cell.m[2]; p.ic3 = params.inv_cell.m[3];
+    p.ic4 = params.inv_cell.m[4]; p.ic5 = params.inv_cell.m[5];
+    p.ic6 = params.inv_cell.m[6]; p.ic7 = params.inv_cell.m[7];
+    p.ic8 = params.inv_cell.m[8];
     p.rep_x = params.rep_x; p.rep_y = params.rep_y; p.rep_z = params.rep_z;
     p.step = params.step;
     p.data_min = params.data_min; p.data_max = params.data_max;
@@ -384,6 +565,14 @@ void MetalRenderer::render(const RenderParams &params, const Camera &camera,
     p.mode = (params.mode == RenderMode::Isosurface) ? 1 : 0;
     p.bg_x = params.bg.x; p.bg_y = params.bg.y; p.bg_z = params.bg.z;
     p.width = w; p.height = h;
+    // Warp only when enabled *and* a displacement texture is resident.
+    p.warp_enabled = (params.warp_enabled && impl_->displacement != nil) ? 1 : 0;
+    p.warp_scale = params.warp_scale;
+    p.warp_iters = params.warp_iters;
+    p.warp_lo_x = params.warp_lo.x; p.warp_lo_y = params.warp_lo.y;
+    p.warp_lo_z = params.warp_lo.z;
+    p.warp_hi_x = params.warp_hi.x; p.warp_hi_y = params.warp_hi.y;
+    p.warp_hi_z = params.warp_hi.z;
 
     id<MTLComputePipelineState> pipeline =
         (params.mode == RenderMode::Isosurface) ? impl_->pipeline_iso
@@ -393,6 +582,12 @@ void MetalRenderer::render(const RenderParams &params, const Camera &camera,
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setComputePipelineState:pipeline];
     [enc setTexture:impl_->volume atIndex:0];
+    // The kernels declare a displacement texture at index 4; bind the volume as
+    // a harmless placeholder when there is none (it is never sampled unless
+    // warp_enabled), so Metal always has a texture bound at that slot.
+    [enc setTexture:(impl_->displacement != nil ? impl_->displacement
+                                                : impl_->volume)
+            atIndex:4];
     [enc setBuffer:impl_->lut offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(GpuParams) atIndex:2];
     [enc setBuffer:impl_->output offset:0 atIndex:3];

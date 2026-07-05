@@ -52,12 +52,20 @@ class App {
   // --- data ------------------------------------------------------------
   void open_path(const std::string &path);
   void reload_volume();
+  void reload_displacement();  //!< (re)read the selected displacement field
 
   // --- rendering -------------------------------------------------------
   void render(int width, int height);
   void set_backend(Backend backend);
   RenderParams make_render_params() const;
   void sync_renderer_data();  //!< (re-)upload volume / LUT if dirty
+
+  /** Forward cell matrix C = F * diag(box): its columns are the world-space
+   *  edge vectors of the (possibly sheared) rendered cell. */
+  Mat3 world_cell() const;
+  /** Axis-aligned bounds of the deformed, tiled cell (8 corners of C*[0,rep]),
+   *  used to frame the camera on non-orthogonal cells. */
+  void cell_bounds(Vec3 &center, float &extent) const;
 
   /** Re-render the current scene into a host framebuffer at full viewport
    *  resolution (ignoring the interactive downscale) and write it as a PNG. */
@@ -66,6 +74,7 @@ class App {
   VolumeLoader loader_;
   FileMeta meta_;
   Volume volume_;
+  DisplacementField disp_;  //!< deformed-geometry warp source (empty = none)
 
   // --- UI / selection state -------------------------------------------
   std::string path_buf_;
@@ -80,6 +89,22 @@ class App {
   Scalarize scalarize_{Scalarize::Component};
   double last_load_ms_{0.0};   //!< duration of the most recent volume load
   bool frame_pending_{false};  //!< frame changed while scrubbing; load on release
+
+  //! Macroscopic deformation gradient F (row-major 3x3; identity == orthogonal
+  //! cell). Populated from the file's deformation_gradient/average_strain
+  //! attribute on load, editable in the Cell panel. The rendered cell is
+  //! C = F * diag(box_extent).
+  float F_[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+  bool deformation_from_file_{false};  //!< F_ came from the file (for the UI)
+
+  //! Deformed-geometry warp: index into meta_.fields of the displacement field
+  //! (-1 = none, the default: no deformation). Only fields with exactly
+  //! spatial_dim components are eligible. warp_scale_ is a user gain on the
+  //! displacement (world units); warp_iters_ is the fixed-point iteration count.
+  int disp_field_index_{-1};
+  float warp_scale_{1.0f};
+  int warp_iters_{6};
+  bool disp_dirty_{true};  //!< re-upload displacement to the backend before render
 
   // --- view / appearance ----------------------------------------------
   OrbitCamera camera_;

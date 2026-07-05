@@ -59,6 +59,20 @@ struct Volume {
                   std::ptrdiff_t stride_c = 1);
 };
 
+/** A dense vector (displacement) field used for the deformed-geometry warp,
+ *  stored as 4 floats per voxel (x, y, z, unused) column-major so it maps
+ *  directly onto a GPU float4 / RGBA32F 3-D texture. */
+struct DisplacementField {
+  int nx{0}, ny{0}, nz{0};
+  float max_mag{0.0f};      //!< max |u| over the grid (for the warp AABB margin)
+  std::vector<float> data;  //!< 4 floats per voxel
+
+  bool empty() const { return data.empty(); }
+  std::size_t size() const {
+    return static_cast<std::size_t>(nx) * ny * nz;
+  }
+};
+
 }  // namespace mueye
 
 #endif  // MUEYE_VOLUME_HH_

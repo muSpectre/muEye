@@ -46,6 +46,15 @@ struct FileMeta {
   std::vector<FieldInfo> fields;
   bool valid{false};
   std::string error;  //!< populated when valid == false
+
+  //! Macroscopic deformation gradient F (row-major 3x3; identity == undeformed)
+  //! that shears the reference cell into a (possibly non-orthogonal) Bravais
+  //! cell. Read from the file's `deformation_gradient` global attribute, or
+  //! from `average_strain` (eps) as F = I + eps. muGrid never writes these
+  //! today; a producer adds them via FileIONetCDF::write_global_attribute.
+  //! A 2D file's 2x2 tensor is embedded in the upper-left, with F_zz = 1.
+  double F[9]{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
+  bool has_deformation{false};  //!< a deformation attribute was found
 };
 
 /** Stateless loader: every open()/load() opens the file, reads and closes it
@@ -63,6 +72,15 @@ class VolumeLoader {
   std::string load(const std::string &path, const FileMeta &meta,
                    const FieldInfo &field, int frame, Scalarize mode,
                    int component, Volume &out);
+
+  /** Read (field, frame) as a displacement vector field: the first
+   *  meta.spatial_dim components are packed into @p out (4 floats/voxel, z=0 in
+   *  2D). @p field must have at least spatial_dim components. Reuses load()
+   *  per component, so it handles the double/float and 2D/3D paths identically.
+   *  @returns empty string on success, otherwise an error message. */
+  std::string load_displacement(const std::string &path, const FileMeta &meta,
+                                const FieldInfo &field, int frame,
+                                DisplacementField &out);
 };
 
 }  // namespace mueye

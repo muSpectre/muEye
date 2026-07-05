@@ -30,6 +30,13 @@ class OrbitCamera {
    *  shrinks the rendered box under an existing view. */
   void retarget_box(const Vec3 &box);
 
+  /** Frame an arbitrary axis-aligned bounding box given its centre and largest
+   *  side length — used for sheared (Bravais) cells, whose bounds are not
+   *  simply [0,box]. Resets the orbit angles. */
+  void frame_aabb(const Vec3 &center, float extent);
+  /** Like frame_aabb but keeps the current orbit angles. */
+  void retarget_aabb(const Vec3 &center, float extent);
+
   /** Orbit by mouse drag deltas (in radians-equivalent screen units). */
   void orbit(float dyaw, float dpitch);
   /** Dolly in/out (e.g. mouse wheel); positive zooms in. */

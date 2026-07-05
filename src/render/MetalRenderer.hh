@@ -30,6 +30,7 @@ class MetalRenderer : public Renderer {
 
   void set_volume(const float *data, int nx, int ny, int nz) override;
   void set_transfer_function(const Vec4 *lut, int n) override;
+  void set_displacement(const float *data, int nx, int ny, int nz) override;
   void render(const RenderParams &params, const Camera &camera,
               Framebuffer &fb) override;
   const char *name() const override;

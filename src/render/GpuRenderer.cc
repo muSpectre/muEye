@@ -118,6 +118,22 @@ struct TextureSampler {
   }
 };
 
+/** Hardware-texture displacement sampler (float4 3-D texture), mirroring
+ *  render_core.hh's ArrayDispSampler::disp_at for the warp path. */
+struct TextureDispSampler {
+  gpuTextureObject_t tex;  // 0 when no displacement is uploaded
+
+  MUEYE_HD Vec3 disp_at(const RenderParams & /*p*/, const Vec3 &uvw) const {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    float4 d = tex3D<float4>(tex, uvw.x, uvw.y, uvw.z);
+    return Vec3{d.x, d.y, d.z};
+#else
+    (void)uvw;
+    return Vec3{0.0f, 0.0f, 0.0f};  // host stub
+#endif
+  }
+};
+
 MUEYE_HD inline void write_rgba(unsigned char *out, std::size_t idx, Vec4 c) {
   out[idx + 0] = static_cast<unsigned char>(clampf(c.x, 0.f, 1.f) * 255.f + 0.5f);
   out[idx + 1] = static_cast<unsigned char>(clampf(c.y, 0.f, 1.f) * 255.f + 0.5f);
@@ -129,6 +145,7 @@ MUEYE_HD inline void write_rgba(unsigned char *out, std::size_t idx, Vec4 c) {
 // render_core.hh): p.mode is grid-uniform — never divergent — but a combined
 // kernel inflates register/instruction footprint and can cap occupancy.
 __global__ void render_kernel_dvr(gpuTextureObject_t vol,
+                                  gpuTextureObject_t disp,
                                   const Vec4 *MUEYE_RESTRICT lut, RenderParams p,
                                   Camera cam, unsigned char *MUEYE_RESTRICT out,
                                   int w, int h) {
@@ -137,11 +154,13 @@ __global__ void render_kernel_dvr(gpuTextureObject_t vol,
   if (x >= w || y >= h) return;
   float u = (x + 0.5f) / w;
   float v = (y + 0.5f) / h;
-  Vec4 c = trace_ray_dvr(TextureSampler{vol}, lut, p, cam, u, v);
+  Vec4 c = trace_ray_dvr(TextureSampler{vol}, TextureDispSampler{disp}, lut, p,
+                         cam, u, v);
   write_rgba(out, (static_cast<std::size_t>(y) * w + x) * 4, c);
 }
 
-__global__ void render_kernel_iso(gpuTextureObject_t vol, RenderParams p,
+__global__ void render_kernel_iso(gpuTextureObject_t vol,
+                                  gpuTextureObject_t disp, RenderParams p,
                                   Camera cam, unsigned char *MUEYE_RESTRICT out,
                                   int w, int h) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -149,20 +168,26 @@ __global__ void render_kernel_iso(gpuTextureObject_t vol, RenderParams p,
   if (x >= w || y >= h) return;
   float u = (x + 0.5f) / w;
   float v = (y + 0.5f) / h;
-  Vec4 c = trace_ray_iso(TextureSampler{vol}, p, cam, u, v);
+  Vec4 c = trace_ray_iso(TextureSampler{vol}, TextureDispSampler{disp}, p, cam,
+                         u, v);
   write_rgba(out, (static_cast<std::size_t>(y) * w + x) * 4, c);
 }
 
 /** Launch the kernel matching p.mode, writing RGBA8 into @p out (device ptr). */
-void launch(gpuTextureObject_t tex, const Vec4 *lut, const RenderParams &p,
-            const Camera &cam, unsigned char *out, int w, int h) {
+void launch(gpuTextureObject_t tex, gpuTextureObject_t disp, const Vec4 *lut,
+            RenderParams p, const Camera &cam, unsigned char *out, int w,
+            int h) {
+  // Never warp without a resident displacement texture (mirrors the Metal
+  // backend's guard); the sampler would otherwise fetch an invalid texture.
+  if (p.warp_enabled && disp == 0) p.warp_enabled = 0;
   dim3 block(16, 16);
   dim3 grid((w + 15) / 16, (h + 15) / 16);
   if (p.mode == RenderMode::Isosurface) {
-    GPU_LAUNCH_KERNEL(render_kernel_iso, grid, block, tex, p, cam, out, w, h);
-  } else {
-    GPU_LAUNCH_KERNEL(render_kernel_dvr, grid, block, tex, lut, p, cam, out, w,
+    GPU_LAUNCH_KERNEL(render_kernel_iso, grid, block, tex, disp, p, cam, out, w,
                       h);
+  } else {
+    GPU_LAUNCH_KERNEL(render_kernel_dvr, grid, block, tex, disp, lut, p, cam,
+                      out, w, h);
   }
 }
 
@@ -187,6 +212,8 @@ GpuRenderer::~GpuRenderer() {
   if (pbo_) glDeleteBuffers(1, &pbo_);
   if (d_tex_) GPU_(DestroyTextureObject)(handle_to_tex(d_tex_));
   if (d_array_) GPU_(FreeArray)(static_cast<gpuArray_t>(d_array_));
+  if (d_disp_tex_) GPU_(DestroyTextureObject)(handle_to_tex(d_disp_tex_));
+  if (d_disp_array_) GPU_(FreeArray)(static_cast<gpuArray_t>(d_disp_array_));
   if (d_lut_) GPU_FREE(d_lut_);
   if (d_output_) GPU_FREE(d_output_);
 }
@@ -306,6 +333,70 @@ void GpuRenderer::set_transfer_function(const Vec4 *lut, int n) {
   }
 }
 
+void GpuRenderer::set_displacement(const float *data, int nx, int ny, int nz) {
+  error_.clear();
+  // Always release the previous displacement texture/array first.
+  if (d_disp_tex_) {
+    GPU_(DestroyTextureObject)(handle_to_tex(d_disp_tex_));
+    d_disp_tex_ = 0;
+  }
+  if (d_disp_array_) {
+    GPU_(FreeArray)(static_cast<gpuArray_t>(d_disp_array_));
+    d_disp_array_ = nullptr;
+  }
+  if (data == nullptr) return;  // clear only
+
+  // A float4 3-D array: the host buffer already stores 4 floats per voxel.
+  GPU_(ChannelFormatDesc) channel = GPU_(CreateChannelDesc)<float4>();
+  gpuArray_t array = nullptr;
+  GPU_(Error_t) err =
+      GPU_(Malloc3DArray)(&array, &channel, gpu_make_extent(nx, ny, nz), 0);
+  if (err != GPU_(Success) || array == nullptr) {
+    error_ = std::string("displacement allocation failed: ") +
+             GPU_(GetErrorString)(err);
+    return;
+  }
+
+  GPU_(Memcpy3DParms) copy = {};
+  copy.srcPtr = gpu_make_pitched(const_cast<float *>(data),
+                                 static_cast<std::size_t>(nx) * 4 * sizeof(float),
+                                 nx, ny);
+  copy.dstArray = array;
+  copy.extent = gpu_make_extent(nx, ny, nz);
+  copy.kind = GPU_(MemcpyHostToDevice);
+  err = GPU_(Memcpy3D)(&copy);
+  if (err != GPU_(Success)) {
+    GPU_(FreeArray)(array);
+    error_ =
+        std::string("displacement upload failed: ") + GPU_(GetErrorString)(err);
+    return;
+  }
+
+  // Same sampling convention as the volume (linear + clamp + normalized coords)
+  // so the warp's fractional lookups match ArrayDispSampler.
+  GPU_(ResourceDesc) res = {};
+  res.resType = GPU_(ResourceTypeArray);
+  res.res.array.array = array;
+  GPU_(TextureDesc) tex_desc = {};
+  tex_desc.addressMode[0] = GPU_(AddressModeClamp);
+  tex_desc.addressMode[1] = GPU_(AddressModeClamp);
+  tex_desc.addressMode[2] = GPU_(AddressModeClamp);
+  tex_desc.filterMode = GPU_(FilterModeLinear);
+  tex_desc.readMode = GPU_(ReadModeElementType);
+  tex_desc.normalizedCoords = 1;
+
+  gpuTextureObject_t tex = 0;
+  err = GPU_(CreateTextureObject)(&tex, &res, &tex_desc, nullptr);
+  if (err != GPU_(Success)) {
+    GPU_(FreeArray)(array);
+    error_ = std::string("displacement texture creation failed: ") +
+             GPU_(GetErrorString)(err);
+    return;
+  }
+  d_disp_array_ = array;
+  d_disp_tex_ = tex_to_handle(tex);
+}
+
 void GpuRenderer::render(const RenderParams &params, const Camera &camera,
                          Framebuffer &fb) {
   const int w = fb.width, h = fb.height;
@@ -331,8 +422,8 @@ void GpuRenderer::render(const RenderParams &params, const Camera &camera,
     out_h_ = h;
   }
 
-  launch(handle_to_tex(d_tex_), d_lut_, params, camera,
-         d_output_, w, h);
+  launch(handle_to_tex(d_tex_), handle_to_tex(d_disp_tex_), d_lut_, params,
+         camera, d_output_, w, h);
   GPU_DEVICE_SYNCHRONIZE();
 
   GPU_MEMCPY_D2H(fb.rgba.data(), d_output_, bytes);
@@ -383,8 +474,8 @@ bool GpuRenderer::render_to_gl(const RenderParams &params, const Camera &camera,
   GPU_(GraphicsResourceGetMappedPointer)(reinterpret_cast<void **>(&dev_ptr),
                                          &mapped_bytes, res);
 
-  launch(handle_to_tex(d_tex_), d_lut_, params, camera,
-         dev_ptr, width, height);
+  launch(handle_to_tex(d_tex_), handle_to_tex(d_disp_tex_), d_lut_, params,
+         camera, dev_ptr, width, height);
 
   // Unmapping synchronizes the render with subsequent GL use of the buffer.
   GPU_(GraphicsUnmapResources)(1, &res, 0);

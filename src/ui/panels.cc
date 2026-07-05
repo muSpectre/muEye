@@ -179,7 +179,84 @@ void App::draw_ui() {
     ImGui::Text("components: %d   sub-points: %d", fi.nb_components,
                 fi.nb_sub_pts);
 
+    // ---- Deformed geometry from a displacement field ----
+    // Eligible fields have exactly spatial_dim components (a 3-vector in 3D,
+    // 2-vector in 2D). "(none)" is the default: undeformed.
+    ImGui::Separator();
+    std::vector<const char *> disp_names;
+    std::vector<int> disp_map;  // combo entry -> field index (-1 for none)
+    disp_names.push_back("(none)");
+    disp_map.push_back(-1);
+    for (std::size_t i = 0; i < meta_.fields.size(); ++i) {
+      if (meta_.fields[i].nb_components == meta_.spatial_dim) {
+        disp_names.push_back(meta_.fields[i].name.c_str());
+        disp_map.push_back(static_cast<int>(i));
+      }
+    }
+    int disp_cur = 0;
+    for (std::size_t k = 0; k < disp_map.size(); ++k)
+      if (disp_map[k] == disp_field_index_) disp_cur = static_cast<int>(k);
+    if (ImGui::Combo("Displacement", &disp_cur, disp_names.data(),
+                     static_cast<int>(disp_names.size()))) {
+      disp_field_index_ = disp_map[disp_cur];
+      reload_displacement();
+    }
+    if (disp_field_index_ >= 0) {
+      if (ImGui::DragFloat("Warp scale", &warp_scale_, 0.05f, 0.0f, 1.0e6f,
+                           "%.3f"))
+        needs_render_ = true;
+      if (ImGui::SliderInt("Warp iters", &warp_iters_, 1, 16))
+        needs_render_ = true;
+      if (periodic_)
+        ImGui::TextDisabled("(periodic tiling is disabled while warping)");
+    }
+
     if (reload) reload_volume();
+    ImGui::End();
+  }
+
+  // ----------------------------------------------------------------- Cell
+  // Deformation gradient F: shears the reference box into a (Bravais) cell.
+  // Editing F rebuilds inv_cell in make_render_params, so only a re-render is
+  // needed. Identity => the orthogonal box exactly as before.
+  if (has_file_ && !volume_.empty()) {
+    ImGui::Begin("Cell");
+    const bool is_2d = meta_.spatial_dim == 2;
+    ImGui::TextWrapped(
+        deformation_from_file_
+            ? "Deformation gradient F (read from file). C = F * box."
+            : "Deformation gradient F (identity = orthogonal). C = F * box.");
+    const int dim = is_2d ? 2 : 3;
+    bool changed = false;
+    // Edit the leading dim x dim block row by row; the z row/col stay identity
+    // for 2D data. Row-major index into F_ is 3*r + c.
+    for (int r = 0; r < dim; ++r) {
+      float row[3];
+      for (int c = 0; c < dim; ++c) row[c] = F_[3 * r + c];
+      ImGui::PushID(r);
+      ImGui::SetNextItemWidth(220.0f);
+      if (ImGui::InputScalarN("##Frow", ImGuiDataType_Float, row, dim, nullptr,
+                              nullptr, "%.4f")) {
+        for (int c = 0; c < dim; ++c) F_[3 * r + c] = row[c];
+        changed = true;
+      }
+      ImGui::PopID();
+    }
+    if (ImGui::Button("Reset to identity")) {
+      for (int i = 0; i < 9; ++i)
+        F_[i] = (i == 0 || i == 4 || i == 8) ? 1.0f : 0.0f;
+      deformation_from_file_ = false;
+      changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Frame cell")) {
+      Vec3 center;
+      float extent;
+      cell_bounds(center, extent);
+      camera_.frame_aabb(center, extent);
+      needs_render_ = true;
+    }
+    if (changed) needs_render_ = true;
     ImGui::End();
   }
 
@@ -225,10 +302,12 @@ void App::draw_ui() {
     }
     if (tiling_changed) {
       for (int &r : replicas_) r = r < 1 ? 1 : (r > 8 ? 8 : r);
-      // Keep the view direction but recentre on the tiled box.
+      // Keep the view direction but recentre on the tiled (possibly sheared) cell.
       if (!volume_.empty()) {
-        Vec3 b = box_extent(volume_.nx, volume_.ny, volume_.nz);
-        camera_.retarget_box(Vec3{b.x * rep(0), b.y * rep(1), b.z * rep(2)});
+        Vec3 center;
+        float extent;
+        cell_bounds(center, extent);
+        camera_.retarget_aabb(center, extent);
       }
       needs_render_ = true;
     }
@@ -354,8 +433,12 @@ void App::draw_ui() {
       // by construction — no ray-march kernel is involved.
       if (show_box_ && !volume_.empty()) {
         ImVec2 img_pos = ImGui::GetItemRectMin();
-        Vec3 b = box_extent(volume_.nx, volume_.ny, volume_.nz);
-        Vec3 tb{b.x * rep(0), b.y * rep(1), b.z * rep(2)};
+        // Edge vectors of the (possibly sheared) tiled cell are the columns of
+        // C scaled by the replica counts; corners are C * frac, frac in {0,rep}.
+        Mat3 C = world_cell();
+        float rx = static_cast<float>(rep(0));
+        float ry = static_cast<float>(rep(1));
+        float rz = static_cast<float>(rep(2));
         // Use the aspect the frame was actually rendered with (the downscaled
         // framebuffer is stretched onto the viewport), so the outline lands
         // exactly on the rendered box.
@@ -370,13 +453,13 @@ void App::draw_ui() {
         ImDrawList *dl = ImGui::GetWindowDrawList();
         // The 12 edges connect the corner pairs differing in one axis bit.
         for (int i = 0; i < 8; ++i) {
-          Vec3 c0{(i & 1) ? tb.x : 0.0f, (i & 2) ? tb.y : 0.0f,
-                  (i & 4) ? tb.z : 0.0f};
+          Vec3 c0 = mat3_mul(C, Vec3{(i & 1) ? rx : 0.0f, (i & 2) ? ry : 0.0f,
+                                     (i & 4) ? rz : 0.0f});
           for (int bit = 1; bit <= 4; bit <<= 1) {
             if (i & bit) continue;
             int j = i | bit;
-            Vec3 c1{(j & 1) ? tb.x : 0.0f, (j & 2) ? tb.y : 0.0f,
-                    (j & 4) ? tb.z : 0.0f};
+            Vec3 c1 = mat3_mul(C, Vec3{(j & 1) ? rx : 0.0f, (j & 2) ? ry : 0.0f,
+                                       (j & 4) ? rz : 0.0f});
             draw_box_edge(dl, cam, c0, c1, img_pos,
                           static_cast<float>(vw), static_cast<float>(vh), col);
           }

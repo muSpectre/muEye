@@ -36,6 +36,7 @@ class GpuRenderer : public Renderer {
 
   void set_volume(const float *data, int nx, int ny, int nz) override;
   void set_transfer_function(const Vec4 *lut, int n) override;
+  void set_displacement(const float *data, int nx, int ny, int nz) override;
   void render(const RenderParams &params, const Camera &camera,
               Framebuffer &fb) override;
   /** Zero-copy path: the kernel writes into a GL pixel buffer object shared
@@ -55,6 +56,11 @@ class GpuRenderer : public Renderer {
   // d_tex_ a cudaTextureObject_t / hipTextureObject_t (an unsigned long long).
   void *d_array_{nullptr};
   unsigned long long d_tex_{0};
+  // Displacement field for the deformed-geometry warp: a float4 3-D texture
+  // (x,y,z displacement per voxel). Same opaque-handle treatment as the volume.
+  // Zero handles mean "no displacement uploaded" — the warp path is then unused.
+  void *d_disp_array_{nullptr};
+  unsigned long long d_disp_tex_{0};
   Vec4 *d_lut_{nullptr};
   unsigned char *d_output_{nullptr};
   int nx_{0}, ny_{0}, nz_{0};

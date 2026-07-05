@@ -84,6 +84,83 @@ MUEYE_HD inline Vec3 normalize(const Vec3 &a) {
   return a * inv;
 }
 
+/**
+ * A 3x3 matrix stored row-major: m[3*r + c]. Used for the world->fractional
+ * "cell" map (see RenderParams::inv_cell) so muEye can render non-orthogonal
+ * (sheared / Bravais) unit cells, not just axis-aligned boxes.
+ */
+struct Mat3 {
+  float m[9];
+};
+
+/** Matrix-vector product A * v. */
+MUEYE_HD inline Vec3 mat3_mul(const Mat3 &A, const Vec3 &v) {
+  return Vec3{A.m[0] * v.x + A.m[1] * v.y + A.m[2] * v.z,
+              A.m[3] * v.x + A.m[4] * v.y + A.m[5] * v.z,
+              A.m[6] * v.x + A.m[7] * v.y + A.m[8] * v.z};
+}
+
+/** Transposed matrix-vector product A^T * v (transforms gradients/normals). */
+MUEYE_HD inline Vec3 mat3t_mul(const Mat3 &A, const Vec3 &v) {
+  return Vec3{A.m[0] * v.x + A.m[3] * v.y + A.m[6] * v.z,
+              A.m[1] * v.x + A.m[4] * v.y + A.m[7] * v.z,
+              A.m[2] * v.x + A.m[5] * v.y + A.m[8] * v.z};
+}
+
+/** Diagonal matrix from a vector. */
+MUEYE_HD inline Mat3 mat3_diag(const Vec3 &d) {
+  return Mat3{{d.x, 0.0f, 0.0f, 0.0f, d.y, 0.0f, 0.0f, 0.0f, d.z}};
+}
+
+/** Row-major 3x3 matrix product A * B. */
+MUEYE_HD inline Mat3 mat3_matmul(const Mat3 &A, const Mat3 &B) {
+  Mat3 C{};
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 3; ++c)
+      C.m[3 * r + c] = A.m[3 * r + 0] * B.m[0 + c] +
+                       A.m[3 * r + 1] * B.m[3 + c] +
+                       A.m[3 * r + 2] * B.m[6 + c];
+  return C;
+}
+
+/** Inverse of a row-major 3x3 matrix (cofactor / determinant); returns the
+ *  identity for a (near-)singular matrix so the renderer degrades gracefully. */
+MUEYE_HD inline Mat3 mat3_inverse(const Mat3 &A) {
+  const float *m = A.m;
+  float c00 = m[4] * m[8] - m[5] * m[7];
+  float c01 = m[5] * m[6] - m[3] * m[8];
+  float c02 = m[3] * m[7] - m[4] * m[6];
+  float det = m[0] * c00 + m[1] * c01 + m[2] * c02;
+  if (det > -1e-20f && det < 1e-20f)
+    return Mat3{{1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f}};
+  float inv = 1.0f / det;
+  Mat3 R{};
+  R.m[0] = c00 * inv;
+  R.m[1] = (m[2] * m[7] - m[1] * m[8]) * inv;
+  R.m[2] = (m[1] * m[5] - m[2] * m[4]) * inv;
+  R.m[3] = c01 * inv;
+  R.m[4] = (m[0] * m[8] - m[2] * m[6]) * inv;
+  R.m[5] = (m[2] * m[3] - m[0] * m[5]) * inv;
+  R.m[6] = c02 * inv;
+  R.m[7] = (m[1] * m[6] - m[0] * m[7]) * inv;
+  R.m[8] = (m[0] * m[4] - m[1] * m[3]) * inv;
+  return R;
+}
+
+/** Build the world->fractional map inv_cell for a deformation gradient F
+ *  (row-major 3x3) acting on the reference box: cell C = F * diag(box),
+ *  inv_cell = C^{-1}. F = identity reproduces axis_aligned_inv_cell(box). */
+MUEYE_HD inline Mat3 inv_cell_from_F(const Mat3 &F, const Vec3 &box) {
+  return mat3_inverse(mat3_matmul(F, mat3_diag(box)));
+}
+
+/** The world->fractional map for an axis-aligned box [0,box]: diag(1/box).
+ *  Feeding this as inv_cell reproduces the pre-cell-matrix behaviour exactly
+ *  (fractional coord = world / box, elementwise). */
+MUEYE_HD inline Mat3 axis_aligned_inv_cell(const Vec3 &box) {
+  return mat3_diag(Vec3{1.0f / box.x, 1.0f / box.y, 1.0f / box.z});
+}
+
 // ---------------------------------------------------------------------------
 // Camera and render parameters.
 // ---------------------------------------------------------------------------
@@ -111,10 +188,20 @@ enum class RenderMode : int { DVR = 0, Isosurface = 1 };
  * coordinates wrap back into the unit cell.
  * Data is sampled from a contiguous float buffer in column-major (muGrid)
  * order: index = i + nx*(j + ny*k).
+ *
+ * `inv_cell` is the world->fractional map: a world point p maps to a fractional
+ * cell coordinate uvw = inv_cell * p, and the sampler reads at uvw (in [0,1]^3
+ * for one cell). For an axis-aligned box this is diag(1/box) — set it with
+ * axis_aligned_inv_cell(box). For a sheared (Bravais) cell whose edge vectors
+ * are the columns of a 3x3 matrix C, inv_cell = C^{-1}; the rendered cell is
+ * then the parallelepiped C * [0,1]^3. `box` is retained for camera/step
+ * bookkeeping and is the axis-aligned extent of the *undeformed* cell.
  */
 struct RenderParams {
   int nx, ny, nz;        //!< grid dimensions
-  Vec3 box;              //!< world-space extents of one volume box [0,box]
+  Vec3 box;              //!< world-space extents of the undeformed box [0,box]
+  Mat3 inv_cell{{1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f,
+                 1.0f}};  //!< world->fractional map (see class doc)
   int rep_x{1};          //!< periodic replicas along x (>= 1; 1 = no tiling)
   int rep_y{1};          //!< periodic replicas along y
   int rep_z{1};          //!< periodic replicas along z
@@ -126,6 +213,20 @@ struct RenderParams {
   float iso_value;       //!< iso level (Isosurface mode), in data units
   RenderMode mode;       //!< DVR or Isosurface
   Vec3 bg;               //!< background colour
+
+  // --- optional displacement warp (deformed geometry) -------------------
+  // When warp_enabled, the volume is rendered in its deformed configuration
+  // x = C*s + D(s), where s is the fractional cell coordinate and D(s) =
+  // (warp_scale / max_dim) * u(s) is the world-space displacement (u is the
+  // selected vector field, sampled through a DispSampler). The trace kernels
+  // invert this per sample (fixed-point) to recover s, so they march the
+  // world-space AABB [warp_lo, warp_hi] that encloses the deformed body.
+  // Periodic replicas are disabled while warping.
+  int warp_enabled{0};
+  float warp_scale{1.0f};  //!< user gain on the displacement (world units)
+  int warp_iters{6};       //!< fixed-point iterations for the inverse map
+  Vec3 warp_lo{0.0f, 0.0f, 0.0f};  //!< world AABB of the deformed body (min)
+  Vec3 warp_hi{0.0f, 0.0f, 0.0f};  //!< world AABB of the deformed body (max)
 };
 
 // ---------------------------------------------------------------------------
@@ -265,6 +366,104 @@ MUEYE_HD inline bool intersect_box(const Vec3 &o, const Vec3 &d, const Vec3 &box
   return t_far > t_near;
 }
 
+/** Intersect a ray with the world-space AABB [lo,hi] (used by the warp path,
+ *  which cannot fold the deformed body into the unit box). */
+MUEYE_HD inline bool intersect_aabb(const Vec3 &o, const Vec3 &d, const Vec3 &lo,
+                                    const Vec3 &hi, float &t_near, float &t_far) {
+  float tmin = -1e30f, tmax = 1e30f;
+  for (int axis = 0; axis < 3; ++axis) {
+    float oa = axis == 0 ? o.x : (axis == 1 ? o.y : o.z);
+    float da = axis == 0 ? d.x : (axis == 1 ? d.y : d.z);
+    float l = axis == 0 ? lo.x : (axis == 1 ? lo.y : lo.z);
+    float h = axis == 0 ? hi.x : (axis == 1 ? hi.y : hi.z);
+    if (fabsf(da) < 1e-8f) {
+      if (oa < l || oa > h) return false;
+    } else {
+      float inv = 1.0f / da;
+      float t1 = (l - oa) * inv;
+      float t2 = (h - oa) * inv;
+      if (t1 > t2) {
+        float tmp = t1;
+        t1 = t2;
+        t2 = tmp;
+      }
+      tmin = maxf(tmin, t1);
+      tmax = minf(tmax, t2);
+      if (tmin > tmax) return false;
+    }
+  }
+  t_near = maxf(tmin, 0.0f);
+  t_far = tmax;
+  return t_far > t_near;
+}
+
+/** Software trilinear sampler of a 3-vector displacement field stored as 4
+ *  floats per voxel (x,y,z,unused), column-major like ArraySampler. The CPU
+ *  backend uses this; GPU backends substitute a float4-texture sampler exposing
+ *  the same disp_at(). */
+struct ArrayDispSampler {
+  const float *MUEYE_RESTRICT disp;  //!< 4 floats per voxel, or null when unused
+
+  MUEYE_HD Vec3 voxel(const RenderParams &p, int i, int j, int k) const {
+    i = i < 0 ? 0 : (i >= p.nx ? p.nx - 1 : i);
+    j = j < 0 ? 0 : (j >= p.ny ? p.ny - 1 : j);
+    k = k < 0 ? 0 : (k >= p.nz ? p.nz - 1 : k);
+    const float *v = disp + 4 * (i + p.nx * (j + p.ny * k));
+    return Vec3{v[0], v[1], v[2]};
+  }
+
+  MUEYE_HD Vec3 disp_at(const RenderParams &p, const Vec3 &uvw) const {
+    float fx = uvw.x * p.nx - 0.5f;
+    float fy = uvw.y * p.ny - 0.5f;
+    float fz = uvw.z * p.nz - 0.5f;
+    int i0 = (int)floorf(fx), j0 = (int)floorf(fy), k0 = (int)floorf(fz);
+    float tx = fx - i0, ty = fy - j0, tz = fz - k0;
+    Vec3 c000 = voxel(p, i0, j0, k0), c100 = voxel(p, i0 + 1, j0, k0);
+    Vec3 c010 = voxel(p, i0, j0 + 1, k0), c110 = voxel(p, i0 + 1, j0 + 1, k0);
+    Vec3 c001 = voxel(p, i0, j0, k0 + 1), c101 = voxel(p, i0 + 1, j0, k0 + 1);
+    Vec3 c011 = voxel(p, i0, j0 + 1, k0 + 1),
+         c111 = voxel(p, i0 + 1, j0 + 1, k0 + 1);
+    Vec3 c00 = c000 * (1 - tx) + c100 * tx, c10 = c010 * (1 - tx) + c110 * tx;
+    Vec3 c01 = c001 * (1 - tx) + c101 * tx, c11 = c011 * (1 - tx) + c111 * tx;
+    Vec3 c0 = c00 * (1 - ty) + c10 * ty, c1 = c01 * (1 - ty) + c11 * ty;
+    return c0 * (1 - tz) + c1 * tz;
+  }
+};
+
+/** The world->fractional displacement gain: raw field-unit displacements are
+ *  scaled to world units by 1/max_dim (one voxel of the longest axis spans that
+ *  in world space) times the user's warp_scale. */
+MUEYE_HD inline float warp_gain(const RenderParams &p) {
+  int max_dim = p.nx > p.ny ? p.nx : p.ny;
+  if (p.nz > max_dim) max_dim = p.nz;
+  return p.warp_scale / static_cast<float>(max_dim > 0 ? max_dim : 1);
+}
+
+/**
+ * Recover the fractional cell coordinate s of a world point x under the
+ * displacement warp x = C*s + D(s). Fixed-point iteration
+ * s <- inv_cell * (x - D(s)); converges for moderate displacement gradients.
+ * `outside` is set when the recovered s leaves the unit cell (i.e. the world
+ * point is not inside the deformed body).
+ */
+template <class DispSampler>
+MUEYE_HD inline Vec3 world_to_reference(const DispSampler &d,
+                                        const RenderParams &p, const Vec3 &x,
+                                        bool &outside) {
+  Vec3 s = mat3_mul(p.inv_cell, x);
+  float g = warp_gain(p);
+  for (int it = 0; it < p.warp_iters; ++it) {
+    Vec3 sc = Vec3{clampf(s.x, 0.0f, 1.0f), clampf(s.y, 0.0f, 1.0f),
+                   clampf(s.z, 0.0f, 1.0f)};
+    Vec3 world_d = d.disp_at(p, sc) * g;
+    s = mat3_mul(p.inv_cell, x - world_d);
+  }
+  const float e = 1e-4f;
+  outside = s.x < -e || s.x > 1.0f + e || s.y < -e || s.y > 1.0f + e ||
+            s.z < -e || s.z > 1.0f + e;
+  return s;
+}
+
 // ---------------------------------------------------------------------------
 // The ray-march kernel. (u, v) are normalized image coordinates in [0,1].
 // ---------------------------------------------------------------------------
@@ -287,43 +486,92 @@ MUEYE_HD inline Vec3 primary_ray_dir(const Camera &cam, float u, float v) {
  * occupancy. The CPU dispatcher trace_ray() below still selects at runtime — a
  * scalar CPU core has no such footprint concern.
  */
-template <class Sampler>
-MUEYE_HD inline Vec4 trace_ray_iso(const Sampler &s, const RenderParams &p,
-                                   const Camera &cam, float u, float v) {
+template <class Sampler, class DispSampler>
+MUEYE_HD inline Vec4 trace_ray_iso(const Sampler &s, const DispSampler &disp,
+                                   const RenderParams &p, const Camera &cam,
+                                   float u, float v) {
   Vec3 dir = primary_ray_dir(cam, u, v);
   float t_near, t_far;
   Vec4 bg = Vec4{p.bg.x, p.bg.y, p.bg.z, 1.0f};
-  // The ray traverses the periodically tiled box [0, box*rep].
-  Vec3 tiled_box = make_vec3(p.box.x * p.rep_x, p.box.y * p.rep_y,
-                             p.box.z * p.rep_z);
-  if (!intersect_box(cam.eye, dir, tiled_box, t_near, t_far)) return bg;
 
-  // Map world position to a box coordinate; sampling wraps it into [0,1]^3.
-  Vec3 inv_box = make_vec3(1.0f / p.box.x, 1.0f / p.box.y, 1.0f / p.box.z);
+  if (p.warp_enabled) {
+    // Deformed geometry: march the world AABB of the deformed body and recover
+    // the fractional coordinate per sample (fixed-point inverse of the warp).
+    if (!intersect_aabb(cam.eye, dir, p.warp_lo, p.warp_hi, t_near, t_far))
+      return bg;
+    float t = t_near;
+    bool have_prev = false;
+    float prev_v = 0.0f;
+    float prev_t = t_near;
+    while (t < t_far) {
+      Vec3 x = cam.eye + dir * t;
+      bool outside;
+      Vec3 sref = world_to_reference(disp, p, x, outside);
+      if (!outside) {
+        float cur_v = s.value_at(p, sref) - p.iso_value;
+        if (have_prev && prev_v * cur_v <= 0.0f) {
+          float denom = (cur_v - prev_v);
+          float frac = fabsf(denom) > 1e-12f ? prev_v / -denom : 0.0f;
+          float t_hit = prev_t + (t - prev_t) * frac;
+          Vec3 xh = cam.eye + dir * t_hit;
+          bool o2;
+          Vec3 sh = world_to_reference(disp, p, xh, o2);
+          Vec3 n = normalize(mat3t_mul(p.inv_cell, gradient(s, p, sh)));
+          Vec3 l = normalize(cam.eye - xh);
+          float diffuse = fabsf(dot(n, l));
+          Vec3 base = make_vec3(0.82f, 0.45f, 0.20f);
+          Vec3 col = base * (0.20f + 0.80f * diffuse);
+          return Vec4{col.x, col.y, col.z, 1.0f};
+        }
+        prev_v = cur_v;
+        prev_t = t;
+        have_prev = true;
+      } else {
+        have_prev = false;  // don't bridge a crossing across the empty margin
+      }
+      t += p.step;
+    }
+    return bg;
+  }
+
+  // Work in fractional cell coordinates: the affine map uvw = inv_cell * world
+  // turns the (possibly sheared) cell into the unit box, so the ray-parameter t
+  // is preserved and the existing box test applies to the tiled unit box.
+  Vec3 o_frac = mat3_mul(p.inv_cell, cam.eye);
+  Vec3 d_frac = mat3_mul(p.inv_cell, dir);
+  Vec3 tiled_box = make_vec3(static_cast<float>(p.rep_x),
+                             static_cast<float>(p.rep_y),
+                             static_cast<float>(p.rep_z));
+  if (!intersect_box(o_frac, d_frac, tiled_box, t_near, t_far)) return bg;
 
   float t = t_near;
-  Vec3 prev = cam.eye + dir * t;
-  float prev_v = s.value_at(p, wrap_uvw(p, prev * inv_box)) - p.iso_value;
+  Vec3 prev = o_frac + d_frac * t;
+  float prev_v = s.value_at(p, wrap_uvw(p, prev)) - p.iso_value;
   t += p.step;
   while (t < t_far) {
-    Vec3 pos = cam.eye + dir * t;
-    float cur_v = s.value_at(p, wrap_uvw(p, pos * inv_box)) - p.iso_value;
+    Vec3 uvw = o_frac + d_frac * t;
+    float cur_v = s.value_at(p, wrap_uvw(p, uvw)) - p.iso_value;
     if (prev_v * cur_v <= 0.0f) {
-      // Linear refinement of the crossing.
+      // Linear refinement of the crossing, in the fractional-coordinate ray.
       float denom = (cur_v - prev_v);
       float frac = fabsf(denom) > 1e-12f ? prev_v / -denom : 0.0f;
-      Vec3 hit = prev + (pos - prev) * frac;
-      Vec3 n = normalize(gradient(s, p, wrap_uvw(p, hit * inv_box)));
-      // Two-sided Phong with a head light along the view direction. A warm,
+      Vec3 hit = prev + (uvw - prev) * frac;
+      // Gradient is in fractional coords; inv_cell^T maps it to a world-space
+      // normal (a no-op for a cubic cell, a shear-correcting rotation otherwise).
+      Vec3 n = normalize(mat3t_mul(p.inv_cell, gradient(s, p, wrap_uvw(p, hit))));
+      // Two-sided Phong with a head light at the eye. The world hit position is
+      // recovered from the same crossing parameter along the world ray.
+      float t_hit = (t - p.step) + p.step * frac;
+      Vec3 world_hit = cam.eye + dir * t_hit;
       // mid-tone material so the surface reads clearly against a light/white
       // background (a near-white material would disappear).
-      Vec3 l = normalize(cam.eye - hit);
+      Vec3 l = normalize(cam.eye - world_hit);
       float diff = fabsf(dot(n, l));
       Vec3 base = make_vec3(0.82f, 0.45f, 0.20f);
       Vec3 col = base * (0.20f + 0.80f * diff);
       return Vec4{col.x, col.y, col.z, 1.0f};
     }
-    prev = pos;
+    prev = uvw;
     prev_v = cur_v;
     t += p.step;
   }
@@ -331,33 +579,58 @@ MUEYE_HD inline Vec4 trace_ray_iso(const Sampler &s, const RenderParams &p,
 }
 
 /** Direct volume rendering: front-to-back emission-absorption compositing. */
-template <class Sampler>
-MUEYE_HD inline Vec4 trace_ray_dvr(const Sampler &s,
+template <class Sampler, class DispSampler>
+MUEYE_HD inline Vec4 trace_ray_dvr(const Sampler &s, const DispSampler &disp,
                                    const Vec4 *MUEYE_RESTRICT lut,
                                    const RenderParams &p, const Camera &cam,
                                    float u, float v) {
   Vec3 dir = primary_ray_dir(cam, u, v);
   float t_near, t_far;
-  // The ray traverses the periodically tiled box [0, box*rep].
-  Vec3 tiled_box = make_vec3(p.box.x * p.rep_x, p.box.y * p.rep_y,
-                             p.box.z * p.rep_z);
-  if (!intersect_box(cam.eye, dir, tiled_box, t_near, t_far))
-    return Vec4{p.bg.x, p.bg.y, p.bg.z, 1.0f};
-
-  // Map world position to a box coordinate; sampling wraps it into [0,1]^3.
-  Vec3 inv_box = make_vec3(1.0f / p.box.x, 1.0f / p.box.y, 1.0f / p.box.z);
-
-  Vec3 accum = make_vec3(0.0f, 0.0f, 0.0f);
-  float trans = 1.0f;  // remaining transparency
   // Opacity correction: p.step is in world units and the longest grid axis
   // spans one world unit, so step * max_dim is the step length in voxels —
   // the unit the LUT's per-voxel opacity is defined in. Using the longest
   // axis (not nx) keeps the density independent of the data's axis order.
   int max_dim = p.nx > p.ny ? p.nx : p.ny;
   if (p.nz > max_dim) max_dim = p.nz;
+
+  if (p.warp_enabled) {
+    // Deformed geometry: march the world AABB, invert the warp per sample.
+    if (!intersect_aabb(cam.eye, dir, p.warp_lo, p.warp_hi, t_near, t_far))
+      return Vec4{p.bg.x, p.bg.y, p.bg.z, 1.0f};
+    Vec3 accum = make_vec3(0.0f, 0.0f, 0.0f);
+    float trans = 1.0f;
+    for (float t = t_near; t < t_far; t += p.step) {
+      Vec3 x = cam.eye + dir * t;
+      bool outside;
+      Vec3 sref = world_to_reference(disp, p, x, outside);
+      if (outside) continue;  // outside the deformed body
+      float val = s.value_at(p, sref);
+      float nv = normalize_value(p, val);
+      Vec4 c = lut_lookup(lut, p, nv);
+      float alpha = clampf(c.w * p.density_scale * p.step * max_dim, 0.0f, 1.0f);
+      accum = accum + make_vec3(c.x, c.y, c.z) * (alpha * trans);
+      trans *= (1.0f - alpha);
+      if (trans < 0.003f) break;
+    }
+    Vec3 out = accum + p.bg * trans;
+    return Vec4{out.x, out.y, out.z, 1.0f};
+  }
+
+  // Work in fractional cell coordinates: uvw = inv_cell * world maps the
+  // (possibly sheared) cell onto the unit box, preserving the ray-parameter t.
+  Vec3 o_frac = mat3_mul(p.inv_cell, cam.eye);
+  Vec3 d_frac = mat3_mul(p.inv_cell, dir);
+  Vec3 tiled_box = make_vec3(static_cast<float>(p.rep_x),
+                             static_cast<float>(p.rep_y),
+                             static_cast<float>(p.rep_z));
+  if (!intersect_box(o_frac, d_frac, tiled_box, t_near, t_far))
+    return Vec4{p.bg.x, p.bg.y, p.bg.z, 1.0f};
+
+  Vec3 accum = make_vec3(0.0f, 0.0f, 0.0f);
+  float trans = 1.0f;  // remaining transparency
   for (float t = t_near; t < t_far; t += p.step) {
-    Vec3 pos = cam.eye + dir * t;
-    float val = s.value_at(p, wrap_uvw(p, pos * inv_box));
+    Vec3 uvw = o_frac + d_frac * t;
+    float val = s.value_at(p, wrap_uvw(p, uvw));
     float nv = normalize_value(p, val);
     Vec4 c = lut_lookup(lut, p, nv);
     // Opacity correction for the step size, then global density scale.
@@ -373,12 +646,14 @@ MUEYE_HD inline Vec4 trace_ray_dvr(const Sampler &s,
 }
 
 /** Runtime-dispatched entry point (CPU backend + single-kernel callers). */
-template <class Sampler>
-MUEYE_HD inline Vec4 trace_ray(const Sampler &s, const Vec4 *MUEYE_RESTRICT lut,
-                               const RenderParams &p, const Camera &cam,
-                               float u, float v) {
-  return p.mode == RenderMode::Isosurface ? trace_ray_iso(s, p, cam, u, v)
-                                          : trace_ray_dvr(s, lut, p, cam, u, v);
+template <class Sampler, class DispSampler>
+MUEYE_HD inline Vec4 trace_ray(const Sampler &s, const DispSampler &disp,
+                               const Vec4 *MUEYE_RESTRICT lut,
+                               const RenderParams &p, const Camera &cam, float u,
+                               float v) {
+  return p.mode == RenderMode::Isosurface
+             ? trace_ray_iso(s, disp, p, cam, u, v)
+             : trace_ray_dvr(s, disp, lut, p, cam, u, v);
 }
 
 }  // namespace mueye

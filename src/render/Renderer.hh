@@ -69,6 +69,14 @@ class Renderer {
   /** Upload the transfer-function LUT (n RGBA entries). */
   virtual void set_transfer_function(const Vec4 *lut, int n) = 0;
 
+  /** Upload the displacement field used for the deformed-geometry warp: a
+   *  contiguous buffer of 4 floats per voxel (x,y,z displacement + unused w),
+   *  column-major like the volume. Pass @p data == nullptr to clear it (no
+   *  warp). Backends that don't implement warping ignore this; the default is
+   *  a no-op, so warp_enabled stays effectively off for them. */
+  virtual void set_displacement(const float * /*data*/, int /*nx*/, int /*ny*/,
+                                int /*nz*/) {}
+
   /** Render one frame into @p fb (assumed already sized). */
   virtual void render(const RenderParams &params, const Camera &camera,
                       Framebuffer &fb) = 0;

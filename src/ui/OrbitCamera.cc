@@ -35,6 +35,17 @@ void OrbitCamera::retarget_box(const Vec3 &box) {
   distance_ = 2.5f * (m > 0.0f ? m : 1.0f);
 }
 
+void OrbitCamera::frame_aabb(const Vec3 &center, float extent) {
+  reset();
+  target_ = center;
+  distance_ = 2.5f * (extent > 0.0f ? extent : 1.0f);
+}
+
+void OrbitCamera::retarget_aabb(const Vec3 &center, float extent) {
+  target_ = center;
+  distance_ = 2.5f * (extent > 0.0f ? extent : 1.0f);
+}
+
 void OrbitCamera::orbit(float dyaw, float dpitch) {
   yaw_ += dyaw;
   pitch_ += dpitch;

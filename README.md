@@ -29,6 +29,18 @@ muEye reuses muGrid internally:
 - Field / frame / component selection, plus derived scalars: vector **magnitude** and,
   for 3×3 tensor fields, **von Mises** and **trace**.
 - Toggleable **box outline** around the rendered volume (Render panel → "Show box").
+- **Non-orthogonal (Bravais) cells**: render the volume in a sheared unit cell given by a
+  macroscopic deformation gradient **F** (cell edge vectors = columns of `C = F · box`).
+  F is read from the file's `deformation_gradient` global attribute (or `average_strain`
+  ε, as `F = I + ε`) and can be edited live in the **Cell** panel. Identity F is the
+  usual orthogonal box. See *Feeding cell geometry from muGrid* below.
+- **Deformed geometry from a displacement field**: pick any vector field with the grid's
+  spatial dimension (3 components in 3D, 2 in 2D) as a **Displacement** in the Dataset
+  panel to render the *deformed* configuration `x = C·s + u`. Default is undeformed;
+  a **Warp scale** gain tunes the visualized displacement (the file carries no physical
+  length, so scale is user-set). The ray marcher inverts the warp per sample
+  (fixed-point), so it works for DVR and isosurface on every backend. Periodic tiling is
+  disabled while warping.
 - **Periodic images**: tile the volume periodically with a per-axis replica count
   (Render panel → "Periodic images" + "Replicas"); the ray marcher wraps sampling back
   into the unit cell, so memory use is independent of the replica count.
@@ -75,6 +87,36 @@ python scripts/make_test_volume.py demo.nc
 Then: pick a file with **Browse...** (native dialog), type a path and **Load**, or
 pass it on the command line; pick a field/frame, toggle **DVR**/**Isosurface**,
 drag to orbit, scroll to zoom.
+
+## Feeding cell geometry from muGrid
+
+muGrid NetCDF files describe geometry only as the integer grid dimensions (`nx/ny/nz`);
+they carry no physical cell shape or strain. To render a **deformed / non-orthogonal
+cell**, muEye reads an optional `deformation_gradient` global attribute (a flat,
+row-major 3×3 in 3D, or 2×2 in 2D). A producer built on muGrid writes it with the
+existing `write_global_attribute` API — **no muGrid change is required**:
+
+```python
+import numpy as np, muGrid
+
+file = muGrid.FileIONetCDF(path, open_mode="overwrite")
+file.register_field_collection(fc)
+
+# Macroscopic deformation gradient F (row-major). F = I ⇒ undeformed.
+F = np.eye(3); F[0, 1] = 0.2                       # example simple shear
+file.write_global_attribute("deformation_gradient", list(F.ravel()))
+
+# ... append_frame() / write fields as usual ...
+```
+
+Notes:
+- Write the attribute **once, up front, before appending frames** — muGrid defines global
+  attributes at file creation.
+- For a small-strain workflow, store the **average strain** ε instead under
+  `average_strain`; muEye applies `F = I + ε`.
+- muEye's rendered cell is `C = F · diag(box)`, where `box` is the grid shape normalized
+  so the longest axis is 1. `scripts/make_test_volume.py --shear S` writes such a file
+  for testing, and `./build/muEye_check --view file.nc [field]` renders it headlessly.
 
 ## Rendering backends
 

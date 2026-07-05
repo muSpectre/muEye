@@ -21,6 +21,10 @@ void CpuRenderer::set_volume(const float *data, int, int, int) {
 
 void CpuRenderer::set_transfer_function(const Vec4 *lut, int) { lut_ = lut; }
 
+void CpuRenderer::set_displacement(const float *data, int, int, int) {
+  disp_ = data;  // borrowed, like the volume; nullptr clears the warp
+}
+
 void CpuRenderer::render(const RenderParams &params, const Camera &camera,
                          Framebuffer &fb) {
   const int w = fb.width;
@@ -29,13 +33,17 @@ void CpuRenderer::render(const RenderParams &params, const Camera &camera,
 
   std::uint8_t *out = fb.rgba.data();
   const ArraySampler sampler{volume_};
+  const ArrayDispSampler disp{disp_};
+  // Never warp without a displacement buffer (mirrors the GPU backends' guard).
+  RenderParams p = params;
+  if (p.warp_enabled && disp_ == nullptr) p.warp_enabled = 0;
 
   // Parallelise across scanlines.
   parallel_for(h, nb_threads_, [&](int y) {
     for (int x = 0; x < w; ++x) {
       float u = (x + 0.5f) / w;
       float v = (y + 0.5f) / h;
-      Vec4 c = trace_ray(sampler, lut_, params, camera, u, v);
+      Vec4 c = trace_ray(sampler, disp, lut_, p, camera, u, v);
       std::size_t idx = (static_cast<std::size_t>(y) * w + x) * 4;
       out[idx + 0] = static_cast<std::uint8_t>(clampf(c.x, 0.f, 1.f) * 255.f + 0.5f);
       out[idx + 1] = static_cast<std::uint8_t>(clampf(c.y, 0.f, 1.f) * 255.f + 0.5f);

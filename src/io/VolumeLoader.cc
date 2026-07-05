@@ -11,6 +11,7 @@
 #include <netcdf.h>
 
 #include <algorithm>
+#include <cmath>
 #include <exception>
 
 // muGrid headers (resolved via the muGrid target's build-interface include dirs)
@@ -207,6 +208,54 @@ FileMeta VolumeLoader::open(const std::string &path) {
     meta.nb_frames = 1;
   }
 
+  // Optional cell geometry: a macroscopic deformation gradient (or average
+  // strain) stored as a global attribute. muGrid does not write these today,
+  // but a producer can via FileIONetCDF::write_global_attribute; when present
+  // muEye renders the sheared (Bravais) cell. Absent => identity (orthogonal).
+  {
+    auto read_att = [&](const char *name, std::vector<double> &out) -> bool {
+      int aid = -1;
+      if (nc_inq_attid(ncid, NC_GLOBAL, name, &aid) != NC_NOERR) return false;
+      std::size_t len = 0;
+      if (nc_inq_attlen(ncid, NC_GLOBAL, name, &len) != NC_NOERR || len == 0)
+        return false;
+      out.assign(len, 0.0);
+      // nc_get_att_double converts whatever numeric type was stored to double.
+      return nc_get_att_double(ncid, NC_GLOBAL, name, out.data()) == NC_NOERR;
+    };
+
+    std::vector<double> vals;
+    bool is_strain = false;
+    if (!read_att("deformation_gradient", vals)) {
+      if (read_att("average_strain", vals)) is_strain = true;
+    }
+    // Embed a 3x3 (9) or 2x2 (4) tensor into the row-major 3x3 F, keeping the
+    // z row/column as identity for 2D data.
+    double e[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    bool ok = false;
+    if (vals.size() == 9) {
+      for (int i = 0; i < 9; ++i) e[i] = vals[i];
+      ok = true;
+    } else if (vals.size() == 4) {
+      e[0] = vals[0]; e[1] = vals[1];  // row 0: xx xy
+      e[3] = vals[2]; e[4] = vals[3];  // row 1: yx yy
+      ok = true;
+    }
+    if (ok) {
+      for (int i = 0; i < 9; ++i)
+        meta.F[i] = (i == 0 || i == 4 || i == 8) ? 1.0 : 0.0;  // identity
+      if (is_strain) {
+        for (int i = 0; i < 9; ++i) meta.F[i] += e[i];  // F = I + eps
+      } else if (vals.size() == 9) {
+        for (int i = 0; i < 9; ++i) meta.F[i] = e[i];
+      } else {  // 2x2 deformation gradient: overwrite upper-left, keep F_zz = 1
+        meta.F[0] = e[0]; meta.F[1] = e[1];
+        meta.F[3] = e[3]; meta.F[4] = e[4];
+      }
+      meta.has_deformation = true;
+    }
+  }
+
   // Enumerate variables and keep those defined on the spatial grid.
   int nvars = 0;
   nc_inq_nvars(ncid, &nvars);
@@ -357,6 +406,44 @@ std::string VolumeLoader::load(const std::string &path, const FileMeta &meta,
   } catch (...) {
     return "muGrid read failed: unknown error.";
   }
+}
+
+std::string VolumeLoader::load_displacement(const std::string &path,
+                                            const FileMeta &meta,
+                                            const FieldInfo &field, int frame,
+                                            DisplacementField &out) {
+  const int nd = meta.spatial_dim;  // 2 or 3 vector components
+  if (field.nb_components < nd)
+    return "Selected field has too few components for a displacement.";
+
+  out.nx = meta.nx;
+  out.ny = meta.ny;
+  out.nz = meta.nz;
+  const std::size_t n = out.size();
+  out.data.assign(n * 4, 0.0f);  // (x, y, z, unused); z stays 0 in 2D
+
+  // Read each spatial component through the ordinary scalar path (which already
+  // handles the muGrid/netcdf and 2D/3D cases) and pack it into channel c.
+  for (int c = 0; c < nd; ++c) {
+    Volume comp;
+    std::string err =
+        load(path, meta, field, frame, Scalarize::Component, c, comp);
+    if (!err.empty()) return err;
+    if (comp.data.size() != n)
+      return "Displacement component size mismatch.";
+    for (std::size_t i = 0; i < n; ++i) out.data[i * 4 + c] = comp.data[i];
+  }
+
+  // Largest displacement magnitude, for the warp bounding-box margin.
+  float mx = 0.0f;
+  for (std::size_t i = 0; i < n; ++i) {
+    float x = out.data[i * 4 + 0], y = out.data[i * 4 + 1],
+          z = out.data[i * 4 + 2];
+    float m = std::sqrt(x * x + y * y + z * z);
+    if (m > mx) mx = m;
+  }
+  out.max_mag = mx;
+  return "";
 }
 
 }  // namespace mueye

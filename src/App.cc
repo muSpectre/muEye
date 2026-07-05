@@ -71,6 +71,7 @@ void App::set_backend(Backend backend) {
   // The new backend has no data yet; re-upload on the next render.
   volume_dirty_ = true;
   tf_dirty_ = true;
+  disp_dirty_ = true;  // the new backend has no displacement uploaded yet
   needs_render_ = true;
   status_ = std::string("Renderer: ") + renderer_->name();
 }
@@ -89,12 +90,25 @@ void App::open_path(const std::string &path) {
   field_index_ = default_field_index(meta_.fields);
   frame_ = 0;
   component_ = 0;
+  // Start undeformed: no displacement field selected until the user picks one.
+  disp_field_index_ = -1;
+  disp_ = DisplacementField{};
+  disp_dirty_ = true;
+  // Adopt the file's deformation gradient (identity if the file has none).
+  for (int i = 0; i < 9; ++i) F_[i] = static_cast<float>(meta_.F[i]);
+  deformation_from_file_ = meta_.has_deformation;
   status_ = "Loaded '" + path + "' (" + std::to_string(meta_.nx) + "x" +
             std::to_string(meta_.ny) + "x" + std::to_string(meta_.nz) + ", " +
             std::to_string(meta_.nb_frames) + " frame(s), " +
-            std::to_string(meta_.fields.size()) + " field(s)).";
-  // Aim the camera at the centre of the (possibly non-cubic / planar) box.
-  camera_.frame_box(box_extent(meta_.nx, meta_.ny, meta_.nz));
+            std::to_string(meta_.fields.size()) + " field(s)" +
+            (meta_.has_deformation ? ", deformed cell" : "") + ").";
+  // Aim the camera at the centre of the (possibly non-cubic / sheared) cell.
+  {
+    Vec3 center;
+    float extent;
+    cell_bounds(center, extent);
+    camera_.frame_aabb(center, extent);
+  }
   reload_volume();
 }
 
@@ -128,6 +142,25 @@ void App::reload_volume() {
             std::to_string(volume_.vmax) + "]";
   volume_dirty_ = true;  // backend must re-upload the new volume
   needs_render_ = true;
+
+  // If a displacement field is selected, refresh it for the current frame too.
+  if (disp_field_index_ >= 0) reload_displacement();
+}
+
+void App::reload_displacement() {
+  disp_ = DisplacementField{};
+  if (has_file_ && disp_field_index_ >= 0 &&
+      disp_field_index_ < static_cast<int>(meta_.fields.size())) {
+    std::string err = loader_.load_displacement(
+        path_buf_, meta_, meta_.fields[disp_field_index_], frame_, disp_);
+    if (!err.empty()) {
+      status_ = err;
+      disp_ = DisplacementField{};
+      disp_field_index_ = -1;
+    }
+  }
+  disp_dirty_ = true;  // backend must (re-)upload or clear the displacement
+  needs_render_ = true;
 }
 
 // Upload data to the backend only when it changed (cheap for CPU, avoids a
@@ -145,6 +178,12 @@ void App::sync_renderer_data() {
     tf_dirty_ = false;
     uploaded = true;
   }
+  if (disp_dirty_) {
+    renderer_->set_displacement(disp_.empty() ? nullptr : disp_.data.data(),
+                                disp_.nx, disp_.ny, disp_.nz);
+    disp_dirty_ = false;
+    uploaded = true;
+  }
   // Surface upload failures (e.g. volume too large for device memory) instead
   // of silently rendering a blank viewport.
   if (uploaded) {
@@ -155,12 +194,38 @@ void App::sync_renderer_data() {
   }
 }
 
+Mat3 App::world_cell() const {
+  Vec3 box = box_extent(volume_.nx, volume_.ny, volume_.nz);
+  Mat3 F{{F_[0], F_[1], F_[2], F_[3], F_[4], F_[5], F_[6], F_[7], F_[8]}};
+  // C = F * diag(box): scale the reference box by the deformation gradient.
+  return mat3_matmul(F, mat3_diag(box));
+}
+
+void App::cell_bounds(Vec3 &center, float &extent) const {
+  Mat3 C = world_cell();
+  float rx = static_cast<float>(rep(0));
+  float ry = static_cast<float>(rep(1));
+  float rz = static_cast<float>(rep(2));
+  Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+  for (int i = 0; i < 8; ++i) {
+    Vec3 f{(i & 1) ? rx : 0.0f, (i & 2) ? ry : 0.0f, (i & 4) ? rz : 0.0f};
+    Vec3 w = mat3_mul(C, f);
+    lo.x = std::min(lo.x, w.x); hi.x = std::max(hi.x, w.x);
+    lo.y = std::min(lo.y, w.y); hi.y = std::max(hi.y, w.y);
+    lo.z = std::min(lo.z, w.z); hi.z = std::max(hi.z, w.z);
+  }
+  center = (lo + hi) * 0.5f;
+  extent = std::max(hi.x - lo.x, std::max(hi.y - lo.y, hi.z - lo.z));
+}
+
 RenderParams App::make_render_params() const {
   RenderParams p;
   p.nx = volume_.nx;
   p.ny = volume_.ny;
   p.nz = volume_.nz;
   p.box = box_extent(volume_.nx, volume_.ny, volume_.nz);
+  // World->fractional map: inverse of the (sheared) cell matrix C = F*diag(box).
+  p.inv_cell = mat3_inverse(world_cell());
   p.rep_x = rep(0);
   p.rep_y = rep(1);
   p.rep_z = rep(2);
@@ -177,6 +242,32 @@ RenderParams App::make_render_params() const {
   p.iso_value = iso_value_;
   p.mode = mode_;
   p.bg = Vec3{bg_[0], bg_[1], bg_[2]};
+
+  // Deformed-geometry warp. Active only when a displacement field is loaded.
+  const bool warp = disp_field_index_ >= 0 && !disp_.empty();
+  p.warp_enabled = warp ? 1 : 0;
+  p.warp_scale = warp_scale_;
+  p.warp_iters = warp_iters_;
+  if (warp) {
+    // Periodic tiling is unsupported while warping (the deformed body no longer
+    // tiles trivially); render a single cell.
+    p.rep_x = p.rep_y = p.rep_z = 1;
+    // World AABB of the deformed body: the single-cell parallelepiped expanded
+    // by the largest world-space displacement on every side.
+    Mat3 C = world_cell();
+    Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+    for (int i = 0; i < 8; ++i) {
+      Vec3 w = mat3_mul(C, Vec3{(i & 1) ? 1.0f : 0.0f, (i & 2) ? 1.0f : 0.0f,
+                                (i & 4) ? 1.0f : 0.0f});
+      lo.x = std::min(lo.x, w.x); hi.x = std::max(hi.x, w.x);
+      lo.y = std::min(lo.y, w.y); hi.y = std::max(hi.y, w.y);
+      lo.z = std::min(lo.z, w.z); hi.z = std::max(hi.z, w.z);
+    }
+    float f = 1.0f / static_cast<float>(max_dim > 0 ? max_dim : 1);
+    float margin = warp_scale_ * f * disp_.max_mag;
+    p.warp_lo = Vec3{lo.x - margin, lo.y - margin, lo.z - margin};
+    p.warp_hi = Vec3{hi.x + margin, hi.y + margin, hi.z + margin};
+  }
   return p;
 }
 

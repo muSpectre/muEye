@@ -100,6 +100,37 @@ void write_demo_2d(const std::string &path, int n) {
               n);
 }
 
+// A smooth synthetic displacement field (4 floats/voxel) for the warp check: a
+// linear dilation about the cell centre, u = A*(s - 0.5) per axis (in grid
+// units). Linear => the fixed-point inverse converges in a couple of iterations,
+// and every backend must recover the same deformed image. z stays ~0 for a 2D
+// (nz==1) grid, so it doubles as the 2D test.
+mueye::DisplacementField make_disp(int nx, int ny, int nz, float amp) {
+  mueye::DisplacementField d;
+  d.nx = nx;
+  d.ny = ny;
+  d.nz = nz;
+  d.data.assign(d.size() * 4, 0.0f);
+  float mx = 0.0f;
+  for (int k = 0; k < nz; ++k)
+    for (int j = 0; j < ny; ++j)
+      for (int i = 0; i < nx; ++i) {
+        float sx = (i + 0.5f) / nx - 0.5f;
+        float sy = (j + 0.5f) / ny - 0.5f;
+        float sz = (k + 0.5f) / nz - 0.5f;
+        std::size_t e =
+            (i + static_cast<std::size_t>(nx) * (j + static_cast<std::size_t>(ny) * k)) * 4;
+        float ux = amp * sx, uy = amp * sy, uz = amp * sz;
+        d.data[e + 0] = ux;
+        d.data[e + 1] = uy;
+        d.data[e + 2] = uz;
+        float m = std::sqrt(ux * ux + uy * uy + uz * uz);
+        if (m > mx) mx = m;
+      }
+  d.max_mag = mx;
+  return d;
+}
+
 std::size_t count_nonbg(const mueye::Framebuffer &fb) {
   std::size_t n = 0;
   std::uint8_t bgr = static_cast<std::uint8_t>(0.05f * 255 + 0.5f);
@@ -164,6 +195,7 @@ int check_anisotropic() {
     p.ny = v.ny;
     p.nz = v.nz;
     p.box = mueye::Vec3{v.nx * f, v.ny * f, v.nz * f};
+    p.inv_cell = mueye::axis_aligned_inv_cell(p.box);
     p.step = 0.5f * f;
     p.data_min = 0.0f;
     p.data_max = 1.0f;
@@ -411,6 +443,7 @@ int check_file(const std::string &path, const char *ppm_out) {
   p.ny = vol.ny;
   p.nz = vol.nz;
   p.box = mueye::Vec3{vol.nx * f, vol.ny * f, vol.nz * f};
+  p.inv_cell = mueye::axis_aligned_inv_cell(p.box);
   p.step = 0.5f * f;
   p.data_min = vol.vmin;
   p.data_max = vol.vmax;
@@ -511,6 +544,98 @@ int check_file(const std::string &path, const char *ppm_out) {
   }
   mismatches += compare_backends("DVR 2x2x2");
 
+  // Sheared (Bravais) cell: a non-orthogonal inv_cell must render identically
+  // across backends too (exercises the Metal mirror's cell-matrix math). Reuse
+  // the single-cell params but replace the axis-aligned map with C = F*box.
+  p.rep_x = p.rep_y = p.rep_z = 1;
+  mueye::Mat3 Fsh{{1.0f, 0.4f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f}};
+  mueye::Mat3 Csh = mueye::mat3_matmul(Fsh, mueye::mat3_diag(p.box));
+  p.inv_cell = mueye::mat3_inverse(Csh);
+  {
+    mueye::Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+    for (int i = 0; i < 8; ++i) {
+      mueye::Vec3 fr{(i & 1) ? 1.0f : 0.0f, (i & 2) ? 1.0f : 0.0f,
+                     (i & 4) ? 1.0f : 0.0f};
+      mueye::Vec3 w = mueye::mat3_mul(Csh, fr);
+      lo.x = std::fmin(lo.x, w.x); hi.x = std::fmax(hi.x, w.x);
+      lo.y = std::fmin(lo.y, w.y); hi.y = std::fmax(hi.y, w.y);
+      lo.z = std::fmin(lo.z, w.z); hi.z = std::fmax(hi.z, w.z);
+    }
+    mueye::Vec3 center = (lo + hi) * 0.5f;
+    float extent = std::fmax(hi.x - lo.x, std::fmax(hi.y - lo.y, hi.z - lo.z));
+    cam.frame_aabb(center, extent);
+    camv = cam.to_camera(1.0f);
+  }
+  render_with(cpu, fb_cpu, mueye::RenderMode::DVR);
+  std::size_t nonbg_sh = count_nonbg(fb_cpu);
+  std::printf("CPU DVR sheared cell (F_xy=0.4): %zu non-background px\n",
+              nonbg_sh);
+  if (ppm_out && mueye::write_png(std::string(ppm_out) + ".shear.png", fb_cpu))
+    std::printf("wrote %s.shear.png\n", ppm_out);
+  // A modest absolute floor (a sheared thin 2D slab is legitimately sparse);
+  // the real regression signal is the cross-backend agreement below.
+  if (nonbg_sh < 200) {
+    std::fprintf(stderr, "sheared render produced almost nothing.\n");
+    return 1;
+  }
+  mismatches += compare_backends("DVR sheared");
+
+  // Deformed geometry: a synthetic displacement warps the volume; every backend
+  // must agree with the CPU reference on the inverse-warp (fixed-point) path.
+  mueye::DisplacementField df = make_disp(vol.nx, vol.ny, vol.nz, 2.0f);
+  p.inv_cell = mueye::axis_aligned_inv_cell(p.box);  // undo the shear above
+  p.warp_enabled = 1;
+  p.warp_scale = 8.0f;
+  p.warp_iters = 8;
+  p.rep_x = p.rep_y = p.rep_z = 1;
+  {
+    int md2 = vol.nx > vol.ny ? vol.nx : vol.ny;
+    if (vol.nz > md2) md2 = vol.nz;
+    float ff = 1.0f / static_cast<float>(md2 > 0 ? md2 : 1);
+    float margin = p.warp_scale * ff * df.max_mag;
+    p.warp_lo = mueye::Vec3{-margin, -margin, -margin};
+    p.warp_hi = mueye::Vec3{p.box.x + margin, p.box.y + margin, p.box.z + margin};
+    mueye::Vec3 center{0.5f * p.box.x, 0.5f * p.box.y, 0.5f * p.box.z};
+    cam.frame_aabb(center, p.box.x + 2 * margin);
+    camv = cam.to_camera(1.0f);
+  }
+  // compare_backends renders through render_with, which does not set the
+  // displacement, so drive the comparison directly here.
+  {
+    cpu.set_displacement(df.data.data(), df.nx, df.ny, df.nz);
+    p.mode = mueye::RenderMode::DVR;
+    cpu.set_volume(vol.data.data(), vol.nx, vol.ny, vol.nz);
+    cpu.set_transfer_function(tf.data(), tf.size());
+    cpu.render(p, camv, fb_cpu);
+    std::size_t nonbg_w = count_nonbg(fb_cpu);
+    std::printf("CPU DVR warped (displacement): %zu non-background px\n",
+                nonbg_w);
+    if (ppm_out && mueye::write_png(std::string(ppm_out) + ".warp.png", fb_cpu))
+      std::printf("wrote %s.warp.png\n", ppm_out);
+    if (nonbg_w < 200) {
+      std::fprintf(stderr, "warped render produced almost nothing.\n");
+      return 1;
+    }
+    for (const mueye::BackendInfo &bi : mueye::enumerate_backends()) {
+      if (bi.backend == mueye::Backend::CPU || !bi.available) continue;
+      auto r = mueye::create_renderer(bi.backend);
+      if (!r) continue;
+      mueye::Framebuffer fb;
+      fb.resize(256, 256);
+      r->set_volume(vol.data.data(), vol.nx, vol.ny, vol.nz);
+      r->set_transfer_function(tf.data(), tf.size());
+      r->set_displacement(df.data.data(), df.nx, df.ny, df.nz);
+      r->render(p, camv, fb);
+      double sum = 0.0;
+      for (std::size_t i = 0; i < fb.rgba.size(); ++i)
+        sum += std::abs(int(fb.rgba[i]) - int(fb_cpu.rgba[i]));
+      double mad = sum / fb.rgba.size();
+      std::printf("backend %-14s : DVR warped mean|Δ| vs CPU = %.3f / 255\n",
+                  bi.name, mad);
+      if (mad > 4.0) ++mismatches;
+    }
+  }
+
   if (mismatches) {
     std::fprintf(stderr, "%d backend(s) diverged from the CPU reference.\n",
                  mismatches);
@@ -560,11 +685,21 @@ int view_file(const std::string &path, const char *field_name) {
   float f = 1.0f / static_cast<float>(md);
   mueye::Vec3 box{vol.nx * f, vol.ny * f, vol.nz * f};
 
+  // Honour any deformation gradient in the file, exactly as the GUI does.
+  mueye::Mat3 F{{static_cast<float>(meta.F[0]), static_cast<float>(meta.F[1]),
+                 static_cast<float>(meta.F[2]), static_cast<float>(meta.F[3]),
+                 static_cast<float>(meta.F[4]), static_cast<float>(meta.F[5]),
+                 static_cast<float>(meta.F[6]), static_cast<float>(meta.F[7]),
+                 static_cast<float>(meta.F[8])}};
+  mueye::Mat3 cell = mueye::mat3_matmul(F, mueye::mat3_diag(box));
+  if (meta.has_deformation) std::printf("applying deformation gradient F\n");
+
   mueye::RenderParams p;
   p.nx = vol.nx;
   p.ny = vol.ny;
   p.nz = vol.nz;
   p.box = box;
+  p.inv_cell = mueye::mat3_inverse(cell);
   p.step = 0.5f * f;
   p.data_min = vol.vmin;
   p.data_max = vol.vmax;
@@ -580,12 +715,37 @@ int view_file(const std::string &path, const char *field_name) {
   mueye::Framebuffer fb;
   fb.resize(512, 512);
 
+  // If the file has a displacement-eligible field (spatial_dim components) other
+  // than the one being coloured, render the deformed geometry (exercises the
+  // real VolumeLoader::load_displacement path). Auto-scale to a visible warp.
+  mueye::DisplacementField df;
+  for (std::size_t i = 0; i < meta.fields.size(); ++i) {
+    if (static_cast<int>(i) == fi) continue;
+    if (meta.fields[i].nb_components != meta.spatial_dim) continue;
+    if (!loader.load_displacement(path, meta, meta.fields[i], 0, df).empty() ||
+        df.empty())
+      continue;
+    cpu.set_displacement(df.data.data(), df.nx, df.ny, df.nz);
+    p.warp_enabled = 1;
+    p.warp_iters = 12;
+    p.warp_scale = df.max_mag > 0.0f ? 0.3f / (f * df.max_mag) : 1.0f;
+    float margin = p.warp_scale * f * df.max_mag;
+    p.warp_lo = mueye::Vec3{-margin, -margin, -margin};
+    p.warp_hi = mueye::Vec3{box.x + margin, box.y + margin, box.z + margin};
+    std::printf("applying displacement field '%s' (warp_scale=%.2f)\n",
+                meta.fields[i].name.c_str(), p.warp_scale);
+    break;
+  }
+
   mueye::OrbitCamera cam;
   cam.frame_box(box);
   cpu.render(p, cam.to_camera(1.0f), fb);
   if (!mueye::write_png("view.png", fb)) return 1;
   std::printf("wrote view.png (1x1x1)\n");
 
+  // The replica preview does not warp (periodic tiling is disabled while
+  // warping); show the undeformed tiled cell.
+  p.warp_enabled = 0;
   p.rep_x = p.rep_y = p.rep_z = 2;
   cam.retarget_box(mueye::Vec3{2 * box.x, 2 * box.y, 2 * box.z});
   cpu.render(p, cam.to_camera(1.0f), fb);

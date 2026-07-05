@@ -8,12 +8,33 @@
 
 #include "App.hh"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 
 #include "io/PngWriter.hh"
 
 namespace mueye {
+
+namespace {
+
+// Pick the field to show by default when a file is first opened. Priority 1:
+// density fields, whose variable name typically contains "rho" or "density"
+// (case-insensitive). Falls back to the first field if none match.
+int default_field_index(const std::vector<FieldInfo> &fields) {
+  for (std::size_t i = 0; i < fields.size(); ++i) {
+    std::string lower = fields[i].name;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (lower.find("density") != std::string::npos ||
+        lower.find("rho") != std::string::npos)
+      return static_cast<int>(i);
+  }
+  return 0;
+}
+
+}  // namespace
 
 App::App() {
   backends_ = enumerate_backends();
@@ -65,7 +86,7 @@ void App::open_path(const std::string &path) {
   path_buf_ = path;
   // Mirror into the File panel's edit buffer (e.g. for a command-line load).
   std::snprintf(path_edit_, sizeof(path_edit_), "%s", path.c_str());
-  field_index_ = 0;
+  field_index_ = default_field_index(meta_.fields);
   frame_ = 0;
   component_ = 0;
   status_ = "Loaded '" + path + "' (" + std::to_string(meta_.nx) + "x" +

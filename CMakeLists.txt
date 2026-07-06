@@ -231,6 +231,24 @@ target_link_libraries(muEye PRIVATE
     glfw
     OpenGL::GL)
 
+# On macOS, build a .app bundle so the µSpectre logo shows as the Dock/Finder
+# icon. The .icns (generated from resources/muspectre_icon.png with iconutil) is
+# copied into the bundle's Resources and referenced by the Info.plist that CMake
+# generates from MACOSX_BUNDLE_*. MACOSX_BUNDLE is ignored on other platforms.
+if(APPLE)
+    set(_mueye_icns ${CMAKE_CURRENT_SOURCE_DIR}/resources/muEye.icns)
+    target_sources(muEye PRIVATE ${_mueye_icns})
+    set_source_files_properties(${_mueye_icns} PROPERTIES
+        MACOSX_PACKAGE_LOCATION "Resources")
+    set_target_properties(muEye PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_BUNDLE_NAME "muEye"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "org.muspectre.muEye"
+        MACOSX_BUNDLE_ICON_FILE "muEye.icns"
+        MACOSX_BUNDLE_BUNDLE_VERSION "1.0"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0")
+endif()
+
 # Helpful warnings (kept non-fatal for a draft); scoped to C++ TUs so they are
 # not handed to a CUDA/HIP device compiler.
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

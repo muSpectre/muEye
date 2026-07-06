@@ -70,7 +70,6 @@ static void build_default_layout(ImGuiID dockspace_id) {
                                                  nullptr, &left_rest);
   ImGuiID left_bot = left_rest;
 
-  ImGui::DockBuilderDockWindow("muEye", left_top);
   ImGui::DockBuilderDockWindow("Dataset", left_top);
   ImGui::DockBuilderDockWindow("Cell", left_top);
   ImGui::DockBuilderDockWindow("Render", left_mid);
@@ -97,12 +96,11 @@ void App::draw_ui() {
     }
   }
 
-  // ---------------------------------------------------------------- File
-  ImGui::Begin("muEye");
+  // ----------------------------------------------------------------- Dataset
+  // File loader on top, then (once a file is open) the field / frame / scalar
+  // controls. This single panel replaces the former separate "muEye" tab.
+  ImGui::Begin("Dataset");
   {
-    ImGui::TextWrapped("muGrid NetCDF viewer — real-time volume ray tracer.");
-    ImGui::Separator();
-
     ImGui::InputText("File", path_edit_, sizeof(path_edit_));
     ImGui::SameLine();
     if (ImGui::Button("Load")) {
@@ -129,92 +127,90 @@ void App::draw_ui() {
     }
     ImGui::EndDisabled();
     ImGui::TextWrapped("%s", status_.c_str());
-  }
-  ImGui::End();
 
-  // ------------------------------------------------------------- Dataset
-  if (has_file_ && !meta_.fields.empty()) {
-    ImGui::Begin("Dataset");
-    bool reload = false;
+    if (has_file_ && !meta_.fields.empty()) {
+      ImGui::Separator();
+      bool reload = false;
 
-    std::vector<const char *> names;
-    names.reserve(meta_.fields.size());
-    for (auto &f : meta_.fields) names.push_back(f.name.c_str());
-    reload |= ImGui::Combo("Field", &field_index_, names.data(),
-                           static_cast<int>(names.size()));
+      std::vector<const char *> names;
+      names.reserve(meta_.fields.size());
+      for (auto &f : meta_.fields) names.push_back(f.name.c_str());
+      reload |= ImGui::Combo("Field", &field_index_, names.data(),
+                             static_cast<int>(names.size()));
 
-    if (meta_.nb_frames > 1) {
-      int f = frame_;
-      if (ImGui::SliderInt("Frame", &f, 0, meta_.nb_frames - 1) &&
-          f != frame_) {
-        frame_ = f;
-        // Live-reload while dragging only when loads are quick; a slow load
-        // per slider tick would freeze the UI, so defer it to release.
-        if (last_load_ms_ <= 50.0) {
+      if (meta_.nb_frames > 1) {
+        int f = frame_;
+        if (ImGui::SliderInt("Frame", &f, 0, meta_.nb_frames - 1) &&
+            f != frame_) {
+          frame_ = f;
+          // Live-reload while dragging only when loads are quick; a slow load
+          // per slider tick would freeze the UI, so defer it to release.
+          if (last_load_ms_ <= 50.0) {
+            reload = true;
+          } else {
+            frame_pending_ = true;
+          }
+        }
+        if (frame_pending_ && ImGui::IsItemDeactivatedAfterEdit()) {
+          frame_pending_ = false;
           reload = true;
-        } else {
-          frame_pending_ = true;
         }
       }
-      if (frame_pending_ && ImGui::IsItemDeactivatedAfterEdit()) {
-        frame_pending_ = false;
+
+      const FieldInfo &fi = meta_.fields[field_index_];
+      const char *modes[] = {"Component", "Magnitude", "von Mises (3x3)",
+                             "Trace (3x3)"};
+      int sm = static_cast<int>(scalarize_);
+      if (ImGui::Combo("Scalar", &sm, modes, IM_ARRAYSIZE(modes))) {
+        scalarize_ = static_cast<Scalarize>(sm);
         reload = true;
       }
-    }
-
-    const FieldInfo &fi = meta_.fields[field_index_];
-    const char *modes[] = {"Component", "Magnitude", "von Mises (3x3)",
-                           "Trace (3x3)"};
-    int sm = static_cast<int>(scalarize_);
-    if (ImGui::Combo("Scalar", &sm, modes, IM_ARRAYSIZE(modes))) {
-      scalarize_ = static_cast<Scalarize>(sm);
-      reload = true;
-    }
-    if (scalarize_ == Scalarize::Component && fi.nb_components > 1) {
-      int c = component_;
-      if (ImGui::SliderInt("Component", &c, 0, fi.nb_components - 1)) {
-        component_ = c;
-        reload = true;
+      if (scalarize_ == Scalarize::Component && fi.nb_components > 1) {
+        int c = component_;
+        if (ImGui::SliderInt("Component", &c, 0, fi.nb_components - 1)) {
+          component_ = c;
+          reload = true;
+        }
       }
-    }
-    ImGui::Text("components: %d   sub-points: %d", fi.nb_components,
-                fi.nb_sub_pts);
+      ImGui::Text("components: %d   sub-points: %d", fi.nb_components,
+                  fi.nb_sub_pts);
 
-    // ---- Deformed geometry from a displacement field ----
-    // Eligible fields have exactly spatial_dim components (a 3-vector in 3D,
-    // 2-vector in 2D). "(none)" is the default: undeformed.
-    ImGui::Separator();
-    std::vector<const char *> disp_names;
-    std::vector<int> disp_map;  // combo entry -> field index (-1 for none)
-    disp_names.push_back("(none)");
-    disp_map.push_back(-1);
-    for (std::size_t i = 0; i < meta_.fields.size(); ++i) {
-      if (meta_.fields[i].nb_components == meta_.spatial_dim) {
-        disp_names.push_back(meta_.fields[i].name.c_str());
-        disp_map.push_back(static_cast<int>(i));
+      // ---- Deformed geometry from a displacement field ----
+      // Eligible fields have exactly spatial_dim components (a 3-vector in 3D,
+      // 2-vector in 2D). "(none)" is the default: undeformed.
+      ImGui::Separator();
+      std::vector<const char *> disp_names;
+      std::vector<int> disp_map;  // combo entry -> field index (-1 for none)
+      disp_names.push_back("(none)");
+      disp_map.push_back(-1);
+      for (std::size_t i = 0; i < meta_.fields.size(); ++i) {
+        if (meta_.fields[i].nb_components == meta_.spatial_dim) {
+          disp_names.push_back(meta_.fields[i].name.c_str());
+          disp_map.push_back(static_cast<int>(i));
+        }
       }
-    }
-    int disp_cur = 0;
-    for (std::size_t k = 0; k < disp_map.size(); ++k)
-      if (disp_map[k] == disp_field_index_) disp_cur = static_cast<int>(k);
-    if (ImGui::Combo("Displacement", &disp_cur, disp_names.data(),
-                     static_cast<int>(disp_names.size()))) {
-      disp_field_index_ = disp_map[disp_cur];
-      reload_displacement();
-    }
-    if (disp_field_index_ >= 0) {
-      if (ImGui::DragFloat("Warp scale", &warp_scale_, 0.05f, 0.0f, 1.0e6f,
-                           "%.3f"))
-        needs_render_ = true;
-      if (ImGui::SliderInt("Warp iters", &warp_iters_, 1, 16))
-        needs_render_ = true;
-      if (periodic_)
-        ImGui::TextDisabled("(periodic tiling is disabled while warping)");
-    }
+      int disp_cur = 0;
+      for (std::size_t k = 0; k < disp_map.size(); ++k)
+        if (disp_map[k] == disp_field_index_) disp_cur = static_cast<int>(k);
+      if (ImGui::Combo("Displacement", &disp_cur, disp_names.data(),
+                       static_cast<int>(disp_names.size()))) {
+        disp_field_index_ = disp_map[disp_cur];
+        reload_displacement();
+      }
+      if (disp_field_index_ >= 0) {
+        if (ImGui::DragFloat("Warp scale", &warp_scale_, 0.05f, 0.0f, 1.0e6f,
+                             "%.3f"))
+          needs_render_ = true;
+        if (ImGui::SliderInt("Warp iters", &warp_iters_, 1, 16))
+          needs_render_ = true;
+        if (periodic_)
+          ImGui::TextDisabled("(periodic tiling is disabled while warping)");
+      }
 
-    if (reload) reload_volume();
-    ImGui::End();
+      if (reload) reload_volume();
+    }
   }
+  ImGui::End();
 
   // ----------------------------------------------------------------- Cell
   // Deformation gradient F: shears the reference box into a (Bravais) cell.

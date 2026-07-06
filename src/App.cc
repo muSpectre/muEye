@@ -102,14 +102,17 @@ void App::open_path(const std::string &path) {
             std::to_string(meta_.nb_frames) + " frame(s), " +
             std::to_string(meta_.fields.size()) + " field(s)" +
             (meta_.has_deformation ? ", deformed cell" : "") + ").";
-  // Aim the camera at the centre of the (possibly non-cubic / sheared) cell.
+  // Load the volume first so its grid dimensions are known, then aim the camera
+  // at the centre of the (possibly non-cubic / sheared) cell. Framing before the
+  // load would use stale/empty dimensions and put the orbit pivot at the origin
+  // (a corner of the cell) instead of its centre.
+  reload_volume();
   {
     Vec3 center;
     float extent;
     cell_bounds(center, extent);
     camera_.frame_aabb(center, extent);
   }
-  reload_volume();
 }
 
 void App::reload_volume() {

@@ -81,6 +81,9 @@ source ../venv/bin/activate
 python scripts/make_test_volume.py demo.nc
 
 # launch the viewer (optionally auto-open a file)
+# macOS builds a .app bundle (so the Dock/Finder icon is the muSpectre logo):
+./build/muEye.app/Contents/MacOS/muEye demo.nc   # or: open ./build/muEye.app
+# Linux / Windows produce a bare executable:
 ./build/muEye demo.nc
 ```
 

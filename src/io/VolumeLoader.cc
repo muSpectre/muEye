@@ -312,6 +312,62 @@ FileMeta VolumeLoader::open(const std::string &path) {
     meta.fields.push_back(std::move(fi));
   }
 
+  // Physical cell size (muTopOpt's `domain_lengths` global attribute): sets the
+  // rendered cell proportions instead of deriving them from the grid shape.
+  {
+    std::size_t len = 0;
+    if (nc_inq_attlen(ncid, NC_GLOBAL, "domain_lengths", &len) == NC_NOERR &&
+        (len == 2 || len == 3)) {
+      double v[3] = {0.0, 0.0, 0.0};
+      if (nc_get_att_double(ncid, NC_GLOBAL, "domain_lengths", v) == NC_NOERR) {
+        meta.domain_lengths[0] = v[0];
+        meta.domain_lengths[1] = v[1];
+        meta.domain_lengths[2] = (len == 3) ? v[2] : 0.0;
+        meta.has_domain_lengths = true;
+      }
+    }
+  }
+
+  // Per-frame applied deformation gradient (muTopOpt's frame variable). Dims are
+  // (frame, [load_case,] d, d); we read load case 0 for every frame. When
+  // present it supersedes the deformation_gradient/average_strain attribute.
+  {
+    int vid = -1;
+    if (nc_inq_varid(ncid, "applied_deformation_gradient", &vid) == NC_NOERR) {
+      int nd = 0;
+      nc_inq_varndims(ncid, vid, &nd);
+      if (nd >= 2) {
+        std::vector<int> dids(nd);
+        nc_inq_vardimid(ncid, vid, dids.data());
+        std::size_t d0 = dim_len(ncid, dids[nd - 2]);  // tensor rows
+        std::size_t d1 = dim_len(ncid, dids[nd - 1]);  // tensor cols
+        bool has_frame_axis = (frame_dim >= 0 && dids[0] == frame_dim);
+        int nframes = has_frame_axis ? meta.nb_frames : 1;
+        std::vector<std::size_t> start(nd, 0), count(nd, 1);
+        count[nd - 2] = d0;
+        count[nd - 1] = d1;
+        std::vector<double> buf(d0 * d1, 0.0);
+        bool ok = true;
+        for (int f = 0; f < nframes && ok; ++f) {
+          if (has_frame_axis) start[0] = static_cast<std::size_t>(f);
+          if (nc_get_vara_double(ncid, vid, start.data(), count.data(),
+                                 buf.data()) != NC_NOERR) {
+            ok = false;
+            break;
+          }
+          // Embed the (d0 x d1) block into the upper-left of a row-major 3x3,
+          // keeping the z row/column as identity for 2D data.
+          std::array<double, 9> Fm{1, 0, 0, 0, 1, 0, 0, 0, 1};
+          for (std::size_t r = 0; r < d0 && r < 3; ++r)
+            for (std::size_t c = 0; c < d1 && c < 3; ++c)
+              Fm[r * 3 + c] = buf[r * d1 + c];
+          meta.applied_F.push_back(Fm);
+        }
+        if (!ok) meta.applied_F.clear();
+      }
+    }
+  }
+
   nc_close(ncid);
 
   if (meta.fields.empty()) {

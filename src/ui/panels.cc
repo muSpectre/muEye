@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -101,7 +102,8 @@ void App::draw_ui() {
   // controls. This single panel replaces the former separate "muEye" tab.
   ImGui::Begin("Dataset");
   {
-    ImGui::InputText("File", path_edit_, sizeof(path_edit_));
+    // File path box (no trailing label) + Load / Browse.
+    ImGui::InputText("##File", path_edit_, sizeof(path_edit_));
     ImGui::SameLine();
     if (ImGui::Button("Load")) {
       open_path(path_edit_);
@@ -114,9 +116,27 @@ void App::draw_ui() {
     ImGui::BeginDisabled(!can_browse);
     // Native file chooser; blocks the UI loop while the modal dialog is open.
     if (ImGui::Button("Browse...")) {
-      auto sel = pfd::open_file("Open muGrid NetCDF file", path_edit_,
-                                {"NetCDF files (*.nc)", "*.nc",
-                                 "All files", "*"})
+      // Default to the *.nc filter. On macOS (pfd's osascript backend) any "*"
+      // pattern disables filtering altogether, so the all-files escape hatch is
+      // omitted there; on Windows/Linux it is kept as a switchable second entry
+      // (the *.nc filter stays first, i.e. the default).
+      std::vector<std::string> filters{"NetCDF files (*.nc)", "*.nc"};
+#ifndef __APPLE__
+      filters.push_back("All files");
+      filters.push_back("*");
+#endif
+      // Open in the current file's *directory*. Passing the file path itself as
+      // the default location makes the macOS (osascript) dialog error out and
+      // silently fail to reopen after a file has been loaded, so derive the
+      // parent directory instead.
+      std::string start_dir;
+      try {
+        std::filesystem::path p{path_edit_};
+        start_dir = (p.has_filename() ? p.parent_path() : p).string();
+      } catch (...) {
+        start_dir.clear();
+      }
+      auto sel = pfd::open_file("Open muGrid NetCDF file", start_dir, filters)
                      .result();
       if (!sel.empty()) {
         // Show the choice in the field even if the load then fails.
@@ -126,23 +146,24 @@ void App::draw_ui() {
       }
     }
     ImGui::EndDisabled();
-    ImGui::TextWrapped("%s", status_.c_str());
+    // Only surface load errors / not-yet-loaded here; the loaded dataset's info
+    // line lives next to the field controls below.
+    if (!has_file_ && !status_.empty())
+      ImGui::TextWrapped("%s", status_.c_str());
 
     if (has_file_ && !meta_.fields.empty()) {
       ImGui::Separator();
       bool reload = false;
 
-      std::vector<const char *> names;
-      names.reserve(meta_.fields.size());
-      for (auto &f : meta_.fields) names.push_back(f.name.c_str());
-      reload |= ImGui::Combo("Field", &field_index_, names.data(),
-                             static_cast<int>(names.size()));
-
+      // Frame slider, directly beneath the file box.
       if (meta_.nb_frames > 1) {
         int f = frame_;
         if (ImGui::SliderInt("Frame", &f, 0, meta_.nb_frames - 1) &&
             f != frame_) {
           frame_ = f;
+          // A per-frame applied deformation gradient (if the file has one)
+          // updates the cell for the new frame.
+          sync_frame_deformation();
           // Live-reload while dragging only when loads are quick; a slow load
           // per slider tick would freeze the UI, so defer it to release.
           if (last_load_ms_ <= 50.0) {
@@ -156,6 +177,16 @@ void App::draw_ui() {
           reload = true;
         }
       }
+
+      // Dataset info string ("Field '<name>' frame ...") just before the field
+      // selector.
+      ImGui::TextWrapped("%s", status_.c_str());
+
+      std::vector<const char *> names;
+      names.reserve(meta_.fields.size());
+      for (auto &f : meta_.fields) names.push_back(f.name.c_str());
+      reload |= ImGui::Combo("Field", &field_index_, names.data(),
+                             static_cast<int>(names.size()));
 
       const FieldInfo &fi = meta_.fields[field_index_];
       const char *modes[] = {"Component", "Magnitude", "von Mises (3x3)",

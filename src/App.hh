@@ -60,6 +60,16 @@ class App {
   RenderParams make_render_params() const;
   void sync_renderer_data();  //!< (re-)upload volume / LUT if dirty
 
+  /** Reference box (aspect) the cell is built on: the file's `domain_lengths`
+   *  normalized so the longest axis is 1 when present, else the grid shape
+   *  (box_extent). C = F * diag(reference_box). */
+  Vec3 reference_box() const;
+
+  /** If the file carries a per-frame applied deformation gradient
+   *  (`meta_.applied_F`), copy the current frame's tensor into F_ (marking it as
+   *  from-file). No-op otherwise. */
+  void sync_frame_deformation();
+
   /** Forward cell matrix C = F * diag(box): its columns are the world-space
    *  edge vectors of the (possibly sheared) rendered cell. */
   Mat3 world_cell() const;

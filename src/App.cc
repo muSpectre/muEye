@@ -12,6 +12,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 
 #include "io/PngWriter.hh"
 
@@ -87,6 +88,14 @@ void App::open_path(const std::string &path) {
   path_buf_ = path;
   // Mirror into the File panel's edit buffer (e.g. for a command-line load).
   std::snprintf(path_edit_, sizeof(path_edit_), "%s", path.c_str());
+  // Default the render output next to the data file: <data-dir>/<stem>.png.
+  {
+    std::filesystem::path dp{path};
+    std::string stem = dp.stem().string();
+    std::filesystem::path png =
+        dp.parent_path() / ((stem.empty() ? "mueye" : stem) + ".png");
+    std::snprintf(png_path_, sizeof(png_path_), "%s", png.string().c_str());
+  }
   field_index_ = default_field_index(meta_.fields);
   frame_ = 0;
   component_ = 0;
@@ -94,9 +103,12 @@ void App::open_path(const std::string &path) {
   disp_field_index_ = -1;
   disp_ = DisplacementField{};
   disp_dirty_ = true;
-  // Adopt the file's deformation gradient (identity if the file has none).
+  // Adopt the file's deformation gradient (identity if the file has none). A
+  // per-frame applied_deformation_gradient, if present, supersedes it for the
+  // current frame.
   for (int i = 0; i < 9; ++i) F_[i] = static_cast<float>(meta_.F[i]);
   deformation_from_file_ = meta_.has_deformation;
+  sync_frame_deformation();  // frame_ == 0 here
   status_ = "Loaded '" + path + "' (" + std::to_string(meta_.nx) + "x" +
             std::to_string(meta_.ny) + "x" + std::to_string(meta_.nz) + ", " +
             std::to_string(meta_.nb_frames) + " frame(s), " +
@@ -197,8 +209,38 @@ void App::sync_renderer_data() {
   }
 }
 
+Vec3 App::reference_box() const {
+  if (meta_.has_domain_lengths) {
+    double lx = meta_.domain_lengths[0];
+    double ly = meta_.domain_lengths[1];
+    double lz = meta_.spatial_dim == 3 ? meta_.domain_lengths[2] : 0.0;
+    double m = std::max(lx, std::max(ly, lz));
+    if (m <= 0.0) m = 1.0;
+    Vec3 b{static_cast<float>(lx / m), static_cast<float>(ly / m), 0.0f};
+    if (meta_.spatial_dim == 3) {
+      b.z = static_cast<float>(lz / m);
+    } else {
+      // 2D: a single-slice slab; keep it one voxel thick along the longest
+      // in-plane direction (cosmetic, matches the grid-derived convention).
+      int mn = std::max(volume_.nx, volume_.ny);
+      b.z = std::max(b.x, b.y) / static_cast<float>(mn > 0 ? mn : 1);
+    }
+    return b;
+  }
+  return box_extent(volume_.nx, volume_.ny, volume_.nz);
+}
+
+void App::sync_frame_deformation() {
+  if (frame_ >= 0 && frame_ < static_cast<int>(meta_.applied_F.size())) {
+    for (int i = 0; i < 9; ++i)
+      F_[i] = static_cast<float>(meta_.applied_F[frame_][i]);
+    deformation_from_file_ = true;
+    needs_render_ = true;
+  }
+}
+
 Mat3 App::world_cell() const {
-  Vec3 box = box_extent(volume_.nx, volume_.ny, volume_.nz);
+  Vec3 box = reference_box();
   Mat3 F{{F_[0], F_[1], F_[2], F_[3], F_[4], F_[5], F_[6], F_[7], F_[8]}};
   // C = F * diag(box): scale the reference box by the deformation gradient.
   return mat3_matmul(F, mat3_diag(box));
@@ -226,7 +268,7 @@ RenderParams App::make_render_params() const {
   p.nx = volume_.nx;
   p.ny = volume_.ny;
   p.nz = volume_.nz;
-  p.box = box_extent(volume_.nx, volume_.ny, volume_.nz);
+  p.box = reference_box();
   // World->fractional map: inverse of the (sheared) cell matrix C = F*diag(box).
   p.inv_cell = mat3_inverse(world_cell());
   p.rep_x = rep(0);
@@ -283,6 +325,13 @@ void App::save_png(const std::string &path) {
     status_ = "Nothing to save — load a file first.";
     return;
   }
+  // Resolve a relative name against the loaded data file's directory, so
+  // renders are saved next to the data by default.
+  std::filesystem::path out{path};
+  if (out.is_relative() && !path_buf_.empty()) {
+    out = std::filesystem::path(path_buf_).parent_path() / out;
+  }
+  const std::string out_path = out.string();
   // Full viewport resolution regardless of the interactive downscale.
   int w = last_render_w_ > 0 ? last_render_w_ * render_downscale_ : 1280;
   int h = last_render_h_ > 0 ? last_render_h_ * render_downscale_ : 720;
@@ -296,11 +345,11 @@ void App::save_png(const std::string &path) {
   renderer_->render(make_render_params(),
                     camera_.to_camera(static_cast<float>(w) / h), fb);
 
-  if (write_png(path, fb)) {
-    status_ = "Saved '" + path + "' (" + std::to_string(w) + "x" +
+  if (write_png(out_path, fb)) {
+    status_ = "Saved '" + out_path + "' (" + std::to_string(w) + "x" +
               std::to_string(h) + ").";
   } else {
-    status_ = "Failed to write '" + path + "'.";
+    status_ = "Failed to write '" + out_path + "'.";
   }
 }
 

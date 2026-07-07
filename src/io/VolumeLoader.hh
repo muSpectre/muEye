@@ -14,6 +14,7 @@
 #ifndef MUEYE_VOLUME_LOADER_HH_
 #define MUEYE_VOLUME_LOADER_HH_
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,19 @@ struct FileMeta {
   //! A 2D file's 2x2 tensor is embedded in the upper-left, with F_zz = 1.
   double F[9]{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
   bool has_deformation{false};  //!< a deformation attribute was found
+
+  //! Physical edge lengths of the unit cell per axis, from the `domain_lengths`
+  //! global attribute (muTopOpt writes it). Sets the rendered cell proportions
+  //! (the reference box aspect) instead of deriving them from the grid shape.
+  double domain_lengths[3]{0.0, 0.0, 0.0};
+  bool has_domain_lengths{false};
+
+  //! Per-frame applied deformation gradient (row-major 3x3), from the
+  //! `applied_deformation_gradient` frame variable (muTopOpt writes it). If the
+  //! variable carries a leading load-case axis, load case 0 is used. Empty when
+  //! the variable is absent; when present it supersedes `F`/has_deformation and
+  //! is applied per frame.
+  std::vector<std::array<double, 9>> applied_F;
 };
 
 /** Stateless loader: every open()/load() opens the file, reads and closes it

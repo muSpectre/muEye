@@ -202,6 +202,12 @@ void App::draw_ui() {
           component_ = c;
           reload = true;
         }
+        // muGrid flattens tensor components column-major (flat = row + d*col),
+        // so spell out which entry the flat index denotes.
+        if (int d = tensor_dim(fi.nb_components); d > 0) {
+          ImGui::SameLine();
+          ImGui::TextDisabled("= (%d,%d)", component_ % d, component_ / d);
+        }
       }
       ImGui::Text("components: %d   sub-points: %d", fi.nb_components,
                   fi.nb_sub_pts);

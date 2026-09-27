@@ -19,7 +19,8 @@ namespace mueye {
 /** How to reduce a (possibly multi-component) muGrid field to a single scalar
  *  per voxel. */
 enum class Scalarize : int {
-  Component = 0,  //!< pick one raw component
+  Component = 0,  //!< pick one raw component (flat index; muGrid flattens a
+                  //!< d x d tensor column-major, flat = row + d*col)
   Magnitude = 1,  //!< Euclidean norm over all components (vector magnitude)
   VonMises = 2,   //!< von Mises equivalent of a 2x2 (4-comp.) or 3x3 (9-comp.) tensor
   Trace = 3       //!< trace of a 2x2 (4-comp.) or 3x3 (9-comp.) tensor

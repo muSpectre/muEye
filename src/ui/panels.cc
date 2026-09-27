@@ -327,8 +327,13 @@ void App::draw_ui() {
       needs_render_ = true;
 
     if (mode_ == RenderMode::DVR) {
-      if (ImGui::SliderFloat("Density", &density_scale_, 0.05f, 5.0f, "%.2f"))
+      // The one global opacity control (the transfer function's former
+      // "Opacity" slider was a second multiplier on the same quantity).
+      if (ImGui::SliderFloat("Opacity", &density_scale_, 0.05f, 5.0f, "%.2f"))
         needs_render_ = true;
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Global multiplier on the transfer function's "
+                          "per-voxel opacity.");
     } else {
       float lo = volume_.empty() ? 0.f : volume_.vmin;
       float hi = volume_.empty() ? 1.f : volume_.vmax;
@@ -378,12 +383,6 @@ void App::draw_ui() {
     int cm = static_cast<int>(tf_.colormap());
     if (ImGui::Combo("Colormap", &cm, cmaps, IM_ARRAYSIZE(cmaps))) {
       tf_.set_colormap(static_cast<Colormap>(cm));
-      tf_dirty_ = true;
-      needs_render_ = true;
-    }
-    float op = tf_.opacity_scale();
-    if (ImGui::SliderFloat("Opacity", &op, 0.0f, 2.0f, "%.2f")) {
-      tf_.set_opacity_scale(op);
       tf_dirty_ = true;
       needs_render_ = true;
     }

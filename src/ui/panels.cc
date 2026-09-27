@@ -333,8 +333,6 @@ void App::draw_ui() {
       ImGui::SameLine();
       if (ImGui::Button("Use file's F")) adopt_file_deformation();
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Frame cell")) frame_view(true);
     if (changed) needs_render_ = true;
     ImGui::EndDisabled();
     ImGui::End();
@@ -404,6 +402,14 @@ void App::draw_ui() {
                         "release.");
 
     ImGui::Separator();
+    // View reset lives here, next to the viewport-related toggles, rather
+    // than hidden in the Cell panel.
+    ImGui::BeginDisabled(volume_.empty());
+    if (ImGui::Button("Reset view")) frame_view(true);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Frame the cell and reset the view direction (R).");
+    ImGui::SameLine();
     // Drawn as a viewport overlay, so toggling needs no re-render.
     ImGui::Checkbox("Show box", &show_box_);
 

@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <limits>
 #include <string>
 #include <vector>
@@ -832,8 +833,9 @@ int check_file(const std::string &path, const char *ppm_out) {
 /**
  * View mode (`muEye_check --view file.nc [field]`): render an existing file
  * with the GUI's default appearance (DVR, default transfer function, white
- * background) to view.png / view_rep.png (2x2x2 periodic replicas). Purely a
- * preview/diagnosis aid; the file is only read, never written.
+ * background) to <file>.view.png / <file>.view_rep.png (2x2x2 periodic
+ * replicas) next to the data file. Purely a preview/diagnosis aid; the data
+ * file is only read, never written.
  */
 int view_file(const std::string &path, const char *field_name) {
   mueye::VolumeLoader loader;
@@ -928,8 +930,14 @@ int view_file(const std::string &path, const char *field_name) {
   mueye::OrbitCamera cam;
   cam.frame_box(box);
   cpu.render(p, cam.to_camera(1.0f), fb);
-  if (!mueye::write_png("view.png", fb)) return 1;
-  std::printf("wrote view.png (1x1x1)\n");
+  // Outputs go next to the data file, like the GUI's Save PNG default:
+  // <dir>/<stem>.view.png and <dir>/<stem>.view_rep.png.
+  const std::filesystem::path in{path};
+  const std::string stem = in.stem().string().empty() ? "view" : in.stem().string();
+  const std::string out1 = (in.parent_path() / (stem + ".view.png")).string();
+  const std::string out2 = (in.parent_path() / (stem + ".view_rep.png")).string();
+  if (!mueye::write_png(out1, fb)) return 1;
+  std::printf("wrote %s (1x1x1)\n", out1.c_str());
 
   // The replica preview does not warp (periodic tiling is disabled while
   // warping); show the undeformed tiled cell.
@@ -937,8 +945,8 @@ int view_file(const std::string &path, const char *field_name) {
   p.rep_x = p.rep_y = p.rep_z = 2;
   cam.retarget_box(mueye::Vec3{2 * box.x, 2 * box.y, 2 * box.z});
   cpu.render(p, cam.to_camera(1.0f), fb);
-  if (!mueye::write_png("view_rep.png", fb)) return 1;
-  std::printf("wrote view_rep.png (2x2x2 replicas)\n");
+  if (!mueye::write_png(out2, fb)) return 1;
+  std::printf("wrote %s (2x2x2 replicas)\n", out2.c_str());
   return 0;
 }
 

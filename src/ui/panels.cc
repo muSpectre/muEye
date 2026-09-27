@@ -196,12 +196,39 @@ void App::draw_ui() {
                              static_cast<int>(names.size()));
 
       const FieldInfo &fi = meta_.fields[field_index_];
-      const char *modes[] = {"Component", "Magnitude", "von Mises (tensor)",
-                             "Trace (tensor)"};
-      int sm = static_cast<int>(scalarize_);
-      if (ImGui::Combo("Scalar", &sm, modes, IM_ARRAYSIZE(modes))) {
-        scalarize_ = static_cast<Scalarize>(sm);
+      // Only offer the reductions that apply to this field: Magnitude needs
+      // more than one component, von Mises and Trace a square tensor. The
+      // others used to be selectable and silently fell back to a sum or the
+      // magnitude. When a field change makes the current choice inapplicable,
+      // fall back to Component.
+      auto applicable = [&](Scalarize m) {
+        switch (m) {
+          case Scalarize::Component:
+            return true;
+          case Scalarize::Magnitude:
+            return fi.nb_components > 1;
+          case Scalarize::VonMises:
+          case Scalarize::Trace:
+            return tensor_dim(fi.nb_components) > 0;
+        }
+        return false;
+      };
+      if (!applicable(scalarize_)) {
+        scalarize_ = Scalarize::Component;
         reload = true;
+      }
+      if (ImGui::BeginCombo("Scalar", to_string(scalarize_))) {
+        for (Scalarize m : {Scalarize::Component, Scalarize::Magnitude,
+                            Scalarize::VonMises, Scalarize::Trace}) {
+          ImGui::BeginDisabled(!applicable(m));
+          if (ImGui::Selectable(to_string(m), m == scalarize_) &&
+              m != scalarize_) {
+            scalarize_ = m;
+            reload = true;
+          }
+          ImGui::EndDisabled();
+        }
+        ImGui::EndCombo();
       }
       if (scalarize_ == Scalarize::Component && fi.nb_components > 1) {
         int c = component_;

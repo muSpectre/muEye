@@ -420,12 +420,14 @@ int check_file(const std::string &path, const char *ppm_out) {
   {
     int fcheck = meta.nb_frames - 1;
     mueye::Volume vg, vd;
-    mueye::FieldInfo direct = meta.fields[0];
-    direct.is_double = false;  // force the netcdf-c path
+    // Select each reader explicitly: Auto would send Component mode down the
+    // direct path on both sides and compare it with itself.
     std::string e1 = loader.load(path, meta, meta.fields[0], fcheck,
-                                 mueye::Scalarize::Component, 0, vg);
-    std::string e2 = loader.load(path, meta, direct, fcheck,
-                                 mueye::Scalarize::Component, 0, vd);
+                                 mueye::Scalarize::Component, 0, vg,
+                                 mueye::ReadPath::MuGrid);
+    std::string e2 = loader.load(path, meta, meta.fields[0], fcheck,
+                                 mueye::Scalarize::Component, 0, vd,
+                                 mueye::ReadPath::Direct);
     if (!e1.empty() || !e2.empty() || vg.data.size() != vd.data.size() ||
         vg.data.empty()) {
       std::fprintf(stderr, "direct-read cross-check failed to load (%s%s)\n",
@@ -450,16 +452,16 @@ int check_file(const std::string &path, const char *ppm_out) {
   // netcdf path (which fetches only the selected component in Component mode).
   for (const mueye::FieldInfo &finfo : meta.fields) {
     if (finfo.nb_components <= 1) continue;
-    mueye::FieldInfo direct = finfo;
-    direct.is_double = false;  // force the netcdf-c path
     for (int c = 0; c <= finfo.nb_components; ++c) {
       // c == nb_components is the magnitude pass (component index unused).
       bool magnitude = c == finfo.nb_components;
       mueye::Scalarize sm =
           magnitude ? mueye::Scalarize::Magnitude : mueye::Scalarize::Component;
       mueye::Volume vg, vd;
-      std::string e1 = loader.load(path, meta, finfo, 0, sm, c, vg);
-      std::string e2 = loader.load(path, meta, direct, 0, sm, c, vd);
+      std::string e1 = loader.load(path, meta, finfo, 0, sm, c, vg,
+                                   mueye::ReadPath::MuGrid);
+      std::string e2 = loader.load(path, meta, finfo, 0, sm, c, vd,
+                                   mueye::ReadPath::Direct);
       if (!e1.empty() || !e2.empty() || vg.data.size() != vd.data.size() ||
           vg.data.empty()) {
         std::fprintf(stderr,

@@ -47,10 +47,12 @@ bool starts_with(const std::string &s, const char *prefix) {
 
 /**
  * Read one frame of @p field straight through the netcdf-c API, bypassing
- * muGrid. Used for variables not stored as NC_DOUBLE: muGrid's read path
- * (serial nc_get_varm) transfers raw bytes into its Real (double) fields with
- * no type conversion, so an NC_FLOAT variable read through it comes back as
- * reinterpreted garbage. nc_get_vara_double converts on read instead.
+ * muGrid (ReadPath::Direct). Required for variables not stored as NC_DOUBLE:
+ * muGrid's read path (serial nc_get_varm) transfers raw bytes into its Real
+ * (double) fields with no type conversion, so an NC_FLOAT variable read
+ * through it comes back as reinterpreted garbage; nc_get_vara_double converts
+ * on read instead. Also the default for Component mode on any variable, since
+ * it fetches a single component where muGrid reads the whole field.
  *
  * The hyperslab is fetched in the file's row-major dimension order
  * (frame, [tensor_dim...], [subpt], nx, ny, nz) — muGrid writes with an imap,
@@ -380,11 +382,25 @@ FileMeta VolumeLoader::open(const std::string &path) {
 
 std::string VolumeLoader::load(const std::string &path, const FileMeta &meta,
                                const FieldInfo &field, int frame,
-                               Scalarize mode, int component, Volume &out) {
-  // Non-double variables (e.g. muFFTTO's float32 output) cannot go through
-  // muGrid's byte-copying read path; fetch them directly via netcdf-c.
-  if (!field.is_double) {
+                               Scalarize mode, int component, Volume &out,
+                               ReadPath read_path) {
+  if (read_path == ReadPath::Auto) {
+    // Non-double variables (e.g. muFFTTO's float32 output) cannot go through
+    // muGrid's byte-copying read path at all. Component mode goes direct as
+    // well: the muGrid path reads every component of the field (all nine of a
+    // 3x3 tensor, 1.2 GB at 256^3) to display one, whereas the hyperslab read
+    // fetches just the selected component.
+    read_path = (!field.is_double || mode == Scalarize::Component)
+                    ? ReadPath::Direct
+                    : ReadPath::MuGrid;
+  }
+  if (read_path == ReadPath::Direct) {
     return load_via_netcdf(path, meta, field, frame, mode, component, out);
+  }
+  if (!field.is_double) {
+    return "Variable '" + field.name +
+           "' is not stored as double; muGrid cannot read it (use the direct "
+           "reader).";
   }
   try {
     // Build a field collection matching the file's spatial dimension. A genuine

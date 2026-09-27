@@ -397,6 +397,15 @@ void App::draw_ui() {
       tf_dirty_ = true;
       needs_render_ = true;
     }
+    float cut = tf_.opacity_cutoff();
+    if (ImGui::SliderFloat("Cutoff", &cut, 0.0f, 0.9f, "%.2f")) {
+      tf_.set_opacity_cutoff(cut);
+      tf_dirty_ = true;
+      needs_render_ = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Values below this fraction of the range are fully "
+                        "transparent (and skipped by the ray marcher).");
 
     // A small preview strip of the colormap.
     ImDrawList *dl = ImGui::GetWindowDrawList();

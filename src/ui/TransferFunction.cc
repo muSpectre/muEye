@@ -73,11 +73,28 @@ void TransferFunction::rebuild() {
         eval_ramp(kViridis, 11, t, r, g, b);
         break;
     }
-    float alpha = std::pow(t, opacity_gamma_) * opacity_scale_;
+    // Fully transparent below the cutoff; the ramp restarts from 0 there so
+    // the opacity stays continuous.
+    float alpha = 0.0f;
+    if (t > opacity_cutoff_) {
+      float tt = (t - opacity_cutoff_) / (1.0f - opacity_cutoff_);
+      alpha = std::pow(tt, opacity_gamma_) * opacity_scale_;
+    }
     if (alpha < 0.f) alpha = 0.f;
     if (alpha > 1.f) alpha = 1.f;
     lut_[i] = Vec4{r, g, b, alpha};
   }
+}
+
+float TransferFunction::transparent_below() const {
+  // lut_lookup(v) interpolates entries i0 = (int)(v*(n-1)) and i0+1, so a
+  // lookup is exactly transparent iff both have alpha 0. With j the first
+  // entry whose alpha is > 0, every v with v*(n-1) < j-1 touches only entries
+  // <= j-1, all transparent; hence the band is [0, (j-1)/(n-1)).
+  int j = 0;
+  while (j < kSize && lut_[j].w <= 0.0f) ++j;
+  if (j <= 1) return 0.0f;
+  return static_cast<float>(j - 1) / static_cast<float>(kSize - 1);
 }
 
 }  // namespace mueye

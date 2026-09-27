@@ -53,8 +53,27 @@ class TransferFunction {
   }
   float opacity_gamma() const { return opacity_gamma_; }
 
+  /** Fraction of the normalized value range below which voxels are fully
+   *  transparent (alpha exactly 0); the ramp restarts from zero at the cutoff.
+   *  Besides hiding the "void" of a density field, this is what lets the ray
+   *  marcher skip bricks whose values all lie below the cutoff. */
+  void set_opacity_cutoff(float c) {
+    c = c < 0.0f ? 0.0f : (c > 0.99f ? 0.99f : c);
+    if (c != opacity_cutoff_) {
+      opacity_cutoff_ = c;
+      rebuild();
+    }
+  }
+  float opacity_cutoff() const { return opacity_cutoff_; }
+
   const Vec4 *data() const { return lut_.data(); }
   int size() const { return kSize; }
+
+  /** Largest normalized value v such that every LUT lookup of a value < v is
+   *  exactly transparent (both interpolated entries have alpha 0), derived from
+   *  the actual LUT contents. Returns 0 when no such band exists. Used to
+   *  decide which bricks the ray marcher may skip. */
+  float transparent_below() const;
 
  private:
   void rebuild();
@@ -62,6 +81,7 @@ class TransferFunction {
   Colormap colormap_{Colormap::Viridis};
   float opacity_scale_{1.0f};
   float opacity_gamma_{1.5f};
+  float opacity_cutoff_{0.02f};
   std::vector<Vec4> lut_ = std::vector<Vec4>(kSize);
 };
 

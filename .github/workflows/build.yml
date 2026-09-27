@@ -53,7 +53,9 @@ jobs:
           - { name: linux-x86_64,   runner: ubuntu-24.04,     os: linux,   triplet: "",            cuda: true }
           - { name: linux-arm64,    runner: ubuntu-24.04-arm, os: linux,   triplet: "",            cuda: false }
           - { name: macos-arm64,    runner: macos-14,         os: macos,   triplet: "",            cuda: false }
-          - { name: windows-x86_64, runner: windows-latest,   os: windows, triplet: x64-windows,   cuda: true }
+          # windows-2022 (VS 2022): windows-latest ships VS 2026, for which
+          # CUDA 12.6 has no MSBuild integration ("No CUDA toolset found").
+          - { name: windows-x86_64, runner: windows-2022,     os: windows, triplet: x64-windows,   cuda: true }
           - { name: windows-arm64,  runner: windows-11-arm,   os: windows, triplet: arm64-windows, cuda: false }
 
     steps:

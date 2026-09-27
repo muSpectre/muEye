@@ -8,10 +8,23 @@ name: build
 # muEye consumes muGrid via add_subdirectory, so each job checks out muGrid
 # alongside it. Dependencies: NetCDF (system on Linux/macOS, vcpkg on Windows),
 # OpenGL, plus GLFW + Dear ImGui which the build fetches automatically.
+#
+# Every job also packages a self-contained binary (all non-system shared
+# libraries bundled) and uploads it as a workflow artifact:
+#   * Linux   — muEye-<ver>-linux-<arch>.AppImage  (linuxdeploy)
+#   * macOS   — muEye-<ver>-macos-arm64.zip         (.app, dylibbundler, ad-hoc signed)
+#   * Windows — muEye-<ver>-windows-<arch>.zip      (exe + vcpkg DLLs + MSVC runtime)
+# Pushing a tag v* additionally publishes these as a GitHub release.
+#
+# The x86_64 Linux and Windows builds include the CUDA backend. The CUDA
+# runtime is linked statically, so only the NVIDIA driver is needed at run
+# time; without one, muEye falls back to the CPU renderer. The runners have no
+# GPU, so the CUDA path is compiled here but never executed.
 
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   pull_request:
   workflow_dispatch:
 
@@ -20,6 +33,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  CUDA_VERSION: '12.6.3'
+  # Real SASS for Volta..Hopper plus compute_90 PTX, which the driver JIT-
+  # compiles for newer GPUs (e.g. Blackwell).
+  CUDA_ARCHITECTURES: '70-real;75-real;80-real;86-real;89-real;90'
   # muGrid dependency. Pin MUGRID_REF to a tag (e.g. "0.110.0") for reproducible
   # builds; "main" tracks the latest.
   MUGRID_REPO: muSpectre/muGrid
@@ -33,11 +50,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x86_64,   runner: ubuntu-24.04,     os: linux,   triplet: "" }
-          - { name: linux-arm64,    runner: ubuntu-24.04-arm, os: linux,   triplet: "" }
-          - { name: macos-arm64,    runner: macos-14,         os: macos,   triplet: "" }
-          - { name: windows-x86_64, runner: windows-latest,   os: windows, triplet: x64-windows }
-          - { name: windows-arm64,  runner: windows-11-arm,   os: windows, triplet: arm64-windows }
+          - { name: linux-x86_64,   runner: ubuntu-24.04,     os: linux,   triplet: "",            cuda: true }
+          - { name: linux-arm64,    runner: ubuntu-24.04-arm, os: linux,   triplet: "",            cuda: false }
+          - { name: macos-arm64,    runner: macos-14,         os: macos,   triplet: "",            cuda: false }
+          # windows-2022 (VS 2022): windows-latest ships VS 2026, for which
+          # CUDA 12.6 has no MSBuild integration ("No CUDA toolset found").
+          - { name: windows-x86_64, runner: windows-2022,     os: windows, triplet: x64-windows,   cuda: true }
+          - { name: windows-arm64,  runner: windows-11-arm,   os: windows, triplet: arm64-windows, cuda: false }
 
     steps:
       - name: Checkout muEye
@@ -63,7 +82,16 @@ jobs:
 
       - name: Install dependencies (macOS)
         if: matrix.os == 'macos'
-        run: brew install netcdf pkg-config ninja
+        run: brew install netcdf pkg-config ninja dylibbundler
+
+      - name: Install CUDA Toolkit
+        if: matrix.cuda
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          # Windows additionally needs the MSBuild integration for the VS generator.
+          sub-packages: ${{ matrix.os == 'windows' && '["nvcc", "cudart", "visual_studio_integration"]' || '["nvcc", "cudart-dev"]' }}
 
       - name: Export vcpkg GitHub Actions cache variables (Windows)
         if: matrix.os == 'windows'
@@ -80,6 +108,7 @@ jobs:
           cmake -S muEye -B muEye/build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DMUEYE_MUGRID_SOURCE_DIR=${{ github.workspace }}/muGrid
+          ${{ matrix.cuda && format('-DMUEYE_ENABLE_CUDA=ON -DCMAKE_CUDA_RUNTIME_LIBRARY=Static "-DCMAKE_CUDA_ARCHITECTURES={0}"', env.CUDA_ARCHITECTURES) || '' }}
 
       - name: Configure (Windows)
         if: matrix.os == 'windows'
@@ -93,6 +122,7 @@ jobs:
           -DMUEYE_MUGRID_SOURCE_DIR=${{ github.workspace }}/muGrid
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
           -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
+          ${{ matrix.cuda && format('-DMUEYE_ENABLE_CUDA=ON -DCMAKE_CUDA_RUNTIME_LIBRARY=Static "-DCMAKE_CUDA_ARCHITECTURES={0}"', env.CUDA_ARCHITECTURES) || '' }}
 
       # ----------------------------------------------------------------- build
       - name: Build muEye
@@ -106,3 +136,105 @@ jobs:
         run: |
           cmake --build muEye/build --target muEye_check --parallel
           (cd muEye/build && ./muEye_check demo.nc 32)
+
+      # --------------------------------------------------------------- package
+      - name: Set package name
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            ver="$GITHUB_REF_NAME"
+          else
+            ver="$(git -C muEye rev-parse --short HEAD)"
+          fi
+          echo "PKG=muEye-${ver}-${{ matrix.name }}" >> "$GITHUB_ENV"
+          mkdir -p dist
+
+      - name: Package AppImage (Linux)
+        if: matrix.os == 'linux'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1   # runners have no FUSE to mount AppImages
+        run: |
+          curl -fsSL -o linuxdeploy \
+            "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$(uname -m).AppImage"
+          chmod +x linuxdeploy
+          DESTDIR="$PWD/AppDir" cmake --install muEye/build --component viewer --prefix /usr
+          install -Dm644 muEye/LICENSE AppDir/usr/share/doc/muEye/LICENSE
+          # Bundles every shared library except the ones on the AppImage
+          # excludelist (glibc, libGL, X11, ...), which must come from the host.
+          ./linuxdeploy --appdir AppDir \
+            --executable AppDir/usr/bin/muEye \
+            --desktop-file muEye/resources/muEye.desktop \
+            --icon-file muEye/resources/muEye.png \
+            --output appimage
+          mv muEye*.AppImage "dist/$PKG.AppImage"
+          # The CUDA runtime must be static and the driver library (libcuda) is
+          # dlopen'ed by it — neither may appear as a link dependency.
+          if ldd AppDir/usr/bin/muEye | grep -E 'libcuda(rt)?\.so'; then
+            echo "muEye links the CUDA runtime/driver dynamically"; exit 1
+          fi
+
+      - name: Package .app (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          cmake --install muEye/build --component viewer --prefix stage
+          app=stage/muEye.app
+          # Copy the Homebrew dylibs (NetCDF, HDF5, ...) into the bundle and
+          # rewrite their install names to @executable_path/../Frameworks.
+          dylibbundler --overwrite-dir --bundle-deps --create-dir \
+            --fix-file "$app/Contents/MacOS/muEye" \
+            --dest-dir "$app/Contents/Frameworks" \
+            --install-path @executable_path/../Frameworks/
+          # install_name_tool invalidates signatures and Apple Silicon refuses
+          # to run unsigned code, so re-sign the whole bundle ad hoc.
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+          # Fail if anything still references a non-system library.
+          leaks=$(otool -L "$app"/Contents/MacOS/muEye "$app"/Contents/Frameworks/*.dylib \
+                  | awk '/^\t/ && $1 !~ /^(@|\/usr\/lib\/|\/System\/)/')
+          if [ -n "$leaks" ]; then echo "Unbundled libraries:"; echo "$leaks"; exit 1; fi
+          cp muEye/LICENSE stage/
+          ditto -c -k stage "dist/$PKG.zip"
+
+      - name: Package zip (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          # Installs muEye.exe plus the MSVC runtime (InstallRequiredSystemLibraries).
+          cmake --install muEye/build --config Release --component viewer --prefix stage
+          # vcpkg's applocal step copied NetCDF/HDF5/... next to the built exe.
+          Copy-Item muEye/build/Release/*.dll stage/
+          if (-not (Test-Path stage/netcdf.dll)) { throw "netcdf.dll was not bundled" }
+          Copy-Item muEye/LICENSE stage/
+          Compress-Archive -Path stage/* -DestinationPath "dist/$env:PKG.zip"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Publish the packages of a v* tag as a GitHub release. Runs only once every
+  # platform built and packaged successfully.
+  release:
+    name: release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --title "muEye $GITHUB_REF_NAME"
+          --generate-notes --verify-tag

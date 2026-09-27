@@ -6,7 +6,7 @@
 # Dear ImGui via FetchContent.
 #
 cmake_minimum_required(VERSION 3.18)
-project(muEye CXX)
+project(muEye VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -80,6 +80,24 @@ add_subdirectory(${MUEYE_MUGRID_SOURCE_DIR} mugrid_build)
 # directly for file introspection, so we must find it ourselves.
 # ---------------------------------------------------------------------------
 find_package(NetCDF REQUIRED)
+
+# netcdf-c exports the MSVC flag "/utf-8" as a PUBLIC compile option with no
+# language guard, so it also reaches nvcc when compiling GpuRenderer.cc, and
+# nvcc takes it for a second input file. Hand the target's options to the host
+# compiler (-Xcompiler) for CUDA sources and leave them unchanged elsewhere.
+if(MUEYE_ENABLE_CUDA AND MSVC AND TARGET netCDF::netcdf)
+    get_target_property(_nc_opts netCDF::netcdf INTERFACE_COMPILE_OPTIONS)
+    if(_nc_opts)
+        set(_nc_wrapped "")
+        foreach(_opt IN LISTS _nc_opts)
+            list(APPEND _nc_wrapped
+                "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${_opt}>"
+                "$<$<NOT:$<COMPILE_LANGUAGE:CUDA>>:${_opt}>")
+        endforeach()
+        set_target_properties(netCDF::netcdf PROPERTIES
+            INTERFACE_COMPILE_OPTIONS "${_nc_wrapped}")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # OpenGL + GLFW + Dear ImGui
@@ -245,8 +263,27 @@ if(APPLE)
         MACOSX_BUNDLE_BUNDLE_NAME "muEye"
         MACOSX_BUNDLE_GUI_IDENTIFIER "org.muspectre.muEye"
         MACOSX_BUNDLE_ICON_FILE "muEye.icns"
-        MACOSX_BUNDLE_BUNDLE_VERSION "1.0"
-        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0")
+        MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}")
+endif()
+
+# Install rules, used by CI to stage the self-contained release packages (see
+# .github/workflows/build.yml). Everything is in the `viewer` component so that
+# `cmake --install --component viewer` skips muGrid's own install rules.
+include(GNUInstallDirs)
+if(WIN32)
+    set(_mueye_bindir .)
+else()
+    set(_mueye_bindir ${CMAKE_INSTALL_BINDIR})
+endif()
+install(TARGETS muEye
+    BUNDLE  DESTINATION .                COMPONENT viewer
+    RUNTIME DESTINATION ${_mueye_bindir} COMPONENT viewer)
+if(WIN32)
+    # Ship the MSVC runtime next to muEye.exe so no VC++ redistributable is needed.
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION ${_mueye_bindir})
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT viewer)
+    include(InstallRequiredSystemLibraries)
 endif()
 
 # Helpful warnings (kept non-fatal for a draft); scoped to C++ TUs so they are

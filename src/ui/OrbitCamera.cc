@@ -47,10 +47,13 @@ void OrbitCamera::retarget_aabb(const Vec3 &center, float extent) {
 }
 
 void OrbitCamera::orbit(float dyaw, float dpitch) {
-  yaw_ += dyaw;
-  pitch_ += dpitch;
+  set_view_angles(yaw_ + dyaw, pitch_ + dpitch);
+}
+
+void OrbitCamera::set_view_angles(float yaw, float pitch) {
+  yaw_ = yaw;
   const float lim = 1.55f;  // ~89 degrees, avoid gimbal flip
-  pitch_ = std::clamp(pitch_, -lim, lim);
+  pitch_ = std::clamp(pitch, -lim, lim);
 }
 
 void OrbitCamera::zoom(float delta) {

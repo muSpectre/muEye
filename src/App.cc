@@ -123,12 +123,22 @@ void App::open_path(const std::string &path) {
   // load would use stale/empty dimensions and put the orbit pivot at the origin
   // (a corner of the cell) instead of its centre.
   reload_volume();
-  {
-    Vec3 center;
-    float extent;
-    cell_bounds(center, extent);
+  frame_view(true);
+}
+
+void App::frame_view(bool reset_angles) {
+  Vec3 center;
+  float extent;
+  cell_bounds(center, extent);
+  if (reset_angles) {
     camera_.frame_aabb(center, extent);
+    // A 2D field is a single slice in the x-y plane; look at it face-on
+    // rather than as an obliquely tilted slab.
+    if (meta_.spatial_dim == 2) camera_.set_face_on();
+  } else {
+    camera_.retarget_aabb(center, extent);
   }
+  needs_render_ = true;
 }
 
 void App::reload_volume() {

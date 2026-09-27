@@ -86,6 +86,11 @@ class App {
    *  used to frame the camera on non-orthogonal cells. */
   void cell_bounds(Vec3 &center, float &extent) const;
 
+  /** Frame the camera on the (tiled, sheared) cell. With @p reset_angles the
+   *  view direction is reset too: the default oblique 3D view, or face-on
+   *  (looking down z) for a 2D field. */
+  void frame_view(bool reset_angles);
+
   /** Re-render the current scene into a host framebuffer at full viewport
    *  resolution (ignoring the interactive downscale) and write it as a PNG. */
   void save_png(const std::string &path);

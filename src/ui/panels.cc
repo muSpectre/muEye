@@ -236,12 +236,7 @@ void App::draw_ui() {
         reload_displacement();
         // Warping switches tiling off (and back on when deselected), so the
         // framed extent changes: recentre without touching the view angles.
-        if (periodic_ && !volume_.empty()) {
-          Vec3 center;
-          float extent;
-          cell_bounds(center, extent);
-          camera_.retarget_aabb(center, extent);
-        }
+        if (periodic_ && !volume_.empty()) frame_view(false);
       }
       if (disp_field_index_ >= 0) {
         if (ImGui::DragFloat("Warp scale", &warp_scale_, 0.05f, 0.0f, 1.0e6f,
@@ -303,13 +298,7 @@ void App::draw_ui() {
       if (ImGui::Button("Use file's F")) adopt_file_deformation();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Frame cell")) {
-      Vec3 center;
-      float extent;
-      cell_bounds(center, extent);
-      camera_.frame_aabb(center, extent);
-      needs_render_ = true;
-    }
+    if (ImGui::Button("Frame cell")) frame_view(true);
     if (changed) needs_render_ = true;
     ImGui::End();
   }
@@ -362,12 +351,7 @@ void App::draw_ui() {
     if (tiling_changed) {
       for (int &r : replicas_) r = r < 1 ? 1 : (r > 8 ? 8 : r);
       // Keep the view direction but recentre on the tiled (possibly sheared) cell.
-      if (!volume_.empty()) {
-        Vec3 center;
-        float extent;
-        cell_bounds(center, extent);
-        camera_.retarget_aabb(center, extent);
-      }
+      if (!volume_.empty()) frame_view(false);
       needs_render_ = true;
     }
 

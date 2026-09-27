@@ -139,12 +139,15 @@ void App::reload_volume() {
   if (frame_ >= meta_.nb_frames) frame_ = meta_.nb_frames - 1;
 
   const FieldInfo &fi = meta_.fields[field_index_];
-  int comp = component_;
-  if (comp >= fi.nb_components) comp = fi.nb_components - 1;
+  // Clamp the component into the new field's range *and write it back*, so
+  // the Component slider never displays a value outside its own range after
+  // switching from a field with more components.
+  if (component_ >= fi.nb_components) component_ = fi.nb_components - 1;
+  if (component_ < 0) component_ = 0;
 
   auto t0 = std::chrono::high_resolution_clock::now();
-  std::string err = loader_.load(path_buf_, meta_, fi, frame_, scalarize_, comp,
-                                 volume_);
+  std::string err = loader_.load(path_buf_, meta_, fi, frame_, scalarize_,
+                                 component_, volume_);
   last_load_ms_ = std::chrono::duration<double, std::milli>(
                       std::chrono::high_resolution_clock::now() - t0)
                       .count();

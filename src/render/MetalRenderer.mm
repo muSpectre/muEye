@@ -517,11 +517,21 @@ void MetalRenderer::set_displacement(const float *data, int nx, int ny, int nz) 
 }
 
 void MetalRenderer::set_transfer_function(const Vec4 *lut, int n) {
-  if (!ok() || lut == nullptr) return;
+  if (!ok() || lut == nullptr || n <= 0) return;
   @autoreleasepool {
     // Vec4 {x,y,z,w} matches MSL float4 layout (16 bytes).
+    const std::size_t bytes = static_cast<std::size_t>(n) * sizeof(Vec4);
+    // Reuse the shared buffer when the LUT size is unchanged (it always is:
+    // the transfer function has a fixed number of entries) instead of
+    // allocating a fresh MTLBuffer on every opacity/colormap slider tick.
+    // render() is synchronous (waitUntilCompleted), so no in-flight command
+    // buffer can still be reading the old contents.
+    if (impl_->lut != nil && [impl_->lut length] == bytes) {
+      std::memcpy([impl_->lut contents], lut, bytes);
+      return;
+    }
     impl_->lut = [impl_->device newBufferWithBytes:lut
-                                            length:static_cast<std::size_t>(n) * sizeof(Vec4)
+                                            length:bytes
                                            options:MTLResourceStorageModeShared];
   }
 }

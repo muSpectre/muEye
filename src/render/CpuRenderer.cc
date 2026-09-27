@@ -25,6 +25,11 @@ void CpuRenderer::set_displacement(const float *data, int, int, int) {
   disp_ = data;  // borrowed, like the volume; nullptr clears the warp
 }
 
+void CpuRenderer::set_brick_grid(const float *bmin, const float *bmax, int bx,
+                                 int by, int bz) {
+  bricks_ = ArrayBrickSampler{bmin, bmax, bx, by, bz};  // borrowed
+}
+
 void CpuRenderer::render(const RenderParams &params, const Camera &camera,
                          Framebuffer &fb) {
   const int w = fb.width;
@@ -43,7 +48,7 @@ void CpuRenderer::render(const RenderParams &params, const Camera &camera,
     for (int x = 0; x < w; ++x) {
       float u = (x + 0.5f) / w;
       float v = (y + 0.5f) / h;
-      Vec4 c = trace_ray(sampler, disp, lut_, p, camera, u, v);
+      Vec4 c = trace_ray(sampler, disp, bricks_, lut_, p, camera, u, v);
       std::size_t idx = (static_cast<std::size_t>(y) * w + x) * 4;
       out[idx + 0] = static_cast<std::uint8_t>(clampf(c.x, 0.f, 1.f) * 255.f + 0.5f);
       out[idx + 1] = static_cast<std::uint8_t>(clampf(c.y, 0.f, 1.f) * 255.f + 0.5f);

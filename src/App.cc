@@ -208,6 +208,10 @@ void App::sync_renderer_data() {
   if (volume_dirty_) {
     renderer_->set_volume(volume_.data.data(), volume_.nx, volume_.ny,
                           volume_.nz);
+    const BrickGrid &b = volume_.bricks;
+    renderer_->set_brick_grid(b.empty() ? nullptr : b.bmin.data(),
+                              b.empty() ? nullptr : b.bmax.data(), b.bx, b.by,
+                              b.bz);
     volume_dirty_ = false;
     uploaded = true;
   }
@@ -322,6 +326,9 @@ RenderParams App::make_render_params() const {
   p.iso_value = iso_value_;
   p.mode = mode_;
   p.bg = Vec3{bg_[0], bg_[1], bg_[2]};
+  // Empty-space skipping threshold, from the transfer function's transparent
+  // band (only the DVR path uses it; the iso path skips by iso level).
+  p.skip_below = tf_.skip_below(p.data_min, p.data_max);
 
   // Deformed-geometry warp. Active only when a displacement field is loaded.
   // Periodic tiling is unsupported while warping (the deformed body no longer

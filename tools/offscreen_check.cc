@@ -15,6 +15,7 @@
  * Part of muEye, a viewer for muGrid data.
  */
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -172,6 +173,7 @@ mueye::Volume make_cube_volume(int nx, int ny, int nz) {
       }
   v.vmin = 0.0f;
   v.vmax = 1.0f;
+  v.build_bricks();
   return v;
 }
 
@@ -217,6 +219,7 @@ int check_anisotropic() {
     p.iso_value = 0.5f;
     p.mode = mueye::RenderMode::DVR;
     p.bg = mueye::Vec3{0.05f, 0.06f, 0.08f};
+    p.skip_below = tf.skip_below(v.vmin, v.vmax);
     return p;
   };
 
@@ -241,17 +244,22 @@ int check_anisotropic() {
   mueye::Framebuffer fa, fb;
   fa.resize(256, 256);
   fb.resize(256, 256);
+  auto set_vol = [&](mueye::Renderer &r, const mueye::Volume &v) {
+    r.set_volume(v.data.data(), v.nx, v.ny, v.nz);
+    r.set_brick_grid(v.bricks.bmin.data(), v.bricks.bmax.data(), v.bricks.bx,
+                     v.bricks.by, v.bricks.bz);
+  };
 
   mueye::RenderParams pa = make_params(va);
   mueye::Camera cam_a = make_cam(pa, mueye::Vec3{1.0f, 0.0f, 0.0f},
                                  mueye::Vec3{0.0f, 0.0f, 1.0f});
-  cpu.set_volume(va.data.data(), va.nx, va.ny, va.nz);
+  set_vol(cpu, va);
   cpu.render(pa, cam_a, fa);
 
   mueye::RenderParams pb = make_params(vb);
   mueye::Camera cam_b = make_cam(pb, mueye::Vec3{0.0f, 0.0f, 1.0f},
                                  mueye::Vec3{1.0f, 0.0f, 0.0f});
-  cpu.set_volume(vb.data.data(), vb.nx, vb.ny, vb.nz);
+  set_vol(cpu, vb);
   cpu.render(pb, cam_b, fb);
 
   // Sanity: the render must actually contain the cube.
@@ -280,7 +288,7 @@ int check_anisotropic() {
 
   // Every other available backend must agree with the CPU reference on the
   // anisotropic grid too.
-  cpu.set_volume(va.data.data(), va.nx, va.ny, va.nz);
+  set_vol(cpu, va);
   cpu.render(pa, cam_a, fa);
   for (const mueye::BackendInfo &bi : mueye::enumerate_backends()) {
     if (bi.backend == mueye::Backend::CPU) continue;
@@ -295,7 +303,7 @@ int check_anisotropic() {
     }
     mueye::Framebuffer fg;
     fg.resize(256, 256);
-    r->set_volume(va.data.data(), va.nx, va.ny, va.nz);
+    set_vol(*r, va);
     r->set_transfer_function(tf.data(), tf.size());
     r->render(pa, cam_a, fg);
     sum = 0.0;
@@ -573,12 +581,66 @@ int check_file(const std::string &path, const char *ppm_out) {
   p.mode = mueye::RenderMode::DVR;
   p.bg = mueye::Vec3{0.05f, 0.06f, 0.08f};
 
+  p.skip_below = tf.skip_below(vol.vmin, vol.vmax);
+
   auto render_with = [&](mueye::Renderer &r, mueye::Framebuffer &fb,
                          mueye::RenderMode mode) {
     p.mode = mode;
     r.set_volume(vol.data.data(), vol.nx, vol.ny, vol.nz);
+    r.set_brick_grid(vol.bricks.bmin.data(), vol.bricks.bmax.data(),
+                     vol.bricks.bx, vol.bricks.by, vol.bricks.bz);
     r.set_transfer_function(tf.data(), tf.size());
     r.render(p, camv, fb);
+  };
+
+  // Empty-space skipping must not change a single pixel: render DVR and the
+  // isosurface with the brick summary and without, on the CPU, and require
+  // bit-identical images. Also reports the speed-up on this scene.
+  auto check_skipping = [&](const char *what) {
+    int bad = 0;
+    for (mueye::RenderMode mode :
+         {mueye::RenderMode::DVR, mueye::RenderMode::Isosurface}) {
+      mueye::CpuRenderer r;
+      mueye::Framebuffer with, without;
+      with.resize(256, 256);
+      without.resize(256, 256);
+      // Render each variant twice and time the second pass (warm caches,
+      // thread pool spun up), so the comparison is not skewed by start-up.
+      render_with(r, with, mode);
+      auto t0 = std::chrono::steady_clock::now();
+      r.render(p, camv, with);
+      auto t1 = std::chrono::steady_clock::now();
+      r.set_brick_grid(nullptr, nullptr, 0, 0, 0);
+      r.render(p, camv, without);
+      t1 = std::chrono::steady_clock::now();
+      r.render(p, camv, without);
+      auto t2 = std::chrono::steady_clock::now();
+      // (t0,t1) brackets warm "with"; (t1,t2) warm "without". Re-time "with"
+      // after "without" too, and keep the faster of its two runs.
+      auto tw = t1 - t0;
+      r.set_brick_grid(vol.bricks.bmin.data(), vol.bricks.bmax.data(),
+                       vol.bricks.bx, vol.bricks.by, vol.bricks.bz);
+      auto t3 = std::chrono::steady_clock::now();
+      r.render(p, camv, with);
+      auto t4 = std::chrono::steady_clock::now();
+      if (t4 - t3 < tw) tw = t4 - t3;
+      std::size_t ndiff = 0;
+      for (std::size_t i = 0; i < with.rgba.size(); ++i)
+        if (with.rgba[i] != without.rgba[i]) ++ndiff;
+      double ms_with = std::chrono::duration<double, std::milli>(tw).count();
+      double ms_without =
+          std::chrono::duration<double, std::milli>(t2 - t1).count();
+      std::printf("skipping %-12s %-4s: %zu differing bytes, %.1f ms -> %.1f ms\n",
+                  what, mode == mueye::RenderMode::DVR ? "DVR" : "iso", ndiff,
+                  ms_without, ms_with);
+      if (ndiff != 0) {
+        std::fprintf(stderr, "empty-space skipping changed the %s image (%s).\n",
+                     mode == mueye::RenderMode::DVR ? "DVR" : "isosurface",
+                     what);
+        ++bad;
+      }
+    }
+    return bad;
   };
 
   // CPU reference render (DVR + isosurface).
@@ -642,6 +704,7 @@ int check_file(const std::string &path, const char *ppm_out) {
   };
 
   int mismatches = compare_backends("DVR");
+  mismatches += check_skipping("single cell");
 
   // Periodic tiling: 2x2x2 replicas, camera reframed on the enlarged box.
   p.rep_x = 2;
@@ -663,6 +726,7 @@ int check_file(const std::string &path, const char *ppm_out) {
     return 1;
   }
   mismatches += compare_backends("DVR 2x2x2");
+  mismatches += check_skipping("2x2x2");
 
   // Sheared (Bravais) cell: a non-orthogonal inv_cell must render identically
   // across backends too (exercises the Metal mirror's cell-matrix math). Reuse
@@ -699,6 +763,7 @@ int check_file(const std::string &path, const char *ppm_out) {
     return 1;
   }
   mismatches += compare_backends("DVR sheared");
+  mismatches += check_skipping("sheared");
 
   // Deformed geometry: a synthetic displacement warps the volume; every backend
   // must agree with the CPU reference on the inverse-warp (fixed-point) path.
@@ -828,9 +893,12 @@ int view_file(const std::string &path, const char *field_name) {
   p.iso_value = 0.5f * (vol.vmin + vol.vmax);
   p.mode = mueye::RenderMode::DVR;
   p.bg = mueye::Vec3{1.0f, 1.0f, 1.0f};  // GUI default: white
+  p.skip_below = tf.skip_below(vol.vmin, vol.vmax);
 
   mueye::CpuRenderer cpu;
   cpu.set_volume(vol.data.data(), vol.nx, vol.ny, vol.nz);
+  cpu.set_brick_grid(vol.bricks.bmin.data(), vol.bricks.bmax.data(),
+                     vol.bricks.bx, vol.bricks.by, vol.bricks.bz);
   cpu.set_transfer_function(tf.data(), tf.size());
   mueye::Framebuffer fb;
   fb.resize(512, 512);

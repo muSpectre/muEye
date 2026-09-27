@@ -20,6 +20,8 @@ class CpuRenderer : public Renderer {
   void set_volume(const float *data, int nx, int ny, int nz) override;
   void set_transfer_function(const Vec4 *lut, int n) override;
   void set_displacement(const float *data, int nx, int ny, int nz) override;
+  void set_brick_grid(const float *bmin, const float *bmax, int bx, int by,
+                      int bz) override;
   void render(const RenderParams &params, const Camera &camera,
               Framebuffer &fb) override;
   const char *name() const override { return "CPU"; }
@@ -37,6 +39,7 @@ class CpuRenderer : public Renderer {
   const float *volume_{nullptr};
   const Vec4 *lut_{nullptr};
   const float *disp_{nullptr};  //!< borrowed displacement buffer (4 floats/voxel)
+  ArrayBrickSampler bricks_{nullptr, nullptr, 0, 0, 0};  //!< borrowed summary
   int nb_threads_{0};
 };
 

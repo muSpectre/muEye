@@ -214,6 +214,13 @@ struct RenderParams {
   RenderMode mode;       //!< DVR or Isosurface
   Vec3 bg;               //!< background colour
 
+  // --- empty-space skipping ---------------------------------------------
+  // Data value below which the transfer function is *exactly* transparent
+  // (both LUT entries any lookup interpolates have alpha 0); see
+  // TransferFunction::skip_below(). A brick whose maximum lies below it
+  // contributes nothing to DVR and is jumped over. -1e30 disables skipping.
+  float skip_below{-1e30f};
+
   // --- optional displacement warp (deformed geometry) -------------------
   // When warp_enabled, the volume is rendered in its deformed configuration
   // x = C*s + D(s), where s is the fractional cell coordinate and D(s) =
@@ -297,6 +304,88 @@ MUEYE_HD inline float wrap_coord(float u, int rep) {
 MUEYE_HD inline Vec3 wrap_uvw(const RenderParams &p, const Vec3 &uvw) {
   return Vec3{wrap_coord(uvw.x, p.rep_x), wrap_coord(uvw.y, p.rep_y),
               wrap_coord(uvw.z, p.rep_z)};
+}
+
+// ---------------------------------------------------------------------------
+// Empty-space skipping.
+//
+// The volume is summarised on a coarse grid of bricks of kBrickSize^3 voxels
+// holding each brick's value range, *dilated by one voxel per side* so that
+// every trilinear sample whose position falls inside a brick is guaranteed to
+// lie within [min, max] (a sample at fractional position w reads voxels
+// floor(w*n - 0.5) and +1, i.e. at most one voxel beyond the brick's own).
+// The ray marchers use it to jump over bricks that cannot contribute: for DVR
+// those whose maximum lies below the transfer function's transparent band, for
+// the isosurface those whose range does not contain the iso level. Jumps land
+// on the same sample lattice (t_near + k*step) the plain march uses, so the
+// image is bit-identical with and without skipping (muEye_check verifies).
+//
+// Like the volume sampler, the brick grid is reached through a small "sampler"
+// type: ArrayBrickSampler over host arrays (CPU backend), or NoBricks for
+// backends that do not upload a summary (valid() == false disables skipping).
+// ---------------------------------------------------------------------------
+
+constexpr int kBrickSize = 8;
+
+/** Brick index along one axis for a wrapped box coordinate w in [0,1]. */
+MUEYE_HD inline int brick_index(float w, int n, int nb) {
+  int b = static_cast<int>(w * n) / kBrickSize;
+  return b < 0 ? 0 : (b >= nb ? nb - 1 : b);
+}
+
+/** Per-brick [min,max] over host arrays (bx*by*bz entries, x fastest). */
+struct ArrayBrickSampler {
+  const float *MUEYE_RESTRICT bmin;
+  const float *MUEYE_RESTRICT bmax;
+  int bx, by, bz;
+
+  MUEYE_HD bool valid() const {
+    return bmin != nullptr && bmax != nullptr && bx > 0 && by > 0 && bz > 0;
+  }
+  /** Value range of the brick containing wrapped box coordinate @p w. */
+  MUEYE_HD void range(const RenderParams &p, const Vec3 &w, float &lo,
+                      float &hi) const {
+    int i = brick_index(w.x, p.nx, bx);
+    int j = brick_index(w.y, p.ny, by);
+    int k = brick_index(w.z, p.nz, bz);
+    int e = i + bx * (j + by * k);
+    lo = bmin[e];
+    hi = bmax[e];
+  }
+};
+
+/** No brick summary: skipping disabled. */
+struct NoBricks {
+  MUEYE_HD bool valid() const { return false; }
+  MUEYE_HD void range(const RenderParams &, const Vec3 &, float &lo,
+                      float &hi) const {
+    lo = -1e30f;
+    hi = 1e30f;
+  }
+};
+
+/** Ray-parameter distance along one axis from box coordinate @p u (wrapped
+ *  @p w, direction component @p d) to the boundary of the brick containing w. */
+MUEYE_HD inline float brick_axis_exit(float u, float w, float d, int n) {
+  if (d > -1e-12f && d < 1e-12f) return 1e30f;  // ray parallel to the face
+  int b = static_cast<int>(w * n) / kBrickSize;
+  float lo = static_cast<float>(b * kBrickSize) / n;
+  float hi = static_cast<float>((b + 1) * kBrickSize) / n;
+  if (hi > 1.0f) hi = 1.0f;  // last brick ends at the cell face
+  float base = u - w;        // offset of this replica in unwrapped coordinates
+  float bound = d > 0.0f ? base + hi : base + lo;
+  return (bound - u) / d;
+}
+
+/** Ray-parameter distance from the sample at fractional position @p uvw
+ *  (wrapped @p w) to where the ray, with fractional direction @p d_frac,
+ *  leaves the brick containing w. Never negative. */
+MUEYE_HD inline float brick_exit_distance(const RenderParams &p, const Vec3 &uvw,
+                                          const Vec3 &w, const Vec3 &d_frac) {
+  float t = brick_axis_exit(uvw.x, w.x, d_frac.x, p.nx);
+  t = minf(t, brick_axis_exit(uvw.y, w.y, d_frac.y, p.ny));
+  t = minf(t, brick_axis_exit(uvw.z, w.z, d_frac.z, p.nz));
+  return t < 0.0f ? 0.0f : t;
 }
 
 /** Central-difference gradient in box coordinates (for surface shading). */
@@ -486,10 +575,10 @@ MUEYE_HD inline Vec3 primary_ray_dir(const Camera &cam, float u, float v) {
  * occupancy. The CPU dispatcher trace_ray() below still selects at runtime — a
  * scalar CPU core has no such footprint concern.
  */
-template <class Sampler, class DispSampler>
+template <class Sampler, class DispSampler, class Bricks>
 MUEYE_HD inline Vec4 trace_ray_iso(const Sampler &s, const DispSampler &disp,
-                                   const RenderParams &p, const Camera &cam,
-                                   float u, float v) {
+                                   const Bricks &bricks, const RenderParams &p,
+                                   const Camera &cam, float u, float v) {
   Vec3 dir = primary_ray_dir(cam, u, v);
   float t_near, t_far;
   Vec4 bg = Vec4{p.bg.x, p.bg.y, p.bg.z, 1.0f};
@@ -544,13 +633,24 @@ MUEYE_HD inline Vec4 trace_ray_iso(const Sampler &s, const DispSampler &disp,
                              static_cast<float>(p.rep_z));
   if (!intersect_box(o_frac, d_frac, tiled_box, t_near, t_far)) return bg;
 
-  float t = t_near;
-  Vec3 prev = o_frac + d_frac * t;
+  // Samples sit on the lattice t_near + k*step (an explicit index rather than
+  // an accumulated t, so that a skip can re-enter the same lattice exactly).
+  // A brick whose range excludes the iso level cannot contain a crossing
+  // between two of its own samples; the crossings at its entry and exit are
+  // still tested against the true neighbouring samples, so skipping leaves the
+  // result unchanged. The same margin as the DVR path guards against the
+  // interpolation's rounding.
+  const float margin = 1e-6f * (p.data_max - p.data_min);
+  Vec3 prev = o_frac + d_frac * t_near;
   float prev_v = s.value_at(p, wrap_uvw(p, prev)) - p.iso_value;
-  t += p.step;
-  while (t < t_far) {
+  int k = 1;
+  float brick_end = -1e30f;  // ray parameter at which the current brick ends
+  for (;;) {
+    float t = t_near + k * p.step;
+    if (t >= t_far) break;
     Vec3 uvw = o_frac + d_frac * t;
-    float cur_v = s.value_at(p, wrap_uvw(p, uvw)) - p.iso_value;
+    Vec3 w = wrap_uvw(p, uvw);
+    float cur_v = s.value_at(p, w) - p.iso_value;
     if (prev_v * cur_v <= 0.0f) {
       // Linear refinement of the crossing, in the fractional-coordinate ray.
       float denom = (cur_v - prev_v);
@@ -560,7 +660,8 @@ MUEYE_HD inline Vec4 trace_ray_iso(const Sampler &s, const DispSampler &disp,
       // normal (a no-op for a cubic cell, a shear-correcting rotation otherwise).
       Vec3 n = normalize(mat3t_mul(p.inv_cell, gradient(s, p, wrap_uvw(p, hit))));
       // Two-sided Phong with a head light at the eye. The world hit position is
-      // recovered from the same crossing parameter along the world ray.
+      // recovered from the same crossing parameter along the world ray (prev
+      // is always the sample at k-1).
       float t_hit = (t - p.step) + p.step * frac;
       Vec3 world_hit = cam.eye + dir * t_hit;
       // mid-tone material so the surface reads clearly against a light/white
@@ -573,14 +674,33 @@ MUEYE_HD inline Vec4 trace_ray_iso(const Sampler &s, const DispSampler &disp,
     }
     prev = uvw;
     prev_v = cur_v;
-    t += p.step;
+    if (bricks.valid() && t >= brick_end) {
+      float blo, bhi;
+      bricks.range(p, w, blo, bhi);
+      brick_end = t + brick_exit_distance(p, uvw, w, d_frac);
+      if (p.iso_value < blo - margin || p.iso_value > bhi + margin) {
+        // Jump to the last lattice sample still inside this brick and make it
+        // the new prev, so the exit pair (last inside, first outside) is
+        // tested exactly as the plain march would.
+        int k_exit = static_cast<int>(ceilf((brick_end - t_near) / p.step));
+        if (k_exit - 1 > k) {
+          k = k_exit - 1;
+          float tp = t_near + k * p.step;
+          if (tp >= t_far) break;
+          prev = o_frac + d_frac * tp;
+          prev_v = s.value_at(p, wrap_uvw(p, prev)) - p.iso_value;
+        }
+      }
+    }
+    ++k;
   }
   return bg;
 }
 
 /** Direct volume rendering: front-to-back emission-absorption compositing. */
-template <class Sampler, class DispSampler>
+template <class Sampler, class DispSampler, class Bricks>
 MUEYE_HD inline Vec4 trace_ray_dvr(const Sampler &s, const DispSampler &disp,
+                                   const Bricks &bricks,
                                    const Vec4 *MUEYE_RESTRICT lut,
                                    const RenderParams &p, const Camera &cam,
                                    float u, float v) {
@@ -628,9 +748,33 @@ MUEYE_HD inline Vec4 trace_ray_dvr(const Sampler &s, const DispSampler &disp,
 
   Vec3 accum = make_vec3(0.0f, 0.0f, 0.0f);
   float trans = 1.0f;  // remaining transparency
-  for (float t = t_near; t < t_far; t += p.step) {
+  // Samples on the lattice t_near + k*step (explicit index so a skip can
+  // re-enter the very same lattice; see the empty-space skipping notes).
+  int k = 0;
+  float brick_end = -1e30f;  // ray parameter at which the current brick ends
+  for (;;) {
+    float t = t_near + k * p.step;
+    if (t >= t_far) break;
     Vec3 uvw = o_frac + d_frac * t;
-    float val = s.value_at(p, wrap_uvw(p, uvw));
+    Vec3 w = wrap_uvw(p, uvw);
+    // Look the brick up only when the ray has left the previous one; inside a
+    // brick the decision is already known, so the per-sample overhead is one
+    // comparison.
+    if (bricks.valid() && t >= brick_end) {
+      float blo, bhi;
+      bricks.range(p, w, blo, bhi);
+      brick_end = t + brick_exit_distance(p, uvw, w, d_frac);
+      if (bhi < p.skip_below) {
+        // Every sample in this brick is exactly transparent (alpha 0 adds
+        // nothing and leaves trans untouched): jump to the first lattice
+        // sample beyond the brick. Always advance at least one sample so a
+        // boundary landing cannot stall.
+        int k_next = static_cast<int>(ceilf((brick_end - t_near) / p.step));
+        k = k_next > k ? k_next : k + 1;
+        continue;
+      }
+    }
+    float val = s.value_at(p, w);
     float nv = normalize_value(p, val);
     Vec4 c = lut_lookup(lut, p, nv);
     // Opacity correction for the step size, then global density scale.
@@ -639,6 +783,7 @@ MUEYE_HD inline Vec4 trace_ray_dvr(const Sampler &s, const DispSampler &disp,
     accum = accum + crgb * (alpha * trans);
     trans *= (1.0f - alpha);
     if (trans < 0.003f) break;  // early ray termination
+    ++k;
   }
   // Composite over the background.
   Vec3 out = accum + p.bg * trans;
@@ -646,14 +791,15 @@ MUEYE_HD inline Vec4 trace_ray_dvr(const Sampler &s, const DispSampler &disp,
 }
 
 /** Runtime-dispatched entry point (CPU backend + single-kernel callers). */
-template <class Sampler, class DispSampler>
+template <class Sampler, class DispSampler, class Bricks>
 MUEYE_HD inline Vec4 trace_ray(const Sampler &s, const DispSampler &disp,
+                               const Bricks &bricks,
                                const Vec4 *MUEYE_RESTRICT lut,
                                const RenderParams &p, const Camera &cam, float u,
                                float v) {
   return p.mode == RenderMode::Isosurface
-             ? trace_ray_iso(s, disp, p, cam, u, v)
-             : trace_ray_dvr(s, disp, lut, p, cam, u, v);
+             ? trace_ray_iso(s, disp, bricks, p, cam, u, v)
+             : trace_ray_dvr(s, disp, bricks, lut, p, cam, u, v);
 }
 
 }  // namespace mueye

@@ -32,6 +32,18 @@ const char *to_string(Scalarize s);
  *  (2 for 4 components, 3 for 9), or 0 if it is not a square tensor. */
 int tensor_dim(int nb_components);
 
+/** Coarse per-brick value range of a volume, for the ray marcher's
+ *  empty-space skipping (see render_core.hh). Bricks are kSize^3 voxels; each
+ *  brick's range is taken over its voxels dilated by one on every side, so
+ *  any trilinear sample positioned inside the brick lies within it. */
+struct BrickGrid {
+  static constexpr int kSize = 8;  //!< must equal render_core.hh's kBrickSize
+  int bx{0}, by{0}, bz{0};
+  std::vector<float> bmin, bmax;   //!< bx*by*bz entries, x fastest
+
+  bool empty() const { return bmin.empty(); }
+};
+
 /** A dense scalar field on a regular grid, stored column-major
  *  (idx = i + nx*(j + ny*k)) in single precision. */
 struct Volume {
@@ -39,11 +51,16 @@ struct Volume {
   float vmin{0.0f}, vmax{1.0f};  //!< range over the *finite* voxels
   std::size_t nb_nonfinite{0};   //!< NaN/Inf voxels found (replaced by vmin)
   std::vector<float> data;
+  BrickGrid bricks;              //!< built by from_field() / build_bricks()
 
   bool empty() const { return data.empty(); }
   std::size_t size() const {
     return static_cast<std::size_t>(nx) * ny * nz;
   }
+
+  /** (Re)build the brick summary from `data`. from_field() calls this; call it
+   *  again after modifying `data` by hand. */
+  void build_bricks();
 
   /**
    * Fill this volume from a raw field buffer of doubles or floats (the

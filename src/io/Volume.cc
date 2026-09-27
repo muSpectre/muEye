@@ -13,6 +13,7 @@
 #include <limits>
 
 #include "render/parallel_for.hh"
+#include "render/render_core.hh"  // kBrickSize
 
 namespace mueye {
 
@@ -184,6 +185,47 @@ void Volume::from_field(const T *src, int nx_, int ny_, int nz_,
     for (float &f : data)
       if (!std::isfinite(f)) f = vmin;
   }
+
+  build_bricks();
+}
+
+static_assert(BrickGrid::kSize == kBrickSize,
+              "BrickGrid::kSize must match render_core.hh's kBrickSize");
+
+void Volume::build_bricks() {
+  const int B = BrickGrid::kSize;
+  BrickGrid &g = bricks;
+  if (data.empty()) {
+    g = BrickGrid{};
+    return;
+  }
+  g.bx = (nx + B - 1) / B;
+  g.by = (ny + B - 1) / B;
+  g.bz = (nz + B - 1) / B;
+  const std::size_t nb = static_cast<std::size_t>(g.bx) * g.by * g.bz;
+  g.bmin.assign(nb, 0.0f);
+  g.bmax.assign(nb, 0.0f);
+  const float *vol = data.data();
+  const int nx_ = nx, ny_ = ny, nz_ = nz, bx = g.bx, by = g.by;
+  parallel_for(static_cast<int>(nb), 0, [&](int e) {
+    const int bi = e % bx, bj = (e / bx) % by, bk = e / (bx * by);
+    // Dilated voxel range [b*B-1, (b+1)*B], clamped to the grid.
+    const int i0 = std::max(0, bi * B - 1), i1 = std::min(nx_ - 1, (bi + 1) * B);
+    const int j0 = std::max(0, bj * B - 1), j1 = std::min(ny_ - 1, (bj + 1) * B);
+    const int k0 = std::max(0, bk * B - 1), k1 = std::min(nz_ - 1, (bk + 1) * B);
+    float lo = std::numeric_limits<float>::infinity();
+    float hi = -std::numeric_limits<float>::infinity();
+    for (int k = k0; k <= k1; ++k)
+      for (int j = j0; j <= j1; ++j) {
+        const float *row = vol + nx_ * (j + static_cast<std::size_t>(ny_) * k);
+        for (int i = i0; i <= i1; ++i) {
+          lo = std::min(lo, row[i]);
+          hi = std::max(hi, row[i]);
+        }
+      }
+    g.bmin[e] = lo;
+    g.bmax[e] = hi;
+  });
 }
 
 template void Volume::from_field<double>(const double *, int, int, int, int,

@@ -154,8 +154,10 @@ __global__ void render_kernel_dvr(gpuTextureObject_t vol,
   if (x >= w || y >= h) return;
   float u = (x + 0.5f) / w;
   float v = (y + 0.5f) / h;
-  Vec4 c = trace_ray_dvr(TextureSampler{vol}, TextureDispSampler{disp}, lut, p,
-                         cam, u, v);
+  // NoBricks: no brick summary is uploaded to the device yet, so the GPU
+  // path renders without empty-space skipping (same image, more samples).
+  Vec4 c = trace_ray_dvr(TextureSampler{vol}, TextureDispSampler{disp},
+                         NoBricks{}, lut, p, cam, u, v);
   write_rgba(out, (static_cast<std::size_t>(y) * w + x) * 4, c);
 }
 
@@ -168,8 +170,8 @@ __global__ void render_kernel_iso(gpuTextureObject_t vol,
   if (x >= w || y >= h) return;
   float u = (x + 0.5f) / w;
   float v = (y + 0.5f) / h;
-  Vec4 c = trace_ray_iso(TextureSampler{vol}, TextureDispSampler{disp}, p, cam,
-                         u, v);
+  Vec4 c = trace_ray_iso(TextureSampler{vol}, TextureDispSampler{disp},
+                         NoBricks{}, p, cam, u, v);
   write_rgba(out, (static_cast<std::size_t>(y) * w + x) * 4, c);
 }
 

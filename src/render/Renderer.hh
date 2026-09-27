@@ -77,6 +77,15 @@ class Renderer {
   virtual void set_displacement(const float * /*data*/, int /*nx*/, int /*ny*/,
                                 int /*nz*/) {}
 
+  /** Upload the volume's brick summary for empty-space skipping: per-brick
+   *  minimum and maximum over a bx*by*bz grid of kBrickSize^3-voxel bricks
+   *  (see render_core.hh; Volume::bricks builds it). Pass null pointers to
+   *  clear it. Optional: the default no-op leaves skipping disabled for
+   *  backends that do not implement it (they render identically, only
+   *  slower on sparse volumes). */
+  virtual void set_brick_grid(const float * /*bmin*/, const float * /*bmax*/,
+                              int /*bx*/, int /*by*/, int /*bz*/) {}
+
   /** Render one frame into @p fb (assumed already sized). */
   virtual void render(const RenderParams &params, const Camera &camera,
                       Framebuffer &fb) = 0;

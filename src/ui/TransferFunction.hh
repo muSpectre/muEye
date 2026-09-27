@@ -75,6 +75,17 @@ class TransferFunction {
    *  decide which bricks the ray marcher may skip. */
   float transparent_below() const;
 
+  /** RenderParams::skip_below for a volume with range [data_min, data_max]:
+   *  the data value below which lookups are exactly transparent, less a small
+   *  margin for the trilinear interpolation's rounding; -1e30 when the LUT
+   *  has no transparent band (skipping disabled). */
+  float skip_below(float data_min, float data_max) const {
+    float thr = transparent_below();
+    float range = data_max - data_min;
+    if (thr <= 0.0f || range <= 0.0f) return -1e30f;
+    return data_min + thr * range - 1e-6f * range;
+  }
+
  private:
   void rebuild();
 

@@ -78,12 +78,16 @@ void App::set_backend(Backend backend) {
 }
 
 void App::open_path(const std::string &path) {
-  meta_ = loader_.open(path);
-  if (!meta_.valid) {
-    has_file_ = false;
-    status_ = "Failed to open '" + path + "': " + meta_.error;
+  // Introspect into a temporary: if the new file cannot be opened, the
+  // currently loaded dataset (metadata, volume, displacement, renderer data)
+  // stays fully intact and only the error is reported. Previously the failed
+  // metadata replaced meta_ while volume_ kept rendering the old file.
+  FileMeta meta = loader_.open(path);
+  if (!meta.valid) {
+    status_ = "Failed to open '" + path + "': " + meta.error;
     return;
   }
+  meta_ = std::move(meta);
   has_file_ = true;
   path_buf_ = path;
   // Mirror into the File panel's edit buffer (e.g. for a command-line load).
@@ -149,6 +153,10 @@ void App::reload_volume() {
   if (!err.empty()) {
     status_ = err;
     volume_ = Volume{};
+    // The CPU backend borrows volume_.data; it was just freed, so the backend
+    // must be re-pointed before it renders again.
+    volume_dirty_ = true;
+    needs_render_ = true;
     return;
   }
   // Iso level: start at the data midpoint when a *different quantity* is shown

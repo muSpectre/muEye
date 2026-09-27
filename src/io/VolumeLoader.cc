@@ -55,7 +55,8 @@ bool starts_with(const std::string &s, const char *prefix) {
  * for a single component, nb_comp == 1 and that component sits at c == 0.
  */
 struct RawField {
-  const double *src;
+  const double *src;    //!< double view, or null when the data is float
+  const float *src_f;   //!< float view (single-component direct reads), or null
   int nb_comp;
   std::ptrdiff_t sx, sy, sz, sc;
 };
@@ -175,16 +176,29 @@ std::string read_direct(const std::string &path, const FileMeta &meta,
     return "Unexpected layout of variable '" + field.name + "'.";
   }
 
-  // Typed read: netcdf converts the stored type (float, ...) to double.
+  // Typed read: netcdf converts the stored type on the fly. A single component
+  // is fetched as float straight away: the Volume is float anyway and the
+  // rounding is the same as converting the double later, so the result is
+  // bit-identical while the temporary buffer is half the size (0.5 GB instead
+  // of 1 GB at 512^3). Multi-component fetches stay double so the reductions
+  // (magnitude, von Mises, ...) are evaluated in double precision.
+  if (only_component >= 0) {
+    std::vector<float> buf(static_cast<std::size_t>(total));
+    status =
+        nc_get_vara_float(ncid, varid, start.data(), count.data(), buf.data());
+    nc_close(ncid);
+    if (status != NC_NOERR)
+      return std::string("nc_get_vara_float failed: ") + nc_strerror(status);
+    fn(RawField{nullptr, buf.data(), nb_comp, sx, sy, sz, sc});
+    return "";
+  }
   std::vector<double> buf(static_cast<std::size_t>(total));
   status =
       nc_get_vara_double(ncid, varid, start.data(), count.data(), buf.data());
   nc_close(ncid);
   if (status != NC_NOERR)
     return std::string("nc_get_vara_double failed: ") + nc_strerror(status);
-
-  // With component subsetting the buffer holds exactly one component.
-  fn(RawField{buf.data(), nb_comp, sx, sy, sz, sc});
+  fn(RawField{buf.data(), nullptr, nb_comp, sx, sy, sz, sc});
   return "";
 }
 
@@ -276,7 +290,7 @@ std::string read_mugrid(const std::string &path, const FileMeta &meta,
       src += c;
       nb_comp = 1;
     }
-    fn(RawField{src, nb_comp, sx, sy, sz, 1});
+    fn(RawField{src, nullptr, nb_comp, sx, sy, sz, 1});
 
     file.close();
     return "";
@@ -512,8 +526,12 @@ std::string VolumeLoader::load(const std::string &path, const FileMeta &meta,
   const bool one = mode == Scalarize::Component;
   const int only = one ? std::max(component, 0) : -1;
   auto fill = [&](const RawField &r) {
-    out.from_field(r.src, meta.nx, meta.ny, meta.nz, r.nb_comp, r.sx, r.sy,
-                   r.sz, mode, one ? 0 : component, r.sc);
+    if (r.src_f != nullptr)
+      out.from_field(r.src_f, meta.nx, meta.ny, meta.nz, r.nb_comp, r.sx, r.sy,
+                     r.sz, mode, one ? 0 : component, r.sc);
+    else
+      out.from_field(r.src, meta.nx, meta.ny, meta.nz, r.nb_comp, r.sx, r.sy,
+                     r.sz, mode, one ? 0 : component, r.sc);
   };
   return read_path == ReadPath::Direct
              ? read_direct(path, meta, field, frame, only, fill)
@@ -539,7 +557,7 @@ std::string VolumeLoader::load_displacement(const std::string &path,
   // nd times and, through muGrid, read every component each time.)
   std::string layout_err;
   auto scatter = [&](const RawField &r) {
-    if (r.nb_comp < nd) {
+    if (r.nb_comp < nd || r.src == nullptr) {
       layout_err = "Displacement field delivered fewer components than "
                    "expected.";
       return;

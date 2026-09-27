@@ -46,9 +46,10 @@ struct Volume {
   }
 
   /**
-   * Fill this volume from a raw muGrid field buffer.
+   * Fill this volume from a raw field buffer of doubles or floats (the
+   * reductions are computed in double either way).
    *
-   * @param src           pointer to the field's double data (host memory)
+   * @param src           pointer to the field's data (host memory)
    * @param nx,ny,nz      grid dimensions
    * @param nb_components number of components stored per voxel
    * @param stride_x/y/z  element strides between adjacent voxels along each axis
@@ -59,11 +60,21 @@ struct Volume {
    *                      muGrid's AoS layout (default), large for the planar
    *                      layout of a raw NetCDF hyperslab
    */
-  void from_field(const double *src, int nx, int ny, int nz, int nb_components,
+  template <class T>
+  void from_field(const T *src, int nx, int ny, int nz, int nb_components,
                   std::ptrdiff_t stride_x, std::ptrdiff_t stride_y,
                   std::ptrdiff_t stride_z, Scalarize mode, int component,
                   std::ptrdiff_t stride_c = 1);
 };
+
+extern template void Volume::from_field<double>(const double *, int, int, int,
+                                                int, std::ptrdiff_t,
+                                                std::ptrdiff_t, std::ptrdiff_t,
+                                                Scalarize, int, std::ptrdiff_t);
+extern template void Volume::from_field<float>(const float *, int, int, int, int,
+                                               std::ptrdiff_t, std::ptrdiff_t,
+                                               std::ptrdiff_t, Scalarize, int,
+                                               std::ptrdiff_t);
 
 /** A dense vector (displacement) field used for the deformed-geometry warp,
  *  stored as 4 floats per voxel (x, y, z, unused) column-major so it maps

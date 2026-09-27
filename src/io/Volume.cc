@@ -36,9 +36,10 @@ int tensor_dim(int nb_components) {
 namespace {
 
 // Reduce the nb_components values at one voxel (component stride sc) to a
-// scalar.
-double reduce(const double *base, int nb_components, Scalarize mode,
-              int component, std::ptrdiff_t sc) {
+// scalar. T is the storage type of the source buffer; arithmetic is double.
+template <class T>
+double reduce(const T *base, int nb_components, Scalarize mode, int component,
+              std::ptrdiff_t sc) {
   switch (mode) {
     case Scalarize::Component: {
       int c = component;
@@ -48,7 +49,10 @@ double reduce(const double *base, int nb_components, Scalarize mode,
     }
     case Scalarize::Magnitude: {
       double s = 0.0;
-      for (int c = 0; c < nb_components; ++c) s += base[c * sc] * base[c * sc];
+      for (int c = 0; c < nb_components; ++c) {
+        double x = base[c * sc];  // promote before squaring (T may be float)
+        s += x * x;
+      }
       return std::sqrt(s);
     }
     case Scalarize::Trace: {
@@ -91,7 +95,10 @@ double reduce(const double *base, int nb_components, Scalarize mode,
       }
       // Not a square tensor: fall back to the magnitude.
       double s = 0.0;
-      for (int c = 0; c < nb_components; ++c) s += base[c * sc] * base[c * sc];
+      for (int c = 0; c < nb_components; ++c) {
+        double x = base[c * sc];
+        s += x * x;
+      }
       return std::sqrt(s);
     }
   }
@@ -100,7 +107,8 @@ double reduce(const double *base, int nb_components, Scalarize mode,
 
 }  // namespace
 
-void Volume::from_field(const double *src, int nx_, int ny_, int nz_,
+template <class T>
+void Volume::from_field(const T *src, int nx_, int ny_, int nz_,
                         int nb_components, std::ptrdiff_t stride_x,
                         std::ptrdiff_t stride_y, std::ptrdiff_t stride_z,
                         Scalarize mode, int component,
@@ -117,8 +125,7 @@ void Volume::from_field(const double *src, int nx_, int ny_, int nz_,
   for (int k = 0; k < nz; ++k) {
     for (int j = 0; j < ny; ++j) {
       for (int i = 0; i < nx; ++i) {
-        const double *base =
-            src + i * stride_x + j * stride_y + k * stride_z;
+        const T *base = src + i * stride_x + j * stride_y + k * stride_z;
         double v = reduce(base, nb_components, mode, component, stride_c);
         // NaN/Inf never enter the range: they would poison the LUT lookup
         // (an (int) cast of NaN is undefined) and the final 8-bit conversion.
@@ -151,5 +158,14 @@ void Volume::from_field(const double *src, int nx_, int ny_, int nz_,
       if (!std::isfinite(f)) f = vmin;
   }
 }
+
+template void Volume::from_field<double>(const double *, int, int, int, int,
+                                         std::ptrdiff_t, std::ptrdiff_t,
+                                         std::ptrdiff_t, Scalarize, int,
+                                         std::ptrdiff_t);
+template void Volume::from_field<float>(const float *, int, int, int, int,
+                                        std::ptrdiff_t, std::ptrdiff_t,
+                                        std::ptrdiff_t, Scalarize, int,
+                                        std::ptrdiff_t);
 
 }  // namespace mueye

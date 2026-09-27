@@ -461,9 +461,13 @@ void App::draw_ui() {
                   last_render_h_, last_downscale_);
     else
       ImGui::Text("Render: %d x %d", last_render_w_, last_render_h_);
-    ImGui::Text("Frame time: %.2f ms (%.1f fps)", last_render_ms_,
-                last_render_ms_ > 0 ? 1000.0 / last_render_ms_ : 0.0);
-    ImGui::Text("UI: %.1f fps", ImGui::GetIO().Framerate);
+    // Rendering is on demand, so a "frame rate" derived from one render would
+    // mislead; report the durations instead. The UI refresh rate is throttled
+    // to a few Hz when idle by design.
+    ImGui::Text("Render time: %.2f ms", last_render_ms_);
+    ImGui::Text("Load time: %.1f ms", last_load_ms_);
+    ImGui::TextDisabled("UI refresh: %.0f Hz (throttled when idle)",
+                        ImGui::GetIO().Framerate);
   }
   ImGui::End();
 

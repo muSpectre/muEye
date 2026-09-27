@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
+#include <functional>
 
 // muGrid headers (resolved via the muGrid target's build-interface include dirs)
 #include "collection/field_collection.hh"
@@ -46,6 +47,21 @@ bool starts_with(const std::string &s, const char *prefix) {
 }
 
 /**
+ * One frame of a field as a strided view of doubles, as delivered by either
+ * reader. Only valid inside the callback that receives it (the storage is
+ * released when the reader returns). `src` points at the first addressable
+ * component of voxel (0,0,0); voxel (i,j,k) component c is at
+ * src[i*sx + j*sy + k*sz + c*sc] for 0 <= c < nb_comp. When a reader was asked
+ * for a single component, nb_comp == 1 and that component sits at c == 0.
+ */
+struct RawField {
+  const double *src;
+  int nb_comp;
+  std::ptrdiff_t sx, sy, sz, sc;
+};
+using RawFieldFn = std::function<void(const RawField &)>;
+
+/**
  * Read one frame of @p field straight through the netcdf-c API, bypassing
  * muGrid (ReadPath::Direct). Required for variables not stored as NC_DOUBLE:
  * muGrid's read path (serial nc_get_varm) transfers raw bytes into its Real
@@ -57,13 +73,14 @@ bool starts_with(const std::string &s, const char *prefix) {
  * The hyperslab is fetched in the file's row-major dimension order
  * (frame, [tensor_dim...], [subpt], nx, ny, nz) — muGrid writes with an imap,
  * so the nx/ny/nz axes in the file are the true x/y/z axes — and handed to
- * Volume::from_field with the matching per-axis and per-component strides.
- * Only sub-point 0 is read, like the muGrid path renders; in Component mode
- * only the selected component is fetched.
+ * @p fn as a RawField with the matching per-axis and per-component strides.
+ * Only sub-point 0 is read, like the muGrid path renders. With
+ * @p only_component >= 0 just that component is fetched (1/9th of the bytes
+ * for a 3x3 tensor field); -1 fetches all of them.
  */
-std::string load_via_netcdf(const std::string &path, const FileMeta &meta,
-                            const FieldInfo &field, int frame, Scalarize mode,
-                            int component, Volume &out) {
+std::string read_direct(const std::string &path, const FileMeta &meta,
+                        const FieldInfo &field, int frame, int only_component,
+                        const RawFieldFn &fn) {
   int ncid = -1;
   int status = nc_open(path.c_str(), NC_NOWRITE, &ncid);
   if (status != NC_NOERR)
@@ -108,16 +125,14 @@ std::string load_via_netcdf(const std::string &path, const FileMeta &meta,
     count[d] = dim_len(ncid, did);
   }
 
-  // In Component mode fetch only the selected component — 1/9th of the bytes
-  // for a 3x3 tensor field. The other reductions need every component. The
-  // flat component index nests row-major across the (adjacent) tensor axes,
-  // so it decomposes fastest-axis-first from the back.
-  const bool one_component = mode == Scalarize::Component;
-  if (one_component) {
+  // Single-component fetch: the flat component index nests row-major across
+  // the (adjacent) tensor axes, so it decomposes fastest-axis-first from the
+  // back.
+  if (only_component >= 0) {
     std::ptrdiff_t total_comp = 1;
     for (int d = 0; d < ndims; ++d)
       if (is_comp[d]) total_comp *= static_cast<std::ptrdiff_t>(count[d]);
-    std::ptrdiff_t rem = component < 0 ? 0 : component;
+    std::ptrdiff_t rem = only_component;
     if (rem >= total_comp) rem = total_comp - 1;
     for (int d = ndims - 1; d >= 0; --d) {
       if (!is_comp[d]) continue;
@@ -169,9 +184,107 @@ std::string load_via_netcdf(const std::string &path, const FileMeta &meta,
     return std::string("nc_get_vara_double failed: ") + nc_strerror(status);
 
   // With component subsetting the buffer holds exactly one component.
-  out.from_field(buf.data(), meta.nx, meta.ny, meta.nz, nb_comp, sx, sy, sz,
-                 mode, one_component ? 0 : component, sc);
+  fn(RawField{buf.data(), nb_comp, sx, sy, sz, sc});
   return "";
+}
+
+/**
+ * Read one frame of @p field through muGrid::FileIONetCDF into a temporary
+ * GlobalFieldCollection (ReadPath::MuGrid) and hand it to @p fn as a
+ * RawField. muGrid always reads every component (AoS: component stride 1);
+ * with @p only_component >= 0 the view is offset to that component and
+ * reports nb_comp == 1, so callers see the same shape from both readers.
+ */
+std::string read_mugrid(const std::string &path, const FileMeta &meta,
+                        const FieldInfo &field, int frame, int only_component,
+                        const RawFieldFn &fn) {
+  if (!field.is_double) {
+    return "Variable '" + field.name +
+           "' is not stored as double; muGrid cannot read it (use the direct "
+           "reader).";
+  }
+  try {
+    // Build a field collection matching the file's spatial dimension. A genuine
+    // 2D file (no nz axis) must be read through a 2D collection; a 3D file (or
+    // one we treat as 3D) carries all three axes.
+    std::vector<muGrid::Index_t> dims =
+        meta.spatial_dim == 2 ? std::vector<muGrid::Index_t>{meta.nx, meta.ny}
+                              : std::vector<muGrid::Index_t>{meta.nx, meta.ny,
+                                                             meta.nz};
+
+    muGrid::DynGridIndex domain(dims);
+    muGrid::DynGridIndex locations(static_cast<muGrid::Dim_t>(dims.size()),
+                                   muGrid::Index_t{0});
+
+    muGrid::GlobalFieldCollection::SubPtMap_t sub_pts;
+    std::string tag = field.sub_tag;
+    if (field.nb_sub_pts > 1 && !tag.empty()) {
+      sub_pts[tag] = field.nb_sub_pts;
+    }
+
+    muGrid::GlobalFieldCollection fc(domain, domain, locations, sub_pts);
+
+    const std::string sub_division =
+        (field.nb_sub_pts > 1 && !tag.empty()) ? tag : muGrid::PixelTag;
+    // muGrid derives the expected NetCDF dimensions from the field's component
+    // shape. A field stored with a tensor_dim__ axis must be registered with a
+    // matching component count; a true scalar (no tensor_dim in the file, e.g.
+    // muFFTTO's 'density') must be registered with an EMPTY component shape, or
+    // muGrid demands a nonexistent tensor_dim__<name>-0 axis and the read fails.
+    if (field.has_tensor_dim) {
+      fc.register_real_field(field.name, field.nb_components, sub_division);
+    } else {
+      fc.register_real_field(field.name, muGrid::Shape_t{}, sub_division);
+    }
+
+    muGrid::FileIONetCDF file(path, muGrid::FileIOBase::OpenMode::Read);
+    file.register_field_collection(fc);
+    file.read(frame, {field.name});
+
+    muGrid::Field &f = fc.get_field(field.name);
+    const double *src =
+        static_cast<const double *>(f.get_void_data_ptr());
+    if (src == nullptr) {
+      file.close();
+      return "Field data pointer is null (is the field on device memory?).";
+    }
+
+    // The last `spatial_dim` entries of the pixel strides are the per-voxel
+    // strides for the x, y (, z) axes (already scaled by nb_dof_per_pixel in
+    // muGrid's AoS layout). A 2D field has no z stride; nz==1 so z never varies.
+    muGrid::Shape_t strides = f.get_strides(muGrid::IterUnit::Pixel);
+    if (strides.size() < static_cast<std::size_t>(meta.spatial_dim)) {
+      file.close();
+      return "Unexpected field stride layout (fewer strides than spatial dims).";
+    }
+    std::ptrdiff_t sx, sy, sz;
+    if (meta.spatial_dim == 2) {
+      sx = strides[strides.size() - 2];
+      sy = strides[strides.size() - 1];
+      sz = 0;
+    } else {
+      sx = strides[strides.size() - 3];
+      sy = strides[strides.size() - 2];
+      sz = strides[strides.size() - 1];
+    }
+
+    int nb_comp = static_cast<int>(f.get_nb_components());
+    if (only_component >= 0) {
+      // AoS: the components of one voxel are contiguous, so offsetting the
+      // base pointer selects the component (clamped like Volume::from_field).
+      int c = std::min(only_component, nb_comp - 1);
+      src += c;
+      nb_comp = 1;
+    }
+    fn(RawField{src, nb_comp, sx, sy, sz, 1});
+
+    file.close();
+    return "";
+  } catch (const std::exception &e) {
+    return std::string("muGrid read failed: ") + e.what();
+  } catch (...) {
+    return "muGrid read failed: unknown error.";
+  }
 }
 
 }  // namespace
@@ -394,90 +507,17 @@ std::string VolumeLoader::load(const std::string &path, const FileMeta &meta,
                     ? ReadPath::Direct
                     : ReadPath::MuGrid;
   }
-  if (read_path == ReadPath::Direct) {
-    return load_via_netcdf(path, meta, field, frame, mode, component, out);
-  }
-  if (!field.is_double) {
-    return "Variable '" + field.name +
-           "' is not stored as double; muGrid cannot read it (use the direct "
-           "reader).";
-  }
-  try {
-    // Build a field collection matching the file's spatial dimension. A genuine
-    // 2D file (no nz axis) must be read through a 2D collection; a 3D file (or
-    // one we treat as 3D) carries all three axes.
-    std::vector<muGrid::Index_t> dims =
-        meta.spatial_dim == 2 ? std::vector<muGrid::Index_t>{meta.nx, meta.ny}
-                              : std::vector<muGrid::Index_t>{meta.nx, meta.ny,
-                                                             meta.nz};
-
-    muGrid::DynGridIndex domain(dims);
-    muGrid::DynGridIndex locations(static_cast<muGrid::Dim_t>(dims.size()),
-                                   muGrid::Index_t{0});
-
-    muGrid::GlobalFieldCollection::SubPtMap_t sub_pts;
-    std::string tag = field.sub_tag;
-    if (field.nb_sub_pts > 1 && !tag.empty()) {
-      sub_pts[tag] = field.nb_sub_pts;
-    }
-
-    muGrid::GlobalFieldCollection fc(domain, domain, locations, sub_pts);
-
-    const std::string sub_division =
-        (field.nb_sub_pts > 1 && !tag.empty()) ? tag : muGrid::PixelTag;
-    // muGrid derives the expected NetCDF dimensions from the field's component
-    // shape. A field stored with a tensor_dim__ axis must be registered with a
-    // matching component count; a true scalar (no tensor_dim in the file, e.g.
-    // muFFTTO's 'density') must be registered with an EMPTY component shape, or
-    // muGrid demands a nonexistent tensor_dim__<name>-0 axis and the read fails.
-    if (field.has_tensor_dim) {
-      fc.register_real_field(field.name, field.nb_components, sub_division);
-    } else {
-      fc.register_real_field(field.name, muGrid::Shape_t{}, sub_division);
-    }
-
-    muGrid::FileIONetCDF file(path, muGrid::FileIOBase::OpenMode::Read);
-    file.register_field_collection(fc);
-    file.read(frame, {field.name});
-
-    muGrid::Field &f = fc.get_field(field.name);
-    const double *src =
-        static_cast<const double *>(f.get_void_data_ptr());
-    if (src == nullptr) {
-      file.close();
-      return "Field data pointer is null (is the field on device memory?).";
-    }
-
-    // The last `spatial_dim` entries of the pixel strides are the per-voxel
-    // strides for the x, y (, z) axes (already scaled by nb_dof_per_pixel in
-    // muGrid's AoS layout). A 2D field has no z stride; nz==1 so z never varies.
-    muGrid::Shape_t strides = f.get_strides(muGrid::IterUnit::Pixel);
-    if (strides.size() < static_cast<std::size_t>(meta.spatial_dim)) {
-      file.close();
-      return "Unexpected field stride layout (fewer strides than spatial dims).";
-    }
-    std::ptrdiff_t sx, sy, sz;
-    if (meta.spatial_dim == 2) {
-      sx = strides[strides.size() - 2];
-      sy = strides[strides.size() - 1];
-      sz = 0;
-    } else {
-      sx = strides[strides.size() - 3];
-      sy = strides[strides.size() - 2];
-      sz = strides[strides.size() - 1];
-    }
-
-    int nb_comp = static_cast<int>(f.get_nb_components());
-    out.from_field(src, meta.nx, meta.ny, meta.nz, nb_comp, sx, sy, sz, mode,
-                   component);
-
-    file.close();
-    return "";
-  } catch (const std::exception &e) {
-    return std::string("muGrid read failed: ") + e.what();
-  } catch (...) {
-    return "muGrid read failed: unknown error.";
-  }
+  // In Component mode both readers deliver only the selected component, at
+  // index 0 of the view; the other reductions need every component.
+  const bool one = mode == Scalarize::Component;
+  const int only = one ? std::max(component, 0) : -1;
+  auto fill = [&](const RawField &r) {
+    out.from_field(r.src, meta.nx, meta.ny, meta.nz, r.nb_comp, r.sx, r.sy,
+                   r.sz, mode, one ? 0 : component, r.sc);
+  };
+  return read_path == ReadPath::Direct
+             ? read_direct(path, meta, field, frame, only, fill)
+             : read_mugrid(path, meta, field, frame, only, fill);
 }
 
 std::string VolumeLoader::load_displacement(const std::string &path,
@@ -494,17 +534,33 @@ std::string VolumeLoader::load_displacement(const std::string &path,
   const std::size_t n = out.size();
   out.data.assign(n * 4, 0.0f);  // (x, y, z, unused); z stays 0 in 2D
 
-  // Read each spatial component through the ordinary scalar path (which already
-  // handles the muGrid/netcdf and 2D/3D cases) and pack it into channel c.
-  for (int c = 0; c < nd; ++c) {
-    Volume comp;
-    std::string err =
-        load(path, meta, field, frame, Scalarize::Component, c, comp);
-    if (!err.empty()) return err;
-    if (comp.data.size() != n)
-      return "Displacement component size mismatch.";
-    for (std::size_t i = 0; i < n; ++i) out.data[i * 4 + c] = comp.data[i];
-  }
+  // One read of the whole field, then scatter the first nd components into
+  // the 4-float layout. (Reading per component would open and read the file
+  // nd times and, through muGrid, read every component each time.)
+  std::string layout_err;
+  auto scatter = [&](const RawField &r) {
+    if (r.nb_comp < nd) {
+      layout_err = "Displacement field delivered fewer components than "
+                   "expected.";
+      return;
+    }
+    const int nx = meta.nx, ny = meta.ny, nz = meta.nz;
+    for (int k = 0; k < nz; ++k)
+      for (int j = 0; j < ny; ++j)
+        for (int i = 0; i < nx; ++i) {
+          const double *base = r.src + i * r.sx + j * r.sy + k * r.sz;
+          std::size_t e =
+              (static_cast<std::size_t>(i) +
+               nx * (j + static_cast<std::size_t>(ny) * k)) * 4;
+          for (int c = 0; c < nd; ++c)
+            out.data[e + c] = static_cast<float>(base[c * r.sc]);
+        }
+  };
+  std::string err =
+      field.is_double ? read_mugrid(path, meta, field, frame, -1, scatter)
+                      : read_direct(path, meta, field, frame, -1, scatter);
+  if (!err.empty()) return err;
+  if (!layout_err.empty()) return layout_err;
 
   // Largest displacement magnitude, for the warp bounding-box margin.
   float mx = 0.0f;

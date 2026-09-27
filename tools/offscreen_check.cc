@@ -68,6 +68,15 @@ void write_demo(const std::string &path, int n) {
     for (std::size_t e = 0; e < nb_entries; ++e)
       s[e] = static_cast<double>(e);
   }
+  // A 3-component field (displacement-eligible in 3D) with every
+  // (voxel, component) value distinct, for the load_displacement cross-check.
+  muGrid::Field &u = fc.register_real_field("u", 3);
+  double *ud = static_cast<double *>(u.get_void_data_ptr());
+  {
+    std::size_t nb_entries = static_cast<std::size_t>(n) * n * n * 3;
+    for (std::size_t e = 0; e < nb_entries; ++e)
+      ud[e] = 0.001 * static_cast<double>(e) - 7.0;
+  }
 
   muGrid::FileIONetCDF file(path, muGrid::FileIOBase::OpenMode::Overwrite);
   file.register_field_collection(fc);
@@ -486,6 +495,54 @@ int check_file(const std::string &path, const char *ppm_out) {
     std::printf("field '%s': %d components + magnitude, direct vs muGrid "
                 "reads agree\n",
                 finfo.name.c_str(), finfo.nb_components);
+  }
+
+  // load_displacement() reads the whole vector field in one go and scatters
+  // the first spatial_dim components into its 4-float layout; that must equal
+  // the per-component Component-mode loads (for both readers).
+  for (const mueye::FieldInfo &finfo : meta.fields) {
+    if (finfo.nb_components != meta.spatial_dim) continue;
+    mueye::DisplacementField df;
+    std::string e = loader.load_displacement(path, meta, finfo, 0, df);
+    if (!e.empty() || df.size() != vol.size()) {
+      std::fprintf(stderr, "load_displacement('%s') failed: %s\n",
+                   finfo.name.c_str(), e.c_str());
+      return 1;
+    }
+    for (int c = 0; c < meta.spatial_dim; ++c) {
+      for (mueye::ReadPath rp : {mueye::ReadPath::MuGrid, mueye::ReadPath::Direct}) {
+        mueye::Volume vc;
+        std::string ec = loader.load(path, meta, finfo, 0,
+                                     mueye::Scalarize::Component, c, vc, rp);
+        if (!ec.empty()) {
+          std::fprintf(stderr, "component load failed: %s\n", ec.c_str());
+          return 1;
+        }
+        float max_diff = 0.0f;
+        for (std::size_t i = 0; i < vc.data.size(); ++i) {
+          float dv = std::fabs(vc.data[i] - df.data[i * 4 + c]);
+          if (dv > max_diff) max_diff = dv;
+        }
+        if (max_diff > 0.0f) {
+          std::fprintf(stderr,
+                       "load_displacement('%s') component %d disagrees with "
+                       "load() (max|Δ| = %g).\n",
+                       finfo.name.c_str(), c, double(max_diff));
+          return 1;
+        }
+      }
+    }
+    // The unused 4th channel (and z in 2D) must stay zero.
+    for (std::size_t i = 0; i < df.size(); ++i) {
+      if (df.data[i * 4 + 3] != 0.0f ||
+          (meta.spatial_dim == 2 && df.data[i * 4 + 2] != 0.0f)) {
+        std::fprintf(stderr, "load_displacement('%s') wrote unused channels.\n",
+                     finfo.name.c_str());
+        return 1;
+      }
+    }
+    std::printf("field '%s': load_displacement matches per-component loads\n",
+                finfo.name.c_str());
   }
 
   mueye::TransferFunction tf;

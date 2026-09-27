@@ -106,8 +106,10 @@ class VolumeLoader {
 
   /** Read (field, frame) as a displacement vector field: the first
    *  meta.spatial_dim components are packed into @p out (4 floats/voxel, z=0 in
-   *  2D). @p field must have at least spatial_dim components. Reuses load()
-   *  per component, so it handles the double/float and 2D/3D paths identically.
+   *  2D). @p field must have at least spatial_dim components. One read of the
+   *  whole field through the same readers load() uses (muGrid for double
+   *  variables, netcdf-c otherwise), so the double/float and 2D/3D cases are
+   *  handled identically.
    *  @returns empty string on success, otherwise an error message. */
   std::string load_displacement(const std::string &path, const FileMeta &meta,
                                 const FieldInfo &field, int frame,

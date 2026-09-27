@@ -303,6 +303,52 @@ int check_anisotropic() {
   return failures;
 }
 
+/**
+ * Scalarization of tensor fields: trace and von Mises for a 2x2 (2D) and a 3x3
+ * (3D) tensor, on a one-voxel "grid", against hand-computed values. The
+ * off-diagonal terms are deliberately asymmetric so the check also pins down
+ * that the reductions symmetrize them (and are thus independent of the
+ * row-/column-major flattening of the file).
+ * @returns 0 on success, non-zero on any failure.
+ */
+int check_reductions() {
+  std::printf("\n=== checking tensor reductions (2x2 and 3x3) ===\n");
+  int failures = 0;
+  auto expect = [&](const char *what, double got, double want) {
+    bool ok = std::fabs(got - want) <= 1e-5 * std::fmax(1.0, std::fabs(want));
+    std::printf("  %-22s = %-12.6g (expected %.6g) %s\n", what, got, want,
+                ok ? "ok" : "MISMATCH");
+    if (!ok) ++failures;
+  };
+  auto reduce1 = [](const double *comps, int nb, mueye::Scalarize mode) {
+    mueye::Volume v;
+    v.from_field(comps, 1, 1, 1, nb, 1, 1, 1, mode, 0);
+    return static_cast<double>(v.data[0]);
+  };
+  // 3x3, flat index r + 3c (column-major) or 3r + c (row-major); both give the
+  // same diagonal and the same off-diagonal pairs {1,3},{2,6},{5,7}.
+  const double t3[9] = {1.0, 0.5, 0.2, 0.1, 2.0, 0.4, 0.6, 0.0, 3.0};
+  expect("trace 3x3", reduce1(t3, 9, mueye::Scalarize::Trace), 6.0);
+  {
+    double sxy = 0.5 * (0.5 + 0.1), sxz = 0.5 * (0.2 + 0.6), syz = 0.5 * (0.4 + 0.0);
+    double j2 = 0.5 * (1.0 + 1.0 + 4.0) + 3.0 * (sxy * sxy + syz * syz + sxz * sxz);
+    expect("von Mises 3x3", reduce1(t3, 9, mueye::Scalarize::VonMises),
+           std::sqrt(j2));
+  }
+  // 2x2: diagonal at 0 and 3, off-diagonal pair {1,2}.
+  const double t2[4] = {2.0, 0.3, 0.1, -1.0};
+  expect("trace 2x2", reduce1(t2, 4, mueye::Scalarize::Trace), 1.0);
+  {
+    double sxy = 0.5 * (0.3 + 0.1);
+    double j2 = 4.0 - (2.0 * -1.0) + 1.0 + 3.0 * sxy * sxy;
+    expect("von Mises 2x2", reduce1(t2, 4, mueye::Scalarize::VonMises),
+           std::sqrt(j2));
+  }
+  expect("magnitude 2x2", reduce1(t2, 4, mueye::Scalarize::Magnitude),
+         std::sqrt(4.0 + 0.09 + 0.01 + 1.0));
+  return failures;
+}
+
 bool write_ppm(const std::string &path, const mueye::Framebuffer &fb) {
   std::FILE *f = std::fopen(path.c_str(), "wb");
   if (!f) return false;
@@ -773,6 +819,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (check_reductions() != 0) return 1;
   if (check_file(path, "offscreen.ppm") != 0) return 1;
   if (check_file(path2d, "offscreen_2d.ppm") != 0) return 1;
   if (check_anisotropic() != 0) return 1;

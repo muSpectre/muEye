@@ -20,11 +20,17 @@ const char *to_string(Scalarize s) {
     case Scalarize::Magnitude:
       return "Magnitude";
     case Scalarize::VonMises:
-      return "von Mises (3x3)";
+      return "von Mises (tensor)";
     case Scalarize::Trace:
-      return "Trace (3x3)";
+      return "Trace (tensor)";
   }
   return "?";
+}
+
+int tensor_dim(int nb_components) {
+  if (nb_components == 4) return 2;
+  if (nb_components == 9) return 3;
+  return 0;
 }
 
 namespace {
@@ -46,24 +52,44 @@ double reduce(const double *base, int nb_components, Scalarize mode,
       return std::sqrt(s);
     }
     case Scalarize::Trace: {
-      // Interpret the 9 components as a row-major 3x3 tensor: diag = 0,4,8.
-      if (nb_components >= 9) return base[0] + base[4 * sc] + base[8 * sc];
-      // Fallback: sum of available components.
+      // A d x d tensor (4 components in 2D, 9 in 3D) has its diagonal at flat
+      // index r*(d+1) whichever way (row- or column-major) it is flattened.
+      int d = tensor_dim(nb_components);
+      if (d > 0) {
+        double s = 0.0;
+        for (int r = 0; r < d; ++r) s += base[r * (d + 1) * sc];
+        return s;
+      }
+      // Not a square tensor: sum of available components.
       double s = 0.0;
       for (int c = 0; c < nb_components; ++c) s += base[c * sc];
       return s;
     }
     case Scalarize::VonMises: {
-      if (nb_components >= 9) {
-        // sigma indices (row-major 3x3): 0 1 2 / 3 4 5 / 6 7 8
+      int d = tensor_dim(nb_components);
+      if (d == 3) {
+        // Off-diagonals are symmetrized, 0.5*(m[r,c] + m[c,r]): for a stress
+        // tensor this is a no-op and it makes the result independent of
+        // whether the file flattens components row- or column-major (muGrid
+        // stores them column-major).
         double sxx = base[0], syy = base[4 * sc], szz = base[8 * sc];
-        double sxy = base[1 * sc], syz = base[5 * sc], sxz = base[2 * sc];
+        double sxy = 0.5 * (base[1 * sc] + base[3 * sc]);
+        double sxz = 0.5 * (base[2 * sc] + base[6 * sc]);
+        double syz = 0.5 * (base[5 * sc] + base[7 * sc]);
         double a = sxx - syy, b = syy - szz, c = szz - sxx;
         double j2 = 0.5 * (a * a + b * b + c * c) +
                     3.0 * (sxy * sxy + syz * syz + sxz * sxz);
         return std::sqrt(j2);
       }
-      // Fallback to magnitude for non-3x3 fields.
+      if (d == 2) {
+        // 2x2 in-plane tensor; the out-of-plane component is taken as zero
+        // (plane-stress convention): sqrt(sxx^2 - sxx*syy + syy^2 + 3 sxy^2).
+        double sxx = base[0], syy = base[3 * sc];
+        double sxy = 0.5 * (base[1 * sc] + base[2 * sc]);
+        double j2 = sxx * sxx - sxx * syy + syy * syy + 3.0 * sxy * sxy;
+        return std::sqrt(j2);
+      }
+      // Not a square tensor: fall back to the magnitude.
       double s = 0.0;
       for (int c = 0; c < nb_components; ++c) s += base[c * sc] * base[c * sc];
       return std::sqrt(s);

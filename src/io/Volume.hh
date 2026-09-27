@@ -21,11 +21,15 @@ namespace mueye {
 enum class Scalarize : int {
   Component = 0,  //!< pick one raw component
   Magnitude = 1,  //!< Euclidean norm over all components (vector magnitude)
-  VonMises = 2,   //!< von Mises equivalent of a 3x3 (9-component) tensor
-  Trace = 3       //!< trace of a 3x3 (9-component) tensor
+  VonMises = 2,   //!< von Mises equivalent of a 2x2 (4-comp.) or 3x3 (9-comp.) tensor
+  Trace = 3       //!< trace of a 2x2 (4-comp.) or 3x3 (9-comp.) tensor
 };
 
 const char *to_string(Scalarize s);
+
+/** Side length d of the square tensor a field with @p nb_components holds
+ *  (2 for 4 components, 3 for 9), or 0 if it is not a square tensor. */
+int tensor_dim(int nb_components);
 
 /** A dense scalar field on a regular grid, stored column-major
  *  (idx = i + nx*(j + ny*k)) in single precision. */

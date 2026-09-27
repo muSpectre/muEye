@@ -189,8 +189,8 @@ void App::draw_ui() {
                              static_cast<int>(names.size()));
 
       const FieldInfo &fi = meta_.fields[field_index_];
-      const char *modes[] = {"Component", "Magnitude", "von Mises (3x3)",
-                             "Trace (3x3)"};
+      const char *modes[] = {"Component", "Magnitude", "von Mises (tensor)",
+                             "Trace (tensor)"};
       int sm = static_cast<int>(scalarize_);
       if (ImGui::Combo("Scalar", &sm, modes, IM_ARRAYSIZE(modes))) {
         scalarize_ = static_cast<Scalarize>(sm);

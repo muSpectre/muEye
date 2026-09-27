@@ -136,6 +136,44 @@ void App::save_png_as() {
   save_png(p.string());
 }
 
+void App::handle_shortcuts() {
+  ImGuiIO &io = ImGui::GetIO();
+  // Typing into a text field or dragging a widget must not trigger them.
+  if (io.WantTextInput || ImGui::IsAnyItemActive()) return;
+  const bool ctrl = io.KeyCtrl || io.KeySuper;
+
+  if (ctrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) browse_for_file();
+  if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S, false) && !volume_.empty())
+    request_save_png(png_path_);
+  if (ctrl) return;  // the remaining keys are unmodified letters / arrows
+
+  if (has_file_ && meta_.nb_frames > 1) {
+    int f = frame_;
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) --f;
+    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) ++f;
+    if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) f = 0;
+    if (ImGui::IsKeyPressed(ImGuiKey_End, false)) f = meta_.nb_frames - 1;
+    f = std::clamp(f, 0, meta_.nb_frames - 1);
+    if (f != frame_) {
+      frame_ = f;
+      sync_frame_deformation();
+      reload_volume();
+    }
+  }
+  if (ImGui::IsKeyPressed(ImGuiKey_R, false) && !volume_.empty())
+    frame_view(true);
+  if (ImGui::IsKeyPressed(ImGuiKey_B, false)) show_box_ = !show_box_;
+  if (ImGui::IsKeyPressed(ImGuiKey_P, false)) {
+    periodic_ = !periodic_;
+    if (!volume_.empty()) frame_view(false);
+    needs_render_ = true;
+  }
+  if (ImGui::IsKeyPressed(ImGuiKey_I, false)) {
+    mode_ = mode_ == RenderMode::DVR ? RenderMode::Isosurface : RenderMode::DVR;
+    needs_render_ = true;
+  }
+}
+
 // Arrange the panels into a default layout: a left control column (grouped into
 // three stacked tab-nodes) and a large viewport filling the rest. Called once
 // when there is no docking layout yet, so a saved imgui.ini still wins.
@@ -186,6 +224,8 @@ void App::draw_ui() {
       build_default_layout(dockspace_id);
     }
   }
+
+  handle_shortcuts();
 
   // ----------------------------------------------------------------- Dataset
   // File loader on top, then (once a file is open) the field / frame / scalar
@@ -631,6 +671,16 @@ void App::draw_ui() {
     ImGui::Text("Load time: %.1f ms", last_load_ms_);
     ImGui::TextDisabled("UI refresh: %.0f Hz (throttled when idle)",
                         ImGui::GetIO().Framerate);
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Keyboard shortcuts")) {
+      ImGui::BulletText("Left / Right, Home / End: previous / next, first / "
+                        "last frame");
+      ImGui::BulletText("R: reset view    B: box outline    P: periodic "
+                        "images    I: DVR / isosurface");
+      ImGui::BulletText("Ctrl+O: open file    Ctrl+S: save PNG");
+      ImGui::BulletText("Mouse: left-drag orbit, right/middle-drag pan, "
+                        "wheel zoom; drop a file to open it");
+    }
   }
   ImGui::End();
 

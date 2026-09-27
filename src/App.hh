@@ -109,6 +109,10 @@ class App {
   /** "Browse..." / Ctrl+O: native open dialog, then open_path(). */
   void browse_for_file();
 
+  /** Global keyboard shortcuts (ignored while a text field has focus or a
+   *  widget is being dragged); called once per frame from draw_ui(). */
+  void handle_shortcuts();
+
   VolumeLoader loader_;
   FileMeta meta_;
   Volume volume_;

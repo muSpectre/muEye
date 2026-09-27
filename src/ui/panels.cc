@@ -233,6 +233,14 @@ void App::draw_ui() {
                        static_cast<int>(disp_names.size()))) {
         disp_field_index_ = disp_map[disp_cur];
         reload_displacement();
+        // Warping switches tiling off (and back on when deselected), so the
+        // framed extent changes: recentre without touching the view angles.
+        if (periodic_ && !volume_.empty()) {
+          Vec3 center;
+          float extent;
+          cell_bounds(center, extent);
+          camera_.retarget_aabb(center, extent);
+        }
       }
       if (disp_field_index_ >= 0) {
         if (ImGui::DragFloat("Warp scale", &warp_scale_, 0.05f, 0.0f, 1.0e6f,

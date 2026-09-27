@@ -308,14 +308,14 @@ RenderParams App::make_render_params() const {
   p.bg = Vec3{bg_[0], bg_[1], bg_[2]};
 
   // Deformed-geometry warp. Active only when a displacement field is loaded.
-  const bool warp = disp_field_index_ >= 0 && !disp_.empty();
+  // Periodic tiling is unsupported while warping (the deformed body no longer
+  // tiles trivially); rep() already returns 1 per axis in that case, for the
+  // render, the box overlay and the camera framing alike.
+  const bool warp = warping();
   p.warp_enabled = warp ? 1 : 0;
   p.warp_scale = warp_scale_;
   p.warp_iters = warp_iters_;
   if (warp) {
-    // Periodic tiling is unsupported while warping (the deformed body no longer
-    // tiles trivially); render a single cell.
-    p.rep_x = p.rep_y = p.rep_z = 1;
     // World AABB of the deformed body: the single-cell parallelepiped expanded
     // by the largest world-space displacement on every side.
     Mat3 C = world_cell();

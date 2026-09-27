@@ -130,9 +130,17 @@ class App {
   bool periodic_{false};  //!< tile the volume periodically
   int replicas_[3] = {2, 2, 2};  //!< replicas per axis while periodic_ is on
 
-  /** Replica count actually applied along @p axis (1 unless periodic tiling
-   *  is enabled). */
-  int rep(int axis) const { return periodic_ ? replicas_[axis] : 1; }
+  /** True while the deformed-geometry warp is active (a displacement field is
+   *  selected and loaded). */
+  bool warping() const { return disp_field_index_ >= 0 && !disp_.empty(); }
+
+  /** Replica count actually applied along @p axis: 1 unless periodic tiling is
+   *  enabled, and always 1 while warping (the deformed body does not tile).
+   *  The single source of truth for the render params, the box overlay and
+   *  the camera framing, so they cannot disagree. */
+  int rep(int axis) const {
+    return (periodic_ && !warping()) ? replicas_[axis] : 1;
+  }
 
   // --- renderer / output ----------------------------------------------
   std::unique_ptr<Renderer> renderer_;

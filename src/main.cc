@@ -172,6 +172,17 @@ int main(int argc, char **argv) {
   // current — i.e. before the ImGui/GLFW teardown below destroys it.
   {
     mueye::App app;
+    // Dropping a file onto the window opens it (the first path of a
+    // multi-file drop). The callback runs from glfwPollEvents /
+    // glfwWaitEventsTimeout, i.e. between ImGui frames, so loading there is
+    // safe.
+    glfwSetWindowUserPointer(window, &app);
+    glfwSetDropCallback(window, [](GLFWwindow *w, int count,
+                                   const char **paths) {
+      if (count <= 0 || paths == nullptr || paths[0] == nullptr) return;
+      auto *a = static_cast<mueye::App *>(glfwGetWindowUserPointer(w));
+      if (a != nullptr) a->load_file(paths[0]);
+    });
     if (argc > 1) {
       app.load_file(argv[1]);
     }
@@ -216,6 +227,10 @@ int main(int argc, char **argv) {
 
       glfwSwapBuffers(window);
     }
+    // The drop callback holds the App by pointer; detach it before the App
+    // is destroyed at the end of this scope.
+    glfwSetDropCallback(window, nullptr);
+    glfwSetWindowUserPointer(window, nullptr);
   }
 
   ImGui_ImplOpenGL3_Shutdown();

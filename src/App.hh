@@ -102,7 +102,13 @@ class App {
 
   // --- UI / selection state -------------------------------------------
   std::string path_buf_;
+  //! Transient message (last action's result or error), shown in the status
+  //! bar at the bottom of the window.
   std::string status_ = "Open a muGrid NetCDF (.nc) file to begin.";
+  //! Persistent description of the loaded volume ("Field 'x' frame n, range
+  //! [..]"), shown in the Dataset panel; unlike status_ it is never replaced
+  //! by unrelated messages such as "Saved foo.png".
+  std::string info_;
   char path_edit_[1024] = {0};          //!< File-panel path input buffer
   char png_path_[1024] = "mueye.png";   //!< Render-panel PNG file name buffer
   bool layout_initialized_{false};      //!< default docking layout built once

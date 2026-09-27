@@ -63,6 +63,12 @@ static void build_default_layout(ImGuiID dockspace_id) {
   ImGui::DockBuilderSetNodeSize(dockspace_id, ImGui::GetMainViewport()->Size);
 
   ImGuiID center = dockspace_id;
+  // A slim status bar across the bottom (no tab bar, so it reads as a bar).
+  ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.04f,
+                                               nullptr, &center);
+  if (ImGuiDockNode *bn = ImGui::DockBuilderGetNode(bottom))
+    bn->LocalFlags |= ImGuiDockNodeFlags_NoTabBar |
+                      ImGuiDockNodeFlags_NoDockingOverMe;
   ImGuiID left = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.26f,
                                              nullptr, &center);
   ImGuiID left_rest = left;
@@ -79,6 +85,7 @@ static void build_default_layout(ImGuiID dockspace_id) {
   ImGui::DockBuilderDockWindow("Device", left_bot);
   ImGui::DockBuilderDockWindow("Stats", left_bot);
   ImGui::DockBuilderDockWindow("Viewport", center);
+  ImGui::DockBuilderDockWindow("Status", bottom);
   ImGui::DockBuilderFinish(dockspace_id);
 }
 
@@ -147,10 +154,8 @@ void App::draw_ui() {
       }
     }
     ImGui::EndDisabled();
-    // Only surface load errors / not-yet-loaded here; the loaded dataset's info
-    // line lives next to the field controls below.
-    if (!has_file_ && !status_.empty())
-      ImGui::TextWrapped("%s", status_.c_str());
+    // Errors and action results go to the status bar; this panel only shows
+    // the persistent description of what is loaded.
 
     if (has_file_ && !meta_.fields.empty()) {
       ImGui::Separator();
@@ -180,8 +185,9 @@ void App::draw_ui() {
       }
 
       // Dataset info string ("Field '<name>' frame ...") just before the field
-      // selector.
-      ImGui::TextWrapped("%s", status_.c_str());
+      // selector. Persistent: unlike the status bar it is never overwritten
+      // by "Saved foo.png" and the like.
+      ImGui::TextWrapped("%s", info_.c_str());
 
       std::vector<const char *> names;
       names.reserve(meta_.fields.size());
@@ -461,6 +467,26 @@ void App::draw_ui() {
     ImGui::Text("UI: %.1f fps", ImGui::GetIO().Framerate);
   }
   ImGui::End();
+
+  // -------------------------------------------------------------- Status
+  // One-line message bar: the result of the last action (load, save, backend
+  // switch) or the last error, plus the active renderer on the right.
+  {
+    ImGui::Begin("Status", nullptr,
+                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoCollapse);
+    const char *backend = renderer_ ? renderer_->name() : "-";
+    float right_w = ImGui::CalcTextSize(backend).x;
+    float avail = ImGui::GetContentRegionAvail().x;
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + avail - right_w -
+                           ImGui::GetStyle().ItemSpacing.x * 2);
+    ImGui::TextUnformatted(status_.c_str());
+    ImGui::PopTextWrapPos();
+    if (ImGui::IsItemHovered() && !status_.empty())
+      ImGui::SetTooltip("%s", status_.c_str());
+    ImGui::SameLine(avail - right_w);
+    ImGui::TextDisabled("%s", backend);
+    ImGui::End();
+  }
 
   // ------------------------------------------------------------ Viewport
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));

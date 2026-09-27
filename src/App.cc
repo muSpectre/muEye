@@ -56,8 +56,7 @@ App::App() {
     current_backend_ = Backend::CPU;
   }
 
-  status_ = std::string("Renderer: ") + renderer_->name() +
-            "  —  open a muGrid NetCDF (.nc) file to begin.";
+  status_ = "Open a muGrid NetCDF (.nc) file to begin.";
 }
 
 void App::set_backend(Backend backend) {
@@ -75,7 +74,7 @@ void App::set_backend(Backend backend) {
   tf_dirty_ = true;
   disp_dirty_ = true;  // the new backend has no displacement uploaded yet
   needs_render_ = true;
-  status_ = std::string("Renderer: ") + renderer_->name();
+  status_ = std::string("Switched to the ") + renderer_->name() + " backend.";
 }
 
 void App::open_path(const std::string &path) {
@@ -164,6 +163,7 @@ void App::reload_volume() {
                       .count();
   if (!err.empty()) {
     status_ = err;
+    info_ = "(load failed)";
     volume_ = Volume{};
     // The CPU backend borrows volume_.data; it was just freed, so the backend
     // must be re-pointed before it renders again.
@@ -183,12 +183,12 @@ void App::reload_volume() {
   }
   loaded_field_ = field_index_;
   loaded_scalarize_ = scalarize_;
-  status_ = "Field '" + fi.name + "' frame " + std::to_string(frame_) +
-            "  range [" + std::to_string(volume_.vmin) + ", " +
-            std::to_string(volume_.vmax) + "]";
+  info_ = "Field '" + fi.name + "' frame " + std::to_string(frame_) +
+          "  range [" + std::to_string(volume_.vmin) + ", " +
+          std::to_string(volume_.vmax) + "]";
   if (volume_.nb_nonfinite > 0)
-    status_ += "  (" + std::to_string(volume_.nb_nonfinite) +
-               " NaN/Inf voxel(s) shown as the minimum)";
+    info_ += "  (" + std::to_string(volume_.nb_nonfinite) +
+             " NaN/Inf voxel(s) shown as the minimum)";
   volume_dirty_ = true;  // backend must re-upload the new volume
   needs_render_ = true;
 

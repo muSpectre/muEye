@@ -97,6 +97,7 @@ void App::open_path(const std::string &path) {
     std::snprintf(png_path_, sizeof(png_path_), "%s", png.string().c_str());
   }
   field_index_ = default_field_index(meta_.fields);
+  loaded_field_ = -1;  // a new file always re-derives the default iso level
   frame_ = 0;
   component_ = 0;
   // Start undeformed: no displacement field selected until the user picks one.
@@ -150,8 +151,18 @@ void App::reload_volume() {
     volume_ = Volume{};
     return;
   }
-  // Sensible default iso value at the data midpoint on (re)load.
-  iso_value_ = 0.5f * (volume_.vmin + volume_.vmax);
+  // Iso level: start at the data midpoint when a *different quantity* is shown
+  // (new field or scalarization); otherwise keep the user's level across frame
+  // and component changes, clamping it into the new range so scrubbing the
+  // frame slider does not silently discard a hand-tuned isosurface.
+  const bool new_quantity =
+      field_index_ != loaded_field_ || scalarize_ != loaded_scalarize_;
+  if (new_quantity || !(iso_value_ >= volume_.vmin && iso_value_ <= volume_.vmax)) {
+    iso_value_ = new_quantity ? 0.5f * (volume_.vmin + volume_.vmax)
+                              : std::clamp(iso_value_, volume_.vmin, volume_.vmax);
+  }
+  loaded_field_ = field_index_;
+  loaded_scalarize_ = scalarize_;
   status_ = "Field '" + fi.name + "' frame " + std::to_string(frame_) +
             "  range [" + std::to_string(volume_.vmin) + ", " +
             std::to_string(volume_.vmax) + "]";

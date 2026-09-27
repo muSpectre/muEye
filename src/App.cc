@@ -175,6 +175,9 @@ void App::reload_volume() {
   status_ = "Field '" + fi.name + "' frame " + std::to_string(frame_) +
             "  range [" + std::to_string(volume_.vmin) + ", " +
             std::to_string(volume_.vmax) + "]";
+  if (volume_.nb_nonfinite > 0)
+    status_ += "  (" + std::to_string(volume_.nb_nonfinite) +
+               " NaN/Inf voxel(s) shown as the minimum)";
   volume_dirty_ = true;  // backend must re-upload the new volume
   needs_render_ = true;
 

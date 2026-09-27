@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -346,6 +347,20 @@ int check_reductions() {
   }
   expect("magnitude 2x2", reduce1(t2, 4, mueye::Scalarize::Magnitude),
          std::sqrt(4.0 + 0.09 + 0.01 + 1.0));
+
+  // Non-finite voxels: excluded from the range, replaced by vmin, counted.
+  {
+    const double nanv = std::numeric_limits<double>::quiet_NaN();
+    const double infv = std::numeric_limits<double>::infinity();
+    const double vals[4] = {2.0, nanv, -1.0, infv};
+    mueye::Volume v;
+    v.from_field(vals, 4, 1, 1, 1, 1, 4, 4, mueye::Scalarize::Component, 0);
+    expect("nan: vmin", v.vmin, -1.0);
+    expect("nan: vmax", v.vmax, 2.0);
+    expect("nan: count", static_cast<double>(v.nb_nonfinite), 2.0);
+    expect("nan: replaced[1]", v.data[1], -1.0);
+    expect("nan: replaced[3]", v.data[3], -1.0);
+  }
   return failures;
 }
 

@@ -36,7 +36,8 @@ int tensor_dim(int nb_components);
  *  (idx = i + nx*(j + ny*k)) in single precision. */
 struct Volume {
   int nx{0}, ny{0}, nz{0};
-  float vmin{0.0f}, vmax{1.0f};
+  float vmin{0.0f}, vmax{1.0f};  //!< range over the *finite* voxels
+  std::size_t nb_nonfinite{0};   //!< NaN/Inf voxels found (replaced by vmin)
   std::vector<float> data;
 
   bool empty() const { return data.empty(); }

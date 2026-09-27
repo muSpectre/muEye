@@ -112,6 +112,7 @@ void Volume::from_field(const double *src, int nx_, int ny_, int nz_,
 
   double lo = std::numeric_limits<double>::infinity();
   double hi = -std::numeric_limits<double>::infinity();
+  std::size_t nb_bad = 0;
 
   for (int k = 0; k < nz; ++k) {
     for (int j = 0; j < ny; ++j) {
@@ -119,20 +120,36 @@ void Volume::from_field(const double *src, int nx_, int ny_, int nz_,
         const double *base =
             src + i * stride_x + j * stride_y + k * stride_z;
         double v = reduce(base, nb_components, mode, component, stride_c);
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
+        // NaN/Inf never enter the range: they would poison the LUT lookup
+        // (an (int) cast of NaN is undefined) and the final 8-bit conversion.
+        if (std::isfinite(v)) {
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        } else {
+          ++nb_bad;
+        }
         data[static_cast<std::size_t>(i) + nx * (j + static_cast<std::size_t>(ny) * k)] =
             static_cast<float>(v);
       }
     }
   }
 
-  if (!(lo <= hi)) {  // empty or all-NaN
+  if (!(lo <= hi)) {  // empty or no finite value at all
     lo = 0.0;
     hi = 1.0;
   }
   vmin = static_cast<float>(lo);
   vmax = static_cast<float>(hi);
+  nb_nonfinite = nb_bad;
+
+  // Replace non-finite voxels by the minimum, which the transfer function
+  // maps to LUT entry 0 (transparent for the default opacity ramp) and which
+  // an isosurface can never cross, so they neither render as garbage nor
+  // fake a surface. The count is kept so the UI can say they were there.
+  if (nb_bad > 0) {
+    for (float &f : data)
+      if (!std::isfinite(f)) f = vmin;
+  }
 }
 
 }  // namespace mueye

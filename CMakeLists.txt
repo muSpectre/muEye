@@ -6,7 +6,7 @@
 # Dear ImGui via FetchContent.
 #
 cmake_minimum_required(VERSION 3.18)
-project(muEye CXX)
+project(muEye VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -245,8 +245,27 @@ if(APPLE)
         MACOSX_BUNDLE_BUNDLE_NAME "muEye"
         MACOSX_BUNDLE_GUI_IDENTIFIER "org.muspectre.muEye"
         MACOSX_BUNDLE_ICON_FILE "muEye.icns"
-        MACOSX_BUNDLE_BUNDLE_VERSION "1.0"
-        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0")
+        MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}")
+endif()
+
+# Install rules, used by CI to stage the self-contained release packages (see
+# .github/workflows/build.yml). Everything is in the `viewer` component so that
+# `cmake --install --component viewer` skips muGrid's own install rules.
+include(GNUInstallDirs)
+if(WIN32)
+    set(_mueye_bindir .)
+else()
+    set(_mueye_bindir ${CMAKE_INSTALL_BINDIR})
+endif()
+install(TARGETS muEye
+    BUNDLE  DESTINATION .                COMPONENT viewer
+    RUNTIME DESTINATION ${_mueye_bindir} COMPONENT viewer)
+if(WIN32)
+    # Ship the MSVC runtime next to muEye.exe so no VC++ redistributable is needed.
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION ${_mueye_bindir})
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT viewer)
+    include(InstallRequiredSystemLibraries)
 endif()
 
 # Helpful warnings (kept non-fatal for a draft); scoped to C++ TUs so they are

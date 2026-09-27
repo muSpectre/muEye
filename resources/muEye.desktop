@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=muEye
+Comment=Real-time ray-tracing viewer for muGrid NetCDF data
+Exec=muEye %f
+Icon=muEye
+Terminal=false
+Categories=Science;Graphics;Viewer;

@@ -7,6 +7,7 @@ cmake-build-*/
 *.nc
 *.ppm
 *.png
+!resources/muEye.png
 
 # Editor / OS
 .DS_Store

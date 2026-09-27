@@ -99,6 +99,23 @@ cmake --build build -j8
 On macOS install NetCDF e.g. with `brew install netcdf`. On Debian/Ubuntu:
 `sudo apt install libnetcdf-dev libglfw3-dev` (GLFW is fetched if absent).
 
+## Download
+
+Prebuilt, self-contained binaries (NetCDF/HDF5 and all other non-system libraries
+bundled) are attached to each [GitHub release](https://github.com/muSpectre/muEye/releases);
+every CI run also uploads them as workflow artifacts.
+
+- **Linux** (`.AppImage`, x86_64 / arm64): `chmod +x muEye-*.AppImage` and run it. Built
+  on Ubuntu 24.04, so it needs glibc ≥ 2.39 plus the host's OpenGL/X11 drivers.
+- **macOS** (`.zip` with `muEye.app`, Apple Silicon): the app is ad-hoc signed, not
+  notarized, so Gatekeeper blocks the first launch. Allow it under *System Settings →
+  Privacy & Security → Open Anyway*, or run `xattr -dr com.apple.quarantine muEye.app`.
+- **Windows** (`.zip`, x86_64 / arm64): unzip and run `muEye.exe`. The MSVC runtime is
+  included, so no VC++ redistributable is needed.
+
+To cut a release, push a tag `v<version>` (keep it in sync with `project(muEye VERSION ...)`
+in `CMakeLists.txt`); CI builds every platform and publishes the release.
+
 ## Run
 
 ```bash

@@ -386,6 +386,21 @@ void App::draw_ui() {
       tf_dirty_ = true;
       needs_render_ = true;
     }
+    if (ImGui::BeginCombo("Opacity ramp", to_string(tf_.ramp()))) {
+      for (OpacityRamp r : {OpacityRamp::Ascending, OpacityRamp::Descending,
+                            OpacityRamp::Symmetric}) {
+        if (ImGui::Selectable(to_string(r), r == tf_.ramp()) &&
+            r != tf_.ramp()) {
+          tf_.set_ramp(r);
+          tf_dirty_ = true;
+          needs_render_ = true;
+        }
+      }
+      ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Which values are transparent. Use Symmetric with a "
+                        "diverging colormap (Cool-Warm) so both signs show.");
     float g = tf_.opacity_gamma();
     if (ImGui::SliderFloat("Opacity gamma", &g, 0.2f, 4.0f, "%.2f")) {
       tf_.set_opacity_gamma(g);

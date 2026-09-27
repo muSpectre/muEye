@@ -24,6 +24,18 @@ const char *to_string(Colormap c) {
   return "?";
 }
 
+const char *to_string(OpacityRamp r) {
+  switch (r) {
+    case OpacityRamp::Ascending:
+      return "Ascending (low = transparent)";
+    case OpacityRamp::Descending:
+      return "Descending (high = transparent)";
+    case OpacityRamp::Symmetric:
+      return "Symmetric (centre = transparent)";
+  }
+  return "?";
+}
+
 namespace {
 
 // A few control points of the matplotlib "viridis" colormap.
@@ -73,11 +85,25 @@ void TransferFunction::rebuild() {
         eval_ramp(kViridis, 11, t, r, g, b);
         break;
     }
+    // Ramp coordinate r in [0,1]: 0 where the map is transparent, 1 where it
+    // is most opaque.
+    float r_ramp = t;
+    switch (ramp_) {
+      case OpacityRamp::Descending:
+        r_ramp = 1.0f - t;
+        break;
+      case OpacityRamp::Symmetric:
+        r_ramp = std::fabs(2.0f * t - 1.0f);
+        break;
+      case OpacityRamp::Ascending:
+      default:
+        break;
+    }
     // Fully transparent below the cutoff; the ramp restarts from 0 there so
     // the opacity stays continuous.
     float alpha = 0.0f;
-    if (t > opacity_cutoff_) {
-      float tt = (t - opacity_cutoff_) / (1.0f - opacity_cutoff_);
+    if (r_ramp > opacity_cutoff_) {
+      float tt = (r_ramp - opacity_cutoff_) / (1.0f - opacity_cutoff_);
       alpha = std::pow(tt, opacity_gamma_) * opacity_scale_;
     }
     if (alpha < 0.f) alpha = 0.f;

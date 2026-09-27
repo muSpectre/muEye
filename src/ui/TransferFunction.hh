@@ -20,6 +20,11 @@ enum class Colormap : int { Viridis = 0, Grayscale = 1, CoolWarm = 2 };
 
 const char *to_string(Colormap c);
 
+/** Shape of the opacity ramp over the normalized value range. */
+enum class OpacityRamp : int { Ascending = 0, Descending = 1, Symmetric = 2 };
+
+const char *to_string(OpacityRamp r);
+
 /** Builds a 256-entry RGBA LUT from a named colormap and an opacity ramp. */
 class TransferFunction {
  public:
@@ -66,6 +71,19 @@ class TransferFunction {
   }
   float opacity_cutoff() const { return opacity_cutoff_; }
 
+  /** Which end of the value range is transparent. Ascending (the default)
+   *  hides low values; Descending hides high values; Symmetric is transparent
+   *  at the centre of the range and opaque towards both ends, the natural
+   *  choice for a diverging colormap around zero (with Ascending the whole
+   *  negative half of a Cool-Warm map would be invisible). */
+  void set_ramp(OpacityRamp r) {
+    if (r != ramp_) {
+      ramp_ = r;
+      rebuild();
+    }
+  }
+  OpacityRamp ramp() const { return ramp_; }
+
   const Vec4 *data() const { return lut_.data(); }
   int size() const { return kSize; }
 
@@ -93,6 +111,7 @@ class TransferFunction {
   float opacity_scale_{1.0f};
   float opacity_gamma_{1.5f};
   float opacity_cutoff_{0.02f};
+  OpacityRamp ramp_{OpacityRamp::Ascending};
   std::vector<Vec4> lut_ = std::vector<Vec4>(kSize);
 };
 

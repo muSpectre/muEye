@@ -501,14 +501,25 @@ void App::draw_ui() {
 
       // C-style cast so this works whether ImTextureID is a pointer (older
       // ImGui) or an integer handle (ImU64 in recent versions).
-      ImGui::Image((ImTextureID)(std::uintptr_t)texture_.id(),
-                   ImVec2(static_cast<float>(vw), static_cast<float>(vh)));
+      const ImVec2 img_pos = ImGui::GetCursorScreenPos();
+      const ImVec2 img_size(static_cast<float>(vw), static_cast<float>(vh));
+      ImGui::Image((ImTextureID)(std::uintptr_t)texture_.id(), img_size);
+      // An invisible button over the image owns the mouse input: unlike a
+      // hover test on the (non-interactive) image it stays *active* while a
+      // button pressed on it is held, so an orbit or pan continues even when
+      // the cursor leaves the viewport mid-drag.
+      ImGui::SetCursorScreenPos(img_pos);
+      ImGui::InvisibleButton("##viewport_input", img_size,
+                             ImGuiButtonFlags_MouseButtonLeft |
+                                 ImGuiButtonFlags_MouseButtonRight |
+                                 ImGuiButtonFlags_MouseButtonMiddle);
+      const bool input_active = ImGui::IsItemActive();
+      const bool input_hovered = ImGui::IsItemHovered();
 
       // Box outline: project the edges of the (possibly tiled) volume box
       // with the render camera and draw them over the image. Backend-agnostic
       // by construction — no ray-march kernel is involved.
       if (show_box_ && !volume_.empty()) {
-        ImVec2 img_pos = ImGui::GetItemRectMin();
         // Edge vectors of the (possibly sheared) tiled cell are the columns of
         // C scaled by the replica counts; corners are C * frac, frac in {0,rep}.
         Mat3 C = world_cell();
@@ -542,19 +553,23 @@ void App::draw_ui() {
         }
       }
 
-      // Mouse interaction over the image drives the orbit camera.
-      if (ImGui::IsItemHovered()) {
+      // Mouse interaction drives the orbit camera: drags while the viewport
+      // button is active (pressed on the image, wherever the cursor is now),
+      // wheel zoom while hovering it.
+      {
         ImGuiIO &io = ImGui::GetIO();
-        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-          camera_.orbit(io.MouseDelta.x * 0.01f, io.MouseDelta.y * 0.01f);
-          needs_render_ = true;
-        } else if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) ||
-                   ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-          camera_.pan(io.MouseDelta.x / vw, io.MouseDelta.y / vh,
-                      static_cast<float>(vw) / vh);
-          needs_render_ = true;
+        if (input_active) {
+          if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            camera_.orbit(io.MouseDelta.x * 0.01f, io.MouseDelta.y * 0.01f);
+            needs_render_ = true;
+          } else if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) ||
+                     ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+            camera_.pan(io.MouseDelta.x / vw, io.MouseDelta.y / vh,
+                        static_cast<float>(vw) / vh);
+            needs_render_ = true;
+          }
         }
-        if (io.MouseWheel != 0.0f) {
+        if (input_hovered && io.MouseWheel != 0.0f) {
           camera_.zoom(io.MouseWheel);
           needs_render_ = true;
         }

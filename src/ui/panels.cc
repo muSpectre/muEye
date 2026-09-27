@@ -550,7 +550,8 @@ void App::draw_ui() {
           needs_render_ = true;
         } else if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) ||
                    ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-          camera_.pan(io.MouseDelta.x / vw, io.MouseDelta.y / vh);
+          camera_.pan(io.MouseDelta.x / vw, io.MouseDelta.y / vh,
+                      static_cast<float>(vw) / vh);
           needs_render_ = true;
         }
         if (io.MouseWheel != 0.0f) {

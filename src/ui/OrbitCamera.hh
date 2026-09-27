@@ -41,8 +41,10 @@ class OrbitCamera {
   void orbit(float dyaw, float dpitch);
   /** Dolly in/out (e.g. mouse wheel); positive zooms in. */
   void zoom(float delta);
-  /** Pan the target in the camera plane. */
-  void pan(float dx, float dy);
+  /** Pan the target in the camera plane by a drag of (@p dx, @p dy) viewport
+   *  widths/heights (screen coordinates: +dy is downwards); the scene follows
+   *  the cursor 1:1 for a viewport of the given aspect ratio. */
+  void pan(float dx, float dy, float aspect);
 
   /** Build the render_core camera for an image of the given aspect ratio. */
   Camera to_camera(float aspect) const;

@@ -60,15 +60,19 @@ void OrbitCamera::zoom(float delta) {
   distance_ = std::clamp(distance_, 0.3f, 50.0f);
 }
 
-void OrbitCamera::pan(float dx, float dy) {
+void OrbitCamera::pan(float dx, float dy, float aspect) {
   // Translate the target in the current view plane, using the same basis the
-  // renderer uses (aspect does not affect right/up). "Grab" semantics: the
-  // scene follows the cursor. Image-right is +cam.right, so a rightward drag
-  // (dx > 0) must move the camera *left*; image-down is -cam.up, so a downward
-  // drag (dy > 0, screen coordinates) moves the camera up.
-  Camera cam = to_camera(1.0f);
-  float scale = distance_ * 0.5f;
-  target_ = target_ - cam.right * (dx * scale) + cam.up * (dy * scale);
+  // renderer uses. "Grab" semantics: the scene follows the cursor 1:1. At the
+  // target's depth the viewport spans 2*distance*tan(fov/2) world units
+  // vertically (times the aspect horizontally), so a drag across the whole
+  // viewport moves the target by exactly that. Image-right is +cam.right, so
+  // a rightward drag (dx > 0) must move the camera *left*; image-down is
+  // -cam.up, so a downward drag (dy > 0, screen coordinates) moves the
+  // camera up.
+  Camera cam = to_camera(aspect);
+  float span_y = 2.0f * distance_ * cam.tan_half_fov;
+  float span_x = span_y * aspect;
+  target_ = target_ - cam.right * (dx * span_x) + cam.up * (dy * span_y);
 }
 
 Camera OrbitCamera::to_camera(float aspect) const {

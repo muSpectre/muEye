@@ -108,6 +108,14 @@ class App {
   //! C = F * diag(box_extent).
   float F_[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
   bool deformation_from_file_{false};  //!< F_ came from the file (for the UI)
+  //! The user edited or reset F by hand. While set, the file's per-frame
+  //! applied deformation gradient no longer overwrites F_ on frame changes;
+  //! "Use file's F" in the Cell panel clears it. Reset on every file open.
+  bool F_user_override_{false};
+
+  /** Restore F_ from the file (per-frame tensor if present, else the global
+   *  attribute, else identity) and clear the user override. */
+  void adopt_file_deformation();
 
   //! Deformed-geometry warp: index into meta_.fields of the displacement field
   //! (-1 = none, the default: no deformation). Only fields with exactly

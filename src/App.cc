@@ -110,10 +110,8 @@ void App::open_path(const std::string &path) {
   disp_dirty_ = true;
   // Adopt the file's deformation gradient (identity if the file has none). A
   // per-frame applied_deformation_gradient, if present, supersedes it for the
-  // current frame.
-  for (int i = 0; i < 9; ++i) F_[i] = static_cast<float>(meta_.F[i]);
-  deformation_from_file_ = meta_.has_deformation;
-  sync_frame_deformation();  // frame_ == 0 here
+  // current frame. A new file always discards a manual override.
+  adopt_file_deformation();  // frame_ == 0 here
   status_ = "Loaded '" + path + "' (" + std::to_string(meta_.nx) + "x" +
             std::to_string(meta_.ny) + "x" + std::to_string(meta_.nz) + ", " +
             std::to_string(meta_.nb_frames) + " frame(s), " +
@@ -250,12 +248,24 @@ Vec3 App::reference_box() const {
 }
 
 void App::sync_frame_deformation() {
+  // A hand-edited F wins over the file's per-frame tensor until the user asks
+  // for the file's value back; otherwise scrubbing frames would silently undo
+  // an edit or a "Reset to identity".
+  if (F_user_override_) return;
   if (frame_ >= 0 && frame_ < static_cast<int>(meta_.applied_F.size())) {
     for (int i = 0; i < 9; ++i)
       F_[i] = static_cast<float>(meta_.applied_F[frame_][i]);
     deformation_from_file_ = true;
     needs_render_ = true;
   }
+}
+
+void App::adopt_file_deformation() {
+  F_user_override_ = false;
+  for (int i = 0; i < 9; ++i) F_[i] = static_cast<float>(meta_.F[i]);
+  deformation_from_file_ = meta_.has_deformation;
+  sync_frame_deformation();
+  needs_render_ = true;
 }
 
 Mat3 App::world_cell() const {

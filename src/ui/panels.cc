@@ -265,9 +265,11 @@ void App::draw_ui() {
     ImGui::Begin("Cell");
     const bool is_2d = meta_.spatial_dim == 2;
     ImGui::TextWrapped(
-        deformation_from_file_
-            ? "Deformation gradient F (read from file). C = F * box."
-            : "Deformation gradient F (identity = orthogonal). C = F * box.");
+        F_user_override_
+            ? "Deformation gradient F (edited by hand). C = F * box."
+            : deformation_from_file_
+                  ? "Deformation gradient F (read from file). C = F * box."
+                  : "Deformation gradient F (identity = orthogonal). C = F * box.");
     const int dim = is_2d ? 2 : 3;
     bool changed = false;
     // Edit the leading dim x dim block row by row; the z row/col stay identity
@@ -280,6 +282,8 @@ void App::draw_ui() {
       if (ImGui::InputScalarN("##Frow", ImGuiDataType_Float, row, dim, nullptr,
                               nullptr, "%.4f")) {
         for (int c = 0; c < dim; ++c) F_[3 * r + c] = row[c];
+        deformation_from_file_ = false;
+        F_user_override_ = true;  // stop frame changes from overwriting it
         changed = true;
       }
       ImGui::PopID();
@@ -288,7 +292,14 @@ void App::draw_ui() {
       for (int i = 0; i < 9; ++i)
         F_[i] = (i == 0 || i == 4 || i == 8) ? 1.0f : 0.0f;
       deformation_from_file_ = false;
+      F_user_override_ = true;
       changed = true;
+    }
+    // Offer the file's tensor back once the user has overridden it.
+    const bool file_has_F = meta_.has_deformation || !meta_.applied_F.empty();
+    if (F_user_override_ && file_has_F) {
+      ImGui::SameLine();
+      if (ImGui::Button("Use file's F")) adopt_file_deformation();
     }
     ImGui::SameLine();
     if (ImGui::Button("Frame cell")) {

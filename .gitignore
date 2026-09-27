@@ -12,3 +12,6 @@ cmake-build-*/
 .DS_Store
 compile_commands.json
 .cache/
+
+# Dear ImGui layout (now written to the per-user config dir; a stray CWD copy is noise)
+imgui.ini

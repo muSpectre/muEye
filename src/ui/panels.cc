@@ -263,8 +263,11 @@ void App::draw_ui() {
   // Deformation gradient F: shears the reference box into a (Bravais) cell.
   // Editing F rebuilds inv_cell in make_render_params, so only a re-render is
   // needed. Identity => the orthogonal box exactly as before.
-  if (has_file_ && !volume_.empty()) {
+  // Always present (contents disabled without data) so the docked tab does
+  // not pop in and out of the layout when files are opened.
+  {
     ImGui::Begin("Cell");
+    ImGui::BeginDisabled(!(has_file_ && !volume_.empty()));
     const bool is_2d = meta_.spatial_dim == 2;
     ImGui::TextWrapped(
         F_user_override_
@@ -306,6 +309,7 @@ void App::draw_ui() {
     ImGui::SameLine();
     if (ImGui::Button("Frame cell")) frame_view(true);
     if (changed) needs_render_ = true;
+    ImGui::EndDisabled();
     ImGui::End();
   }
 
@@ -398,8 +402,13 @@ void App::draw_ui() {
   ImGui::End();
 
   // --------------------------------------------------- Transfer function
-  if (mode_ == RenderMode::DVR) {
+  // Always present; its controls only act in DVR mode, so they are disabled
+  // (not hidden, which would remove the tab from the dock) for isosurfaces.
+  {
     ImGui::Begin("Transfer function");
+    const bool dvr = mode_ == RenderMode::DVR;
+    if (!dvr) ImGui::TextDisabled("Used in DVR mode only.");
+    ImGui::BeginDisabled(!dvr);
     const char *cmaps[] = {"Viridis", "Grayscale", "Cool-Warm"};
     int cm = static_cast<int>(tf_.colormap());
     if (ImGui::Combo("Colormap", &cm, cmaps, IM_ARRAYSIZE(cmaps))) {
@@ -480,6 +489,7 @@ void App::draw_ui() {
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip("Colour and opacity over the value range; the curve "
                         "is the opacity.");
+    ImGui::EndDisabled();
     ImGui::End();
   }
 

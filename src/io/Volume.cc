@@ -8,8 +8,11 @@
 
 #include "io/Volume.hh"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
+
+#include "render/parallel_for.hh"
 
 namespace mueye {
 
@@ -118,27 +121,51 @@ void Volume::from_field(const T *src, int nx_, int ny_, int nz_,
   nz = nz_;
   data.assign(size(), 0.0f);
 
+  // Scalarize in parallel over (j,k) rows, each row reducing into its own
+  // min/max/NaN-count slot; the slots are combined afterwards. Rows rather
+  // than k-slices so a 2D field (nz == 1) parallelizes too. This is what sits
+  // between a frame-slider tick and the picture, and at 512^3 the serial loop
+  // took long enough to push scrubbing over the live-reload threshold.
+  const int nb_rows = ny * nz;
+  std::vector<double> row_lo(static_cast<std::size_t>(std::max(nb_rows, 1)),
+                             std::numeric_limits<double>::infinity());
+  std::vector<double> row_hi(row_lo.size(),
+                             -std::numeric_limits<double>::infinity());
+  std::vector<std::size_t> row_bad(row_lo.size(), 0);
+
+  parallel_for(nb_rows, 0, [&](int row) {
+    const int j = row % ny;
+    const int k = row / ny;
+    double lo = std::numeric_limits<double>::infinity();
+    double hi = -std::numeric_limits<double>::infinity();
+    std::size_t bad = 0;
+    float *dst = data.data() + nx * (j + static_cast<std::size_t>(ny) * k);
+    const T *row_base = src + j * stride_y + k * stride_z;
+    for (int i = 0; i < nx; ++i) {
+      double v = reduce(row_base + i * stride_x, nb_components, mode, component,
+                        stride_c);
+      // NaN/Inf never enter the range: they would poison the LUT lookup
+      // (an (int) cast of NaN is undefined) and the final 8-bit conversion.
+      if (std::isfinite(v)) {
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      } else {
+        ++bad;
+      }
+      dst[i] = static_cast<float>(v);
+    }
+    row_lo[row] = lo;
+    row_hi[row] = hi;
+    row_bad[row] = bad;
+  });
+
   double lo = std::numeric_limits<double>::infinity();
   double hi = -std::numeric_limits<double>::infinity();
   std::size_t nb_bad = 0;
-
-  for (int k = 0; k < nz; ++k) {
-    for (int j = 0; j < ny; ++j) {
-      for (int i = 0; i < nx; ++i) {
-        const T *base = src + i * stride_x + j * stride_y + k * stride_z;
-        double v = reduce(base, nb_components, mode, component, stride_c);
-        // NaN/Inf never enter the range: they would poison the LUT lookup
-        // (an (int) cast of NaN is undefined) and the final 8-bit conversion.
-        if (std::isfinite(v)) {
-          if (v < lo) lo = v;
-          if (v > hi) hi = v;
-        } else {
-          ++nb_bad;
-        }
-        data[static_cast<std::size_t>(i) + nx * (j + static_cast<std::size_t>(ny) * k)] =
-            static_cast<float>(v);
-      }
-    }
+  for (int row = 0; row < nb_rows; ++row) {
+    lo = std::min(lo, row_lo[row]);
+    hi = std::max(hi, row_hi[row]);
+    nb_bad += row_bad[row];
   }
 
   if (!(lo <= hi)) {  // empty or no finite value at all

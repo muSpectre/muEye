@@ -15,9 +15,12 @@
  * Part of muEye, a viewer for muGrid data.
  */
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -66,6 +69,15 @@ void write_demo(const std::string &path, int n) {
     // fetch the same file, so only their mutual agreement matters.
     for (std::size_t e = 0; e < nb_entries; ++e)
       s[e] = static_cast<double>(e);
+  }
+  // A 3-component field (displacement-eligible in 3D) with every
+  // (voxel, component) value distinct, for the load_displacement cross-check.
+  muGrid::Field &u = fc.register_real_field("u", 3);
+  double *ud = static_cast<double *>(u.get_void_data_ptr());
+  {
+    std::size_t nb_entries = static_cast<std::size_t>(n) * n * n * 3;
+    for (std::size_t e = 0; e < nb_entries; ++e)
+      ud[e] = 0.001 * static_cast<double>(e) - 7.0;
   }
 
   muGrid::FileIONetCDF file(path, muGrid::FileIOBase::OpenMode::Overwrite);
@@ -162,6 +174,7 @@ mueye::Volume make_cube_volume(int nx, int ny, int nz) {
       }
   v.vmin = 0.0f;
   v.vmax = 1.0f;
+  v.build_bricks();
   return v;
 }
 
@@ -207,6 +220,7 @@ int check_anisotropic() {
     p.iso_value = 0.5f;
     p.mode = mueye::RenderMode::DVR;
     p.bg = mueye::Vec3{0.05f, 0.06f, 0.08f};
+    p.skip_below = tf.skip_below(v.vmin, v.vmax);
     return p;
   };
 
@@ -231,17 +245,22 @@ int check_anisotropic() {
   mueye::Framebuffer fa, fb;
   fa.resize(256, 256);
   fb.resize(256, 256);
+  auto set_vol = [&](mueye::Renderer &r, const mueye::Volume &v) {
+    r.set_volume(v.data.data(), v.nx, v.ny, v.nz);
+    r.set_brick_grid(v.bricks.bmin.data(), v.bricks.bmax.data(), v.bricks.bx,
+                     v.bricks.by, v.bricks.bz);
+  };
 
   mueye::RenderParams pa = make_params(va);
   mueye::Camera cam_a = make_cam(pa, mueye::Vec3{1.0f, 0.0f, 0.0f},
                                  mueye::Vec3{0.0f, 0.0f, 1.0f});
-  cpu.set_volume(va.data.data(), va.nx, va.ny, va.nz);
+  set_vol(cpu, va);
   cpu.render(pa, cam_a, fa);
 
   mueye::RenderParams pb = make_params(vb);
   mueye::Camera cam_b = make_cam(pb, mueye::Vec3{0.0f, 0.0f, 1.0f},
                                  mueye::Vec3{1.0f, 0.0f, 0.0f});
-  cpu.set_volume(vb.data.data(), vb.nx, vb.ny, vb.nz);
+  set_vol(cpu, vb);
   cpu.render(pb, cam_b, fb);
 
   // Sanity: the render must actually contain the cube.
@@ -270,7 +289,7 @@ int check_anisotropic() {
 
   // Every other available backend must agree with the CPU reference on the
   // anisotropic grid too.
-  cpu.set_volume(va.data.data(), va.nx, va.ny, va.nz);
+  set_vol(cpu, va);
   cpu.render(pa, cam_a, fa);
   for (const mueye::BackendInfo &bi : mueye::enumerate_backends()) {
     if (bi.backend == mueye::Backend::CPU) continue;
@@ -285,7 +304,7 @@ int check_anisotropic() {
     }
     mueye::Framebuffer fg;
     fg.resize(256, 256);
-    r->set_volume(va.data.data(), va.nx, va.ny, va.nz);
+    set_vol(*r, va);
     r->set_transfer_function(tf.data(), tf.size());
     r->render(pa, cam_a, fg);
     sum = 0.0;
@@ -299,6 +318,66 @@ int check_anisotropic() {
                    bi.name);
       ++failures;
     }
+  }
+  return failures;
+}
+
+/**
+ * Scalarization of tensor fields: trace and von Mises for a 2x2 (2D) and a 3x3
+ * (3D) tensor, on a one-voxel "grid", against hand-computed values. The
+ * off-diagonal terms are deliberately asymmetric so the check also pins down
+ * that the reductions symmetrize them (and are thus independent of the
+ * row-/column-major flattening of the file).
+ * @returns 0 on success, non-zero on any failure.
+ */
+int check_reductions() {
+  std::printf("\n=== checking tensor reductions (2x2 and 3x3) ===\n");
+  int failures = 0;
+  auto expect = [&](const char *what, double got, double want) {
+    bool ok = std::fabs(got - want) <= 1e-5 * std::fmax(1.0, std::fabs(want));
+    std::printf("  %-22s = %-12.6g (expected %.6g) %s\n", what, got, want,
+                ok ? "ok" : "MISMATCH");
+    if (!ok) ++failures;
+  };
+  auto reduce1 = [](const double *comps, int nb, mueye::Scalarize mode) {
+    mueye::Volume v;
+    v.from_field(comps, 1, 1, 1, nb, 1, 1, 1, mode, 0);
+    return static_cast<double>(v.data[0]);
+  };
+  // 3x3, flat index r + 3c (column-major) or 3r + c (row-major); both give the
+  // same diagonal and the same off-diagonal pairs {1,3},{2,6},{5,7}.
+  const double t3[9] = {1.0, 0.5, 0.2, 0.1, 2.0, 0.4, 0.6, 0.0, 3.0};
+  expect("trace 3x3", reduce1(t3, 9, mueye::Scalarize::Trace), 6.0);
+  {
+    double sxy = 0.5 * (0.5 + 0.1), sxz = 0.5 * (0.2 + 0.6), syz = 0.5 * (0.4 + 0.0);
+    double j2 = 0.5 * (1.0 + 1.0 + 4.0) + 3.0 * (sxy * sxy + syz * syz + sxz * sxz);
+    expect("von Mises 3x3", reduce1(t3, 9, mueye::Scalarize::VonMises),
+           std::sqrt(j2));
+  }
+  // 2x2: diagonal at 0 and 3, off-diagonal pair {1,2}.
+  const double t2[4] = {2.0, 0.3, 0.1, -1.0};
+  expect("trace 2x2", reduce1(t2, 4, mueye::Scalarize::Trace), 1.0);
+  {
+    double sxy = 0.5 * (0.3 + 0.1);
+    double j2 = 4.0 - (2.0 * -1.0) + 1.0 + 3.0 * sxy * sxy;
+    expect("von Mises 2x2", reduce1(t2, 4, mueye::Scalarize::VonMises),
+           std::sqrt(j2));
+  }
+  expect("magnitude 2x2", reduce1(t2, 4, mueye::Scalarize::Magnitude),
+         std::sqrt(4.0 + 0.09 + 0.01 + 1.0));
+
+  // Non-finite voxels: excluded from the range, replaced by vmin, counted.
+  {
+    const double nanv = std::numeric_limits<double>::quiet_NaN();
+    const double infv = std::numeric_limits<double>::infinity();
+    const double vals[4] = {2.0, nanv, -1.0, infv};
+    mueye::Volume v;
+    v.from_field(vals, 4, 1, 1, 1, 1, 4, 4, mueye::Scalarize::Component, 0);
+    expect("nan: vmin", v.vmin, -1.0);
+    expect("nan: vmax", v.vmax, 2.0);
+    expect("nan: count", static_cast<double>(v.nb_nonfinite), 2.0);
+    expect("nan: replaced[1]", v.data[1], -1.0);
+    expect("nan: replaced[3]", v.data[3], -1.0);
   }
   return failures;
 }
@@ -359,12 +438,14 @@ int check_file(const std::string &path, const char *ppm_out) {
   {
     int fcheck = meta.nb_frames - 1;
     mueye::Volume vg, vd;
-    mueye::FieldInfo direct = meta.fields[0];
-    direct.is_double = false;  // force the netcdf-c path
+    // Select each reader explicitly: Auto would send Component mode down the
+    // direct path on both sides and compare it with itself.
     std::string e1 = loader.load(path, meta, meta.fields[0], fcheck,
-                                 mueye::Scalarize::Component, 0, vg);
-    std::string e2 = loader.load(path, meta, direct, fcheck,
-                                 mueye::Scalarize::Component, 0, vd);
+                                 mueye::Scalarize::Component, 0, vg,
+                                 mueye::ReadPath::MuGrid);
+    std::string e2 = loader.load(path, meta, meta.fields[0], fcheck,
+                                 mueye::Scalarize::Component, 0, vd,
+                                 mueye::ReadPath::Direct);
     if (!e1.empty() || !e2.empty() || vg.data.size() != vd.data.size() ||
         vg.data.empty()) {
       std::fprintf(stderr, "direct-read cross-check failed to load (%s%s)\n",
@@ -389,16 +470,16 @@ int check_file(const std::string &path, const char *ppm_out) {
   // netcdf path (which fetches only the selected component in Component mode).
   for (const mueye::FieldInfo &finfo : meta.fields) {
     if (finfo.nb_components <= 1) continue;
-    mueye::FieldInfo direct = finfo;
-    direct.is_double = false;  // force the netcdf-c path
     for (int c = 0; c <= finfo.nb_components; ++c) {
       // c == nb_components is the magnitude pass (component index unused).
       bool magnitude = c == finfo.nb_components;
       mueye::Scalarize sm =
           magnitude ? mueye::Scalarize::Magnitude : mueye::Scalarize::Component;
       mueye::Volume vg, vd;
-      std::string e1 = loader.load(path, meta, finfo, 0, sm, c, vg);
-      std::string e2 = loader.load(path, meta, direct, 0, sm, c, vd);
+      std::string e1 = loader.load(path, meta, finfo, 0, sm, c, vg,
+                                   mueye::ReadPath::MuGrid);
+      std::string e2 = loader.load(path, meta, finfo, 0, sm, c, vd,
+                                   mueye::ReadPath::Direct);
       if (!e1.empty() || !e2.empty() || vg.data.size() != vd.data.size() ||
           vg.data.empty()) {
         std::fprintf(stderr,
@@ -423,6 +504,54 @@ int check_file(const std::string &path, const char *ppm_out) {
     std::printf("field '%s': %d components + magnitude, direct vs muGrid "
                 "reads agree\n",
                 finfo.name.c_str(), finfo.nb_components);
+  }
+
+  // load_displacement() reads the whole vector field in one go and scatters
+  // the first spatial_dim components into its 4-float layout; that must equal
+  // the per-component Component-mode loads (for both readers).
+  for (const mueye::FieldInfo &finfo : meta.fields) {
+    if (finfo.nb_components != meta.spatial_dim) continue;
+    mueye::DisplacementField df;
+    std::string e = loader.load_displacement(path, meta, finfo, 0, df);
+    if (!e.empty() || df.size() != vol.size()) {
+      std::fprintf(stderr, "load_displacement('%s') failed: %s\n",
+                   finfo.name.c_str(), e.c_str());
+      return 1;
+    }
+    for (int c = 0; c < meta.spatial_dim; ++c) {
+      for (mueye::ReadPath rp : {mueye::ReadPath::MuGrid, mueye::ReadPath::Direct}) {
+        mueye::Volume vc;
+        std::string ec = loader.load(path, meta, finfo, 0,
+                                     mueye::Scalarize::Component, c, vc, rp);
+        if (!ec.empty()) {
+          std::fprintf(stderr, "component load failed: %s\n", ec.c_str());
+          return 1;
+        }
+        float max_diff = 0.0f;
+        for (std::size_t i = 0; i < vc.data.size(); ++i) {
+          float dv = std::fabs(vc.data[i] - df.data[i * 4 + c]);
+          if (dv > max_diff) max_diff = dv;
+        }
+        if (max_diff > 0.0f) {
+          std::fprintf(stderr,
+                       "load_displacement('%s') component %d disagrees with "
+                       "load() (max|Δ| = %g).\n",
+                       finfo.name.c_str(), c, double(max_diff));
+          return 1;
+        }
+      }
+    }
+    // The unused 4th channel (and z in 2D) must stay zero.
+    for (std::size_t i = 0; i < df.size(); ++i) {
+      if (df.data[i * 4 + 3] != 0.0f ||
+          (meta.spatial_dim == 2 && df.data[i * 4 + 2] != 0.0f)) {
+        std::fprintf(stderr, "load_displacement('%s') wrote unused channels.\n",
+                     finfo.name.c_str());
+        return 1;
+      }
+    }
+    std::printf("field '%s': load_displacement matches per-component loads\n",
+                finfo.name.c_str());
   }
 
   mueye::TransferFunction tf;
@@ -453,12 +582,66 @@ int check_file(const std::string &path, const char *ppm_out) {
   p.mode = mueye::RenderMode::DVR;
   p.bg = mueye::Vec3{0.05f, 0.06f, 0.08f};
 
+  p.skip_below = tf.skip_below(vol.vmin, vol.vmax);
+
   auto render_with = [&](mueye::Renderer &r, mueye::Framebuffer &fb,
                          mueye::RenderMode mode) {
     p.mode = mode;
     r.set_volume(vol.data.data(), vol.nx, vol.ny, vol.nz);
+    r.set_brick_grid(vol.bricks.bmin.data(), vol.bricks.bmax.data(),
+                     vol.bricks.bx, vol.bricks.by, vol.bricks.bz);
     r.set_transfer_function(tf.data(), tf.size());
     r.render(p, camv, fb);
+  };
+
+  // Empty-space skipping must not change a single pixel: render DVR and the
+  // isosurface with the brick summary and without, on the CPU, and require
+  // bit-identical images. Also reports the speed-up on this scene.
+  auto check_skipping = [&](const char *what) {
+    int bad = 0;
+    for (mueye::RenderMode mode :
+         {mueye::RenderMode::DVR, mueye::RenderMode::Isosurface}) {
+      mueye::CpuRenderer r;
+      mueye::Framebuffer with, without;
+      with.resize(256, 256);
+      without.resize(256, 256);
+      // Render each variant twice and time the second pass (warm caches,
+      // thread pool spun up), so the comparison is not skewed by start-up.
+      render_with(r, with, mode);
+      auto t0 = std::chrono::steady_clock::now();
+      r.render(p, camv, with);
+      auto t1 = std::chrono::steady_clock::now();
+      r.set_brick_grid(nullptr, nullptr, 0, 0, 0);
+      r.render(p, camv, without);
+      t1 = std::chrono::steady_clock::now();
+      r.render(p, camv, without);
+      auto t2 = std::chrono::steady_clock::now();
+      // (t0,t1) brackets warm "with"; (t1,t2) warm "without". Re-time "with"
+      // after "without" too, and keep the faster of its two runs.
+      auto tw = t1 - t0;
+      r.set_brick_grid(vol.bricks.bmin.data(), vol.bricks.bmax.data(),
+                       vol.bricks.bx, vol.bricks.by, vol.bricks.bz);
+      auto t3 = std::chrono::steady_clock::now();
+      r.render(p, camv, with);
+      auto t4 = std::chrono::steady_clock::now();
+      if (t4 - t3 < tw) tw = t4 - t3;
+      std::size_t ndiff = 0;
+      for (std::size_t i = 0; i < with.rgba.size(); ++i)
+        if (with.rgba[i] != without.rgba[i]) ++ndiff;
+      double ms_with = std::chrono::duration<double, std::milli>(tw).count();
+      double ms_without =
+          std::chrono::duration<double, std::milli>(t2 - t1).count();
+      std::printf("skipping %-12s %-4s: %zu differing bytes, %.1f ms -> %.1f ms\n",
+                  what, mode == mueye::RenderMode::DVR ? "DVR" : "iso", ndiff,
+                  ms_without, ms_with);
+      if (ndiff != 0) {
+        std::fprintf(stderr, "empty-space skipping changed the %s image (%s).\n",
+                     mode == mueye::RenderMode::DVR ? "DVR" : "isosurface",
+                     what);
+        ++bad;
+      }
+    }
+    return bad;
   };
 
   // CPU reference render (DVR + isosurface).
@@ -522,6 +705,7 @@ int check_file(const std::string &path, const char *ppm_out) {
   };
 
   int mismatches = compare_backends("DVR");
+  mismatches += check_skipping("single cell");
 
   // Periodic tiling: 2x2x2 replicas, camera reframed on the enlarged box.
   p.rep_x = 2;
@@ -543,6 +727,7 @@ int check_file(const std::string &path, const char *ppm_out) {
     return 1;
   }
   mismatches += compare_backends("DVR 2x2x2");
+  mismatches += check_skipping("2x2x2");
 
   // Sheared (Bravais) cell: a non-orthogonal inv_cell must render identically
   // across backends too (exercises the Metal mirror's cell-matrix math). Reuse
@@ -579,6 +764,7 @@ int check_file(const std::string &path, const char *ppm_out) {
     return 1;
   }
   mismatches += compare_backends("DVR sheared");
+  mismatches += check_skipping("sheared");
 
   // Deformed geometry: a synthetic displacement warps the volume; every backend
   // must agree with the CPU reference on the inverse-warp (fixed-point) path.
@@ -647,8 +833,9 @@ int check_file(const std::string &path, const char *ppm_out) {
 /**
  * View mode (`muEye_check --view file.nc [field]`): render an existing file
  * with the GUI's default appearance (DVR, default transfer function, white
- * background) to view.png / view_rep.png (2x2x2 periodic replicas). Purely a
- * preview/diagnosis aid; the file is only read, never written.
+ * background) to <file>.view.png / <file>.view_rep.png (2x2x2 periodic
+ * replicas) next to the data file. Purely a preview/diagnosis aid; the data
+ * file is only read, never written.
  */
 int view_file(const std::string &path, const char *field_name) {
   mueye::VolumeLoader loader;
@@ -708,9 +895,12 @@ int view_file(const std::string &path, const char *field_name) {
   p.iso_value = 0.5f * (vol.vmin + vol.vmax);
   p.mode = mueye::RenderMode::DVR;
   p.bg = mueye::Vec3{1.0f, 1.0f, 1.0f};  // GUI default: white
+  p.skip_below = tf.skip_below(vol.vmin, vol.vmax);
 
   mueye::CpuRenderer cpu;
   cpu.set_volume(vol.data.data(), vol.nx, vol.ny, vol.nz);
+  cpu.set_brick_grid(vol.bricks.bmin.data(), vol.bricks.bmax.data(),
+                     vol.bricks.bx, vol.bricks.by, vol.bricks.bz);
   cpu.set_transfer_function(tf.data(), tf.size());
   mueye::Framebuffer fb;
   fb.resize(512, 512);
@@ -740,8 +930,14 @@ int view_file(const std::string &path, const char *field_name) {
   mueye::OrbitCamera cam;
   cam.frame_box(box);
   cpu.render(p, cam.to_camera(1.0f), fb);
-  if (!mueye::write_png("view.png", fb)) return 1;
-  std::printf("wrote view.png (1x1x1)\n");
+  // Outputs go next to the data file, like the GUI's Save PNG default:
+  // <dir>/<stem>.view.png and <dir>/<stem>.view_rep.png.
+  const std::filesystem::path in{path};
+  const std::string stem = in.stem().string().empty() ? "view" : in.stem().string();
+  const std::string out1 = (in.parent_path() / (stem + ".view.png")).string();
+  const std::string out2 = (in.parent_path() / (stem + ".view_rep.png")).string();
+  if (!mueye::write_png(out1, fb)) return 1;
+  std::printf("wrote %s (1x1x1)\n", out1.c_str());
 
   // The replica preview does not warp (periodic tiling is disabled while
   // warping); show the undeformed tiled cell.
@@ -749,8 +945,8 @@ int view_file(const std::string &path, const char *field_name) {
   p.rep_x = p.rep_y = p.rep_z = 2;
   cam.retarget_box(mueye::Vec3{2 * box.x, 2 * box.y, 2 * box.z});
   cpu.render(p, cam.to_camera(1.0f), fb);
-  if (!mueye::write_png("view_rep.png", fb)) return 1;
-  std::printf("wrote view_rep.png (2x2x2 replicas)\n");
+  if (!mueye::write_png(out2, fb)) return 1;
+  std::printf("wrote %s (2x2x2 replicas)\n", out2.c_str());
   return 0;
 }
 
@@ -773,6 +969,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (check_reductions() != 0) return 1;
   if (check_file(path, "offscreen.ppm") != 0) return 1;
   if (check_file(path2d, "offscreen_2d.ppm") != 0) return 1;
   if (check_anisotropic() != 0) return 1;

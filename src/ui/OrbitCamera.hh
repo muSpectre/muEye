@@ -37,12 +37,22 @@ class OrbitCamera {
   /** Like frame_aabb but keeps the current orbit angles. */
   void retarget_aabb(const Vec3 &center, float extent);
 
+  /** Set the orbit angles directly (radians; pitch is clamped like orbit()). */
+  void set_view_angles(float yaw, float pitch);
+
+  /** Look straight down the z axis at the x-y plane (image right = +x, image
+   *  up = +y): the natural view of a 2D field, which the default oblique
+   *  angles would show as a tilted slab. */
+  void set_face_on() { set_view_angles(1.5707963f, 0.0f); }
+
   /** Orbit by mouse drag deltas (in radians-equivalent screen units). */
   void orbit(float dyaw, float dpitch);
   /** Dolly in/out (e.g. mouse wheel); positive zooms in. */
   void zoom(float delta);
-  /** Pan the target in the camera plane. */
-  void pan(float dx, float dy);
+  /** Pan the target in the camera plane by a drag of (@p dx, @p dy) viewport
+   *  widths/heights (screen coordinates: +dy is downwards); the scene follows
+   *  the cursor 1:1 for a viewport of the given aspect ratio. */
+  void pan(float dx, float dy, float aspect);
 
   /** Build the render_core camera for an image of the given aspect ratio. */
   Camera to_camera(float aspect) const;

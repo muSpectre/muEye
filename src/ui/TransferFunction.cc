@@ -24,6 +24,18 @@ const char *to_string(Colormap c) {
   return "?";
 }
 
+const char *to_string(OpacityRamp r) {
+  switch (r) {
+    case OpacityRamp::Ascending:
+      return "Ascending (low = transparent)";
+    case OpacityRamp::Descending:
+      return "Descending (high = transparent)";
+    case OpacityRamp::Symmetric:
+      return "Symmetric (centre = transparent)";
+  }
+  return "?";
+}
+
 namespace {
 
 // A few control points of the matplotlib "viridis" colormap.
@@ -73,11 +85,42 @@ void TransferFunction::rebuild() {
         eval_ramp(kViridis, 11, t, r, g, b);
         break;
     }
-    float alpha = std::pow(t, opacity_gamma_) * opacity_scale_;
+    // Ramp coordinate r in [0,1]: 0 where the map is transparent, 1 where it
+    // is most opaque.
+    float r_ramp = t;
+    switch (ramp_) {
+      case OpacityRamp::Descending:
+        r_ramp = 1.0f - t;
+        break;
+      case OpacityRamp::Symmetric:
+        r_ramp = std::fabs(2.0f * t - 1.0f);
+        break;
+      case OpacityRamp::Ascending:
+      default:
+        break;
+    }
+    // Fully transparent below the cutoff; the ramp restarts from 0 there so
+    // the opacity stays continuous.
+    float alpha = 0.0f;
+    if (r_ramp > opacity_cutoff_) {
+      float tt = (r_ramp - opacity_cutoff_) / (1.0f - opacity_cutoff_);
+      alpha = std::pow(tt, opacity_gamma_) * opacity_scale_;
+    }
     if (alpha < 0.f) alpha = 0.f;
     if (alpha > 1.f) alpha = 1.f;
     lut_[i] = Vec4{r, g, b, alpha};
   }
+}
+
+float TransferFunction::transparent_below() const {
+  // lut_lookup(v) interpolates entries i0 = (int)(v*(n-1)) and i0+1, so a
+  // lookup is exactly transparent iff both have alpha 0. With j the first
+  // entry whose alpha is > 0, every v with v*(n-1) < j-1 touches only entries
+  // <= j-1, all transparent; hence the band is [0, (j-1)/(n-1)).
+  int j = 0;
+  while (j < kSize && lut_[j].w <= 0.0f) ++j;
+  if (j <= 1) return 0.0f;
+  return static_cast<float>(j - 1) / static_cast<float>(kSize - 1);
 }
 
 }  // namespace mueye

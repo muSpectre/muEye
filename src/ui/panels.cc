@@ -6,6 +6,13 @@
  * Part of muEye, a viewer for muGrid data.
  */
 
+// portable-file-dialogs.h includes <windows.h> on Windows, whose min/max
+// macros would otherwise mangle the std::min / std::max calls below.
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -51,7 +58,127 @@ void draw_box_edge(ImDrawList *dl, const Camera &cam, Vec3 a, Vec3 b,
               project_to_image(cam, b, origin, w, h), col, 1.5f);
 }
 
+// Probed once: on Linux, available() runs subprocesses to look for a dialog
+// backend (zenity/kdialog/...), so it must not run every frame. An immutable
+// capability, not UI state — a static const is fine.
+bool dialogs_available() {
+  static const bool can = pfd::settings::available();
+  return can;
+}
+
 }  // namespace
+
+void App::browse_for_file() {
+  if (!dialogs_available()) return;
+  // Default to the *.nc filter. On macOS (pfd's osascript backend) any "*"
+  // pattern disables filtering altogether, so the all-files escape hatch is
+  // omitted there; on Windows/Linux it is kept as a switchable second entry
+  // (the *.nc filter stays first, i.e. the default).
+  std::vector<std::string> filters{"NetCDF files (*.nc)", "*.nc"};
+#ifndef __APPLE__
+  filters.push_back("All files");
+  filters.push_back("*");
+#endif
+  // Open in the current file's *directory*. Passing the file path itself as
+  // the default location makes the macOS (osascript) dialog error out and
+  // silently fail to reopen after a file has been loaded, so derive the
+  // parent directory instead.
+  std::string start_dir;
+  try {
+    std::filesystem::path p{path_edit_};
+    start_dir = (p.has_filename() ? p.parent_path() : p).string();
+  } catch (...) {
+    start_dir.clear();
+  }
+  auto sel =
+      pfd::open_file("Open muGrid NetCDF file", start_dir, filters).result();
+  if (!sel.empty()) {
+    // Show the choice in the field even if the load then fails.
+    std::snprintf(path_edit_, sizeof(path_edit_), "%s", sel.front().c_str());
+    open_path(sel.front());
+  }
+}
+
+void App::request_save_png(const std::string &path) {
+  if (path.empty()) {
+    status_ = "Enter a file name to save the PNG.";
+    return;
+  }
+  const std::filesystem::path out = resolve_output(path);
+  std::error_code ec;
+  if (std::filesystem::exists(out, ec)) {
+    // Never overwrite silently. Ask through the native message box; without a
+    // dialog backend, refuse and let the user pick another name.
+    if (!dialogs_available()) {
+      status_ = "'" + out.string() +
+                "' exists; choose another name (no dialog available to "
+                "confirm overwriting).";
+      return;
+    }
+    auto choice = pfd::message("Overwrite file?",
+                               "'" + out.string() + "' already exists.\n"
+                               "Overwrite it?",
+                               pfd::choice::yes_no, pfd::icon::warning)
+                      .result();
+    if (choice != pfd::button::yes) {
+      status_ = "Save cancelled.";
+      return;
+    }
+  }
+  save_png(out.string());
+}
+
+void App::save_png_as() {
+  if (!dialogs_available() || volume_.empty()) return;
+  const std::string start = resolve_output(png_path_).string();
+  // The native save dialog confirms overwriting itself.
+  std::string sel =
+      pfd::save_file("Save rendering as PNG", start, {"PNG image (*.png)", "*.png"})
+          .result();
+  if (sel.empty()) return;
+  std::filesystem::path p{sel};
+  if (p.extension().empty()) p += ".png";
+  std::snprintf(png_path_, sizeof(png_path_), "%s", p.string().c_str());
+  save_png(p.string());
+}
+
+void App::handle_shortcuts() {
+  ImGuiIO &io = ImGui::GetIO();
+  // Typing into a text field or dragging a widget must not trigger them.
+  if (io.WantTextInput || ImGui::IsAnyItemActive()) return;
+  const bool ctrl = io.KeyCtrl || io.KeySuper;
+
+  if (ctrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) browse_for_file();
+  if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S, false) && !volume_.empty())
+    request_save_png(png_path_);
+  if (ctrl) return;  // the remaining keys are unmodified letters / arrows
+
+  if (has_file_ && meta_.nb_frames > 1) {
+    int f = frame_;
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) --f;
+    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) ++f;
+    if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) f = 0;
+    if (ImGui::IsKeyPressed(ImGuiKey_End, false)) f = meta_.nb_frames - 1;
+    f = std::clamp(f, 0, meta_.nb_frames - 1);
+    if (f != frame_) {
+      frame_ = f;
+      sync_frame_deformation();
+      reload_volume();
+    }
+  }
+  if (ImGui::IsKeyPressed(ImGuiKey_R, false) && !volume_.empty())
+    frame_view(true);
+  if (ImGui::IsKeyPressed(ImGuiKey_B, false)) show_box_ = !show_box_;
+  if (ImGui::IsKeyPressed(ImGuiKey_P, false)) {
+    periodic_ = !periodic_;
+    if (!volume_.empty()) frame_view(false);
+    needs_render_ = true;
+  }
+  if (ImGui::IsKeyPressed(ImGuiKey_I, false)) {
+    mode_ = mode_ == RenderMode::DVR ? RenderMode::Isosurface : RenderMode::DVR;
+    needs_render_ = true;
+  }
+}
 
 // Arrange the panels into a default layout: a left control column (grouped into
 // three stacked tab-nodes) and a large viewport filling the rest. Called once
@@ -62,6 +189,12 @@ static void build_default_layout(ImGuiID dockspace_id) {
   ImGui::DockBuilderSetNodeSize(dockspace_id, ImGui::GetMainViewport()->Size);
 
   ImGuiID center = dockspace_id;
+  // A slim status bar across the bottom (no tab bar, so it reads as a bar).
+  ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.04f,
+                                               nullptr, &center);
+  if (ImGuiDockNode *bn = ImGui::DockBuilderGetNode(bottom))
+    bn->LocalFlags |= ImGuiDockNodeFlags_NoTabBar |
+                      ImGuiDockNodeFlags_NoDockingOverMe;
   ImGuiID left = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.26f,
                                              nullptr, &center);
   ImGuiID left_rest = left;
@@ -78,6 +211,7 @@ static void build_default_layout(ImGuiID dockspace_id) {
   ImGui::DockBuilderDockWindow("Device", left_bot);
   ImGui::DockBuilderDockWindow("Stats", left_bot);
   ImGui::DockBuilderDockWindow("Viewport", center);
+  ImGui::DockBuilderDockWindow("Status", bottom);
   ImGui::DockBuilderFinish(dockspace_id);
 }
 
@@ -97,6 +231,8 @@ void App::draw_ui() {
     }
   }
 
+  handle_shortcuts();
+
   // ----------------------------------------------------------------- Dataset
   // File loader on top, then (once a file is open) the field / frame / scalar
   // controls. This single panel replaces the former separate "muEye" tab.
@@ -112,44 +248,12 @@ void App::draw_ui() {
     // Probed once: on Linux, available() runs subprocesses to look for a
     // dialog backend (zenity/kdialog/...), so it must not run every frame.
     // An immutable capability, not UI state — a static const is fine.
-    static const bool can_browse = pfd::settings::available();
-    ImGui::BeginDisabled(!can_browse);
+    ImGui::BeginDisabled(!dialogs_available());
     // Native file chooser; blocks the UI loop while the modal dialog is open.
-    if (ImGui::Button("Browse...")) {
-      // Default to the *.nc filter. On macOS (pfd's osascript backend) any "*"
-      // pattern disables filtering altogether, so the all-files escape hatch is
-      // omitted there; on Windows/Linux it is kept as a switchable second entry
-      // (the *.nc filter stays first, i.e. the default).
-      std::vector<std::string> filters{"NetCDF files (*.nc)", "*.nc"};
-#ifndef __APPLE__
-      filters.push_back("All files");
-      filters.push_back("*");
-#endif
-      // Open in the current file's *directory*. Passing the file path itself as
-      // the default location makes the macOS (osascript) dialog error out and
-      // silently fail to reopen after a file has been loaded, so derive the
-      // parent directory instead.
-      std::string start_dir;
-      try {
-        std::filesystem::path p{path_edit_};
-        start_dir = (p.has_filename() ? p.parent_path() : p).string();
-      } catch (...) {
-        start_dir.clear();
-      }
-      auto sel = pfd::open_file("Open muGrid NetCDF file", start_dir, filters)
-                     .result();
-      if (!sel.empty()) {
-        // Show the choice in the field even if the load then fails.
-        std::snprintf(path_edit_, sizeof(path_edit_), "%s",
-                      sel.front().c_str());
-        open_path(sel.front());
-      }
-    }
+    if (ImGui::Button("Browse...")) browse_for_file();
     ImGui::EndDisabled();
-    // Only surface load errors / not-yet-loaded here; the loaded dataset's info
-    // line lives next to the field controls below.
-    if (!has_file_ && !status_.empty())
-      ImGui::TextWrapped("%s", status_.c_str());
+    // Errors and action results go to the status bar; this panel only shows
+    // the persistent description of what is loaded.
 
     if (has_file_ && !meta_.fields.empty()) {
       ImGui::Separator();
@@ -179,8 +283,9 @@ void App::draw_ui() {
       }
 
       // Dataset info string ("Field '<name>' frame ...") just before the field
-      // selector.
-      ImGui::TextWrapped("%s", status_.c_str());
+      // selector. Persistent: unlike the status bar it is never overwritten
+      // by "Saved foo.png" and the like.
+      ImGui::TextWrapped("%s", info_.c_str());
 
       std::vector<const char *> names;
       names.reserve(meta_.fields.size());
@@ -189,18 +294,51 @@ void App::draw_ui() {
                              static_cast<int>(names.size()));
 
       const FieldInfo &fi = meta_.fields[field_index_];
-      const char *modes[] = {"Component", "Magnitude", "von Mises (3x3)",
-                             "Trace (3x3)"};
-      int sm = static_cast<int>(scalarize_);
-      if (ImGui::Combo("Scalar", &sm, modes, IM_ARRAYSIZE(modes))) {
-        scalarize_ = static_cast<Scalarize>(sm);
+      // Only offer the reductions that apply to this field: Magnitude needs
+      // more than one component, von Mises and Trace a square tensor. The
+      // others used to be selectable and silently fell back to a sum or the
+      // magnitude. When a field change makes the current choice inapplicable,
+      // fall back to Component.
+      auto applicable = [&](Scalarize m) {
+        switch (m) {
+          case Scalarize::Component:
+            return true;
+          case Scalarize::Magnitude:
+            return fi.nb_components > 1;
+          case Scalarize::VonMises:
+          case Scalarize::Trace:
+            return tensor_dim(fi.nb_components) > 0;
+        }
+        return false;
+      };
+      if (!applicable(scalarize_)) {
+        scalarize_ = Scalarize::Component;
         reload = true;
+      }
+      if (ImGui::BeginCombo("Scalar", to_string(scalarize_))) {
+        for (Scalarize m : {Scalarize::Component, Scalarize::Magnitude,
+                            Scalarize::VonMises, Scalarize::Trace}) {
+          ImGui::BeginDisabled(!applicable(m));
+          if (ImGui::Selectable(to_string(m), m == scalarize_) &&
+              m != scalarize_) {
+            scalarize_ = m;
+            reload = true;
+          }
+          ImGui::EndDisabled();
+        }
+        ImGui::EndCombo();
       }
       if (scalarize_ == Scalarize::Component && fi.nb_components > 1) {
         int c = component_;
         if (ImGui::SliderInt("Component", &c, 0, fi.nb_components - 1)) {
           component_ = c;
           reload = true;
+        }
+        // muGrid flattens tensor components column-major (flat = row + d*col),
+        // so spell out which entry the flat index denotes.
+        if (int d = tensor_dim(fi.nb_components); d > 0) {
+          ImGui::SameLine();
+          ImGui::TextDisabled("= (%d,%d)", component_ % d, component_ / d);
         }
       }
       ImGui::Text("components: %d   sub-points: %d", fi.nb_components,
@@ -227,6 +365,9 @@ void App::draw_ui() {
                        static_cast<int>(disp_names.size()))) {
         disp_field_index_ = disp_map[disp_cur];
         reload_displacement();
+        // Warping switches tiling off (and back on when deselected), so the
+        // framed extent changes: recentre without touching the view angles.
+        if (periodic_ && !volume_.empty()) frame_view(false);
       }
       if (disp_field_index_ >= 0) {
         if (ImGui::DragFloat("Warp scale", &warp_scale_, 0.05f, 0.0f, 1.0e6f,
@@ -247,13 +388,18 @@ void App::draw_ui() {
   // Deformation gradient F: shears the reference box into a (Bravais) cell.
   // Editing F rebuilds inv_cell in make_render_params, so only a re-render is
   // needed. Identity => the orthogonal box exactly as before.
-  if (has_file_ && !volume_.empty()) {
+  // Always present (contents disabled without data) so the docked tab does
+  // not pop in and out of the layout when files are opened.
+  {
     ImGui::Begin("Cell");
+    ImGui::BeginDisabled(!(has_file_ && !volume_.empty()));
     const bool is_2d = meta_.spatial_dim == 2;
     ImGui::TextWrapped(
-        deformation_from_file_
-            ? "Deformation gradient F (read from file). C = F * box."
-            : "Deformation gradient F (identity = orthogonal). C = F * box.");
+        F_user_override_
+            ? "Deformation gradient F (edited by hand). C = F * box."
+            : deformation_from_file_
+                  ? "Deformation gradient F (read from file). C = F * box."
+                  : "Deformation gradient F (identity = orthogonal). C = F * box.");
     const int dim = is_2d ? 2 : 3;
     bool changed = false;
     // Edit the leading dim x dim block row by row; the z row/col stay identity
@@ -266,6 +412,8 @@ void App::draw_ui() {
       if (ImGui::InputScalarN("##Frow", ImGuiDataType_Float, row, dim, nullptr,
                               nullptr, "%.4f")) {
         for (int c = 0; c < dim; ++c) F_[3 * r + c] = row[c];
+        deformation_from_file_ = false;
+        F_user_override_ = true;  // stop frame changes from overwriting it
         changed = true;
       }
       ImGui::PopID();
@@ -274,17 +422,17 @@ void App::draw_ui() {
       for (int i = 0; i < 9; ++i)
         F_[i] = (i == 0 || i == 4 || i == 8) ? 1.0f : 0.0f;
       deformation_from_file_ = false;
+      F_user_override_ = true;
       changed = true;
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Frame cell")) {
-      Vec3 center;
-      float extent;
-      cell_bounds(center, extent);
-      camera_.frame_aabb(center, extent);
-      needs_render_ = true;
+    // Offer the file's tensor back once the user has overridden it.
+    const bool file_has_F = meta_.has_deformation || !meta_.applied_F.empty();
+    if (F_user_override_ && file_has_F) {
+      ImGui::SameLine();
+      if (ImGui::Button("Use file's F")) adopt_file_deformation();
     }
     if (changed) needs_render_ = true;
+    ImGui::EndDisabled();
     ImGui::End();
   }
 
@@ -306,21 +454,60 @@ void App::draw_ui() {
       needs_render_ = true;
 
     if (mode_ == RenderMode::DVR) {
-      if (ImGui::SliderFloat("Density", &density_scale_, 0.05f, 5.0f, "%.2f"))
+      // The one global opacity control (the transfer function's former
+      // "Opacity" slider was a second multiplier on the same quantity).
+      if (ImGui::SliderFloat("Opacity", &density_scale_, 0.05f, 5.0f, "%.2f"))
         needs_render_ = true;
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Global multiplier on the transfer function's "
+                          "per-voxel opacity.");
     } else {
-      float lo = volume_.empty() ? 0.f : volume_.vmin;
-      float hi = volume_.empty() ? 1.f : volume_.vmax;
+      float lo = volume_.empty() ? 0.f : data_min();
+      float hi = volume_.empty() ? 1.f : data_max();
       if (ImGui::SliderFloat("Iso value", &iso_value_, lo, hi, "%.4g"))
         needs_render_ = true;
+    }
+    // Fixed value range for colours and the iso slider, so frames of a time
+    // series are comparable instead of each being stretched to its own
+    // min/max.
+    if (ImGui::Checkbox("Lock range", &range_locked_)) {
+      if (range_locked_ && !volume_.empty()) {
+        range_min_ = volume_.vmin;
+        range_max_ = volume_.vmax;
+      }
+      needs_render_ = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Map colours and the iso slider to a fixed value range "
+                        "instead of each frame's own minimum and maximum.");
+    if (range_locked_) {
+      float r[2] = {range_min_, range_max_};
+      if (ImGui::InputFloat2("Range", r, "%.4g") && r[1] > r[0]) {
+        range_min_ = r[0];
+        range_max_ = r[1];
+        needs_render_ = true;
+      }
     }
 
     if (ImGui::ColorEdit3("Background", bg_)) needs_render_ = true;
 
     if (ImGui::SliderInt("Downscale", &render_downscale_, 1, 4))
       needs_render_ = true;
+    ImGui::Checkbox("Adaptive quality while interacting", &adaptive_quality_);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Render coarser while the mouse is held so orbiting "
+                        "stays fluid, then refine at the chosen quality on "
+                        "release.");
 
     ImGui::Separator();
+    // View reset lives here, next to the viewport-related toggles, rather
+    // than hidden in the Cell panel.
+    ImGui::BeginDisabled(volume_.empty());
+    if (ImGui::Button("Reset view")) frame_view(true);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Frame the cell and reset the view direction (R).");
+    ImGui::SameLine();
     // Drawn as a viewport overlay, so toggling needs no re-render.
     ImGui::Checkbox("Show box", &show_box_);
 
@@ -331,12 +518,7 @@ void App::draw_ui() {
     if (tiling_changed) {
       for (int &r : replicas_) r = r < 1 ? 1 : (r > 8 ? 8 : r);
       // Keep the view direction but recentre on the tiled (possibly sheared) cell.
-      if (!volume_.empty()) {
-        Vec3 center;
-        float extent;
-        cell_bounds(center, extent);
-        camera_.retarget_aabb(center, extent);
-      }
+      if (!volume_.empty()) frame_view(false);
       needs_render_ = true;
     }
 
@@ -345,14 +527,26 @@ void App::draw_ui() {
     // outline is a UI overlay and is not part of the saved image).
     ImGui::InputText("PNG file", png_path_, sizeof(png_path_));
     ImGui::BeginDisabled(volume_.empty());
-    if (ImGui::Button("Save PNG")) save_png(png_path_);
+    if (ImGui::Button("Save PNG")) request_save_png(png_path_);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Save to the file above (Ctrl+S); asks before "
+                        "overwriting.");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!dialogs_available());
+    if (ImGui::Button("Save as...")) save_png_as();
+    ImGui::EndDisabled();
     ImGui::EndDisabled();
   }
   ImGui::End();
 
   // --------------------------------------------------- Transfer function
-  if (mode_ == RenderMode::DVR) {
+  // Always present; its controls only act in DVR mode, so they are disabled
+  // (not hidden, which would remove the tab from the dock) for isosurfaces.
+  {
     ImGui::Begin("Transfer function");
+    const bool dvr = mode_ == RenderMode::DVR;
+    if (!dvr) ImGui::TextDisabled("Used in DVR mode only.");
+    ImGui::BeginDisabled(!dvr);
     const char *cmaps[] = {"Viridis", "Grayscale", "Cool-Warm"};
     int cm = static_cast<int>(tf_.colormap());
     if (ImGui::Combo("Colormap", &cm, cmaps, IM_ARRAYSIZE(cmaps))) {
@@ -360,36 +554,80 @@ void App::draw_ui() {
       tf_dirty_ = true;
       needs_render_ = true;
     }
-    float op = tf_.opacity_scale();
-    if (ImGui::SliderFloat("Opacity", &op, 0.0f, 2.0f, "%.2f")) {
-      tf_.set_opacity_scale(op);
-      tf_dirty_ = true;
-      needs_render_ = true;
+    if (ImGui::BeginCombo("Opacity ramp", to_string(tf_.ramp()))) {
+      for (OpacityRamp r : {OpacityRamp::Ascending, OpacityRamp::Descending,
+                            OpacityRamp::Symmetric}) {
+        if (ImGui::Selectable(to_string(r), r == tf_.ramp()) &&
+            r != tf_.ramp()) {
+          tf_.set_ramp(r);
+          tf_dirty_ = true;
+          needs_render_ = true;
+        }
+      }
+      ImGui::EndCombo();
     }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Which values are transparent. Use Symmetric with a "
+                        "diverging colormap (Cool-Warm) so both signs show.");
     float g = tf_.opacity_gamma();
     if (ImGui::SliderFloat("Opacity gamma", &g, 0.2f, 4.0f, "%.2f")) {
       tf_.set_opacity_gamma(g);
       tf_dirty_ = true;
       needs_render_ = true;
     }
+    float cut = tf_.opacity_cutoff();
+    if (ImGui::SliderFloat("Cutoff", &cut, 0.0f, 0.9f, "%.2f")) {
+      tf_.set_opacity_cutoff(cut);
+      tf_dirty_ = true;
+      needs_render_ = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Values below this fraction of the range are fully "
+                        "transparent (and skipped by the ray marcher).");
 
-    // A small preview strip of the colormap.
+    // Preview: the colormap drawn *with its opacity* over a checkerboard, so
+    // the transparent band and the ramp are visible, plus the alpha curve.
     ImDrawList *dl = ImGui::GetWindowDrawList();
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     float w = ImGui::GetContentRegionAvail().x;
-    float h = 24.0f;
-    int steps = 64;
-    for (int i = 0; i < steps; ++i) {
+    float h = 48.0f;
+    const float cs = 8.0f;  // checker size
+    for (int cy = 0; cy * cs < h; ++cy)
+      for (int cx = 0; cx * cs < w; ++cx) {
+        ImU32 cc = ((cx + cy) & 1) ? IM_COL32(150, 150, 150, 255)
+                                   : IM_COL32(215, 215, 215, 255);
+        dl->AddRectFilled(
+            ImVec2(p0.x + cx * cs, p0.y + cy * cs),
+            ImVec2(std::min(p0.x + (cx + 1) * cs, p0.x + w),
+                   std::min(p0.y + (cy + 1) * cs, p0.y + h)),
+            cc);
+      }
+    const int n = tf_.size();
+    const Vec4 *lut = tf_.data();
+    const int steps = 128;
+    std::vector<ImVec2> curve;
+    curve.reserve(steps + 1);
+    for (int i = 0; i <= steps; ++i) {
       float t0 = static_cast<float>(i) / steps;
-      const Vec4 *lut = tf_.data();
-      int li = static_cast<int>(t0 * (tf_.size() - 1));
-      Vec4 c = lut[li];
-      ImU32 col = IM_COL32(static_cast<int>(c.x * 255), static_cast<int>(c.y * 255),
-                           static_cast<int>(c.z * 255), 255);
-      dl->AddRectFilled(ImVec2(p0.x + w * t0, p0.y),
-                        ImVec2(p0.x + w * (i + 1) / steps, p0.y + h), col);
+      Vec4 c = lut[std::min(n - 1, static_cast<int>(t0 * (n - 1)))];
+      if (i < steps) {
+        float t1 = static_cast<float>(i + 1) / steps;
+        ImU32 col = IM_COL32(static_cast<int>(c.x * 255),
+                             static_cast<int>(c.y * 255),
+                             static_cast<int>(c.z * 255),
+                             static_cast<int>(c.w * 255));
+        dl->AddRectFilled(ImVec2(p0.x + w * t0, p0.y),
+                          ImVec2(p0.x + w * t1, p0.y + h), col);
+      }
+      curve.push_back(ImVec2(p0.x + w * t0, p0.y + h * (1.0f - c.w)));
     }
+    dl->AddPolyline(curve.data(), static_cast<int>(curve.size()),
+                    IM_COL32(20, 20, 20, 255), ImDrawFlags_None, 1.5f);
     ImGui::Dummy(ImVec2(w, h));
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Colour and opacity over the value range; the curve "
+                        "is the opacity.");
+    ImGui::EndDisabled();
     ImGui::End();
   }
 
@@ -427,12 +665,50 @@ void App::draw_ui() {
     } else {
       ImGui::TextDisabled("No volume loaded.");
     }
-    ImGui::Text("Render: %d x %d", last_render_w_, last_render_h_);
-    ImGui::Text("Frame time: %.2f ms (%.1f fps)", last_render_ms_,
-                last_render_ms_ > 0 ? 1000.0 / last_render_ms_ : 0.0);
-    ImGui::Text("UI: %.1f fps", ImGui::GetIO().Framerate);
+    if (last_downscale_ > render_downscale_)
+      ImGui::Text("Render: %d x %d (interactive, 1/%d)", last_render_w_,
+                  last_render_h_, last_downscale_);
+    else
+      ImGui::Text("Render: %d x %d", last_render_w_, last_render_h_);
+    // Rendering is on demand, so a "frame rate" derived from one render would
+    // mislead; report the durations instead. The UI refresh rate is throttled
+    // to a few Hz when idle by design.
+    ImGui::Text("Render time: %.2f ms", last_render_ms_);
+    ImGui::Text("Load time: %.1f ms", last_load_ms_);
+    ImGui::TextDisabled("UI refresh: %.0f Hz (throttled when idle)",
+                        ImGui::GetIO().Framerate);
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Keyboard shortcuts")) {
+      ImGui::BulletText("Left / Right, Home / End: previous / next, first / "
+                        "last frame");
+      ImGui::BulletText("R: reset view    B: box outline    P: periodic "
+                        "images    I: DVR / isosurface");
+      ImGui::BulletText("Ctrl+O: open file    Ctrl+S: save PNG");
+      ImGui::BulletText("Mouse: left-drag orbit, right/middle-drag pan, "
+                        "wheel zoom; drop a file to open it");
+    }
   }
   ImGui::End();
+
+  // -------------------------------------------------------------- Status
+  // One-line message bar: the result of the last action (load, save, backend
+  // switch) or the last error, plus the active renderer on the right.
+  {
+    ImGui::Begin("Status", nullptr,
+                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoCollapse);
+    const char *backend = renderer_ ? renderer_->name() : "-";
+    float right_w = ImGui::CalcTextSize(backend).x;
+    float avail = ImGui::GetContentRegionAvail().x;
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + avail - right_w -
+                           ImGui::GetStyle().ItemSpacing.x * 2);
+    ImGui::TextUnformatted(status_.c_str());
+    ImGui::PopTextWrapPos();
+    if (ImGui::IsItemHovered() && !status_.empty())
+      ImGui::SetTooltip("%s", status_.c_str());
+    ImGui::SameLine(avail - right_w);
+    ImGui::TextDisabled("%s", backend);
+    ImGui::End();
+  }
 
   // ------------------------------------------------------------ Viewport
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
@@ -443,24 +719,39 @@ void App::draw_ui() {
     int vh = static_cast<int>(avail.y);
 
     if (vw > 0 && vh > 0) {
-      // Re-render on demand or when the viewport was resized.
-      int want_w = vw / render_downscale_;
-      int want_h = vh / render_downscale_;
+      // Re-render on demand or when the viewport was resized. While a mouse
+      // button is held (orbit/pan, slider drags) the effective downscale grows
+      // adaptively; on release it drops back to the user's setting, which
+      // shows up here as a size change and triggers the full-quality refine.
+      const int eff = effective_downscale(ImGui::IsAnyMouseDown());
+      int want_w = std::max(1, vw / eff);
+      int want_h = std::max(1, vh / eff);
       if (needs_render_ || want_w != last_render_w_ || want_h != last_render_h_) {
-        render(vw, vh);
+        render(vw, vh, eff);
         needs_render_ = false;
       }
 
       // C-style cast so this works whether ImTextureID is a pointer (older
       // ImGui) or an integer handle (ImU64 in recent versions).
-      ImGui::Image((ImTextureID)(std::uintptr_t)texture_.id(),
-                   ImVec2(static_cast<float>(vw), static_cast<float>(vh)));
+      const ImVec2 img_pos = ImGui::GetCursorScreenPos();
+      const ImVec2 img_size(static_cast<float>(vw), static_cast<float>(vh));
+      ImGui::Image((ImTextureID)(std::uintptr_t)texture_.id(), img_size);
+      // An invisible button over the image owns the mouse input: unlike a
+      // hover test on the (non-interactive) image it stays *active* while a
+      // button pressed on it is held, so an orbit or pan continues even when
+      // the cursor leaves the viewport mid-drag.
+      ImGui::SetCursorScreenPos(img_pos);
+      ImGui::InvisibleButton("##viewport_input", img_size,
+                             ImGuiButtonFlags_MouseButtonLeft |
+                                 ImGuiButtonFlags_MouseButtonRight |
+                                 ImGuiButtonFlags_MouseButtonMiddle);
+      const bool input_active = ImGui::IsItemActive();
+      const bool input_hovered = ImGui::IsItemHovered();
 
       // Box outline: project the edges of the (possibly tiled) volume box
       // with the render camera and draw them over the image. Backend-agnostic
       // by construction — no ray-march kernel is involved.
       if (show_box_ && !volume_.empty()) {
-        ImVec2 img_pos = ImGui::GetItemRectMin();
         // Edge vectors of the (possibly sheared) tiled cell are the columns of
         // C scaled by the replica counts; corners are C * frac, frac in {0,rep}.
         Mat3 C = world_cell();
@@ -494,18 +785,23 @@ void App::draw_ui() {
         }
       }
 
-      // Mouse interaction over the image drives the orbit camera.
-      if (ImGui::IsItemHovered()) {
+      // Mouse interaction drives the orbit camera: drags while the viewport
+      // button is active (pressed on the image, wherever the cursor is now),
+      // wheel zoom while hovering it.
+      {
         ImGuiIO &io = ImGui::GetIO();
-        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-          camera_.orbit(io.MouseDelta.x * 0.01f, io.MouseDelta.y * 0.01f);
-          needs_render_ = true;
-        } else if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) ||
-                   ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-          camera_.pan(io.MouseDelta.x / vw, io.MouseDelta.y / vh);
-          needs_render_ = true;
+        if (input_active) {
+          if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            camera_.orbit(io.MouseDelta.x * 0.01f, io.MouseDelta.y * 0.01f);
+            needs_render_ = true;
+          } else if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) ||
+                     ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+            camera_.pan(io.MouseDelta.x / vw, io.MouseDelta.y / vh,
+                        static_cast<float>(vw) / vh);
+            needs_render_ = true;
+          }
         }
-        if (io.MouseWheel != 0.0f) {
+        if (input_hovered && io.MouseWheel != 0.0f) {
           camera_.zoom(io.MouseWheel);
           needs_render_ = true;
         }

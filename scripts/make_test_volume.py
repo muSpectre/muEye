@@ -5,18 +5,28 @@ Creates a 64^3 grid with a scalar field ``phi`` holding a solid cube centred in
 the domain, plus a second frame with the cube shifted, so the frame slider has
 something to scrub.
 
-Run inside the workspace venv (which has muGrid with NetCDF support):
+Needs the muGrid Python package with NetCDF support (e.g. the workspace venv
+``../muGrid/venv`` with the muGrid build tree on PYTHONPATH):
 
-    source ../venv/bin/activate     # from muEye/
     python scripts/make_test_volume.py demo.nc
+    python scripts/make_test_volume.py demo.nc 32
 
-Pass ``--shear S`` to also write a ``deformation_gradient`` global attribute
-(a simple shear F_xy = S), which makes muEye render the volume in the sheared
-(non-orthogonal / Bravais) cell C = F * box:
+Options (position-independent):
 
-    python scripts/make_test_volume.py sheared.nc 64 --shear 0.3
+``--shear S``   also write a ``deformation_gradient`` global attribute (a
+                simple shear F_xy = S), which makes muEye render the volume in
+                the sheared (non-orthogonal / Bravais) cell C = F * box:
+
+                    python scripts/make_test_volume.py sheared.nc 64 --shear 0.3
+
+``--warp``      also write a 3-component displacement field ``u`` (a bend plus
+                a wave, in grid-point units) that muEye can render as deformed
+                geometry via the Dataset panel's "Displacement" selector:
+
+                    python scripts/make_test_volume.py --warp warped.nc
 """
 
+import argparse
 import sys
 
 import numpy as np
@@ -37,19 +47,26 @@ def cube(n, center, half=0.25):
     return (cheby <= half).astype(np.float64)
 
 
-def main():
-    args = sys.argv[1:]
-    shear = 0.0
-    if "--shear" in args:
-        i = args.index("--shear")
-        shear = float(args[i + 1])
-        del args[i : i + 2]
-    path = args[0] if len(args) > 0 else "demo.nc"
-    n = int(args[1]) if len(args) > 1 else 64
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Write a small muGrid NetCDF test volume for muEye.")
+    parser.add_argument("path", nargs="?", default="demo.nc",
+                        help="output file (default: demo.nc)")
+    parser.add_argument("n", nargs="?", type=int, default=64,
+                        help="grid points per axis (default: 64)")
+    parser.add_argument("--shear", type=float, default=0.0, metavar="S",
+                        help="write a deformation_gradient attribute with F_xy=S")
+    parser.add_argument("--warp", action="store_true",
+                        help="also write a 3-component displacement field 'u'")
+    args = parser.parse_args(argv)
+    if args.n < 2:
+        parser.error("n must be at least 2")
+    return args
 
-    warp = "--warp" in args
-    if warp:
-        del args[args.index("--warp")]
+
+def main():
+    args = parse_args()
+    path, n, shear, warp = args.path, args.n, args.shear, args.warp
 
     fc = muGrid.GlobalFieldCollection((n, n, n))
     phi = fc.real_field("phi", [1])

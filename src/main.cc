@@ -8,7 +8,9 @@
  */
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <string>
 
 #if defined(__APPLE__)
 #define GL_SILENCE_DEPRECATION
@@ -79,6 +81,41 @@ static void load_platform_font() {
   std::printf("muEye: no platform font found; using built-in font\n");
 }
 
+// Where Dear ImGui persists the window/docking layout. ImGui's default is
+// "imgui.ini" in the *current working directory*, which made the layout depend
+// on where muEye was launched from and littered data directories (and the
+// source tree) with ini files. Use the platform's per-user configuration
+// directory instead; fall back to the CWD default only if no home is known.
+//
+//   Linux/Unix: $XDG_CONFIG_HOME/muEye/imgui.ini  (default ~/.config)
+//   macOS:      ~/Library/Application Support/muEye/imgui.ini
+//   Windows:    %APPDATA%\muEye\imgui.ini
+//
+// Returns an empty string when no suitable directory could be found or made.
+static std::string user_ini_path() {
+  namespace fs = std::filesystem;
+  fs::path dir;
+#if defined(_WIN32)
+  if (const char *appdata = std::getenv("APPDATA"); appdata && *appdata)
+    dir = fs::path(appdata);
+#elif defined(__APPLE__)
+  if (const char *home = std::getenv("HOME"); home && *home)
+    dir = fs::path(home) / "Library" / "Application Support";
+#else
+  if (const char *xdg = std::getenv("XDG_CONFIG_HOME"); xdg && *xdg) {
+    dir = fs::path(xdg);
+  } else if (const char *home = std::getenv("HOME"); home && *home) {
+    dir = fs::path(home) / ".config";
+  }
+#endif
+  if (dir.empty()) return "";
+  dir /= "muEye";
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  if (ec && !fs::is_directory(dir, ec)) return "";
+  return (dir / "imgui.ini").string();
+}
+
 int main(int argc, char **argv) {
   glfwSetErrorCallback(glfw_error_callback);
   if (!glfwInit()) {
@@ -119,6 +156,10 @@ int main(int argc, char **argv) {
   // different DPI (the GLFW backend reports per-monitor content scale, and
   // ImGui >= 1.92 rasterizes fonts dynamically at the effective scale).
   io.ConfigDpiScaleFonts = true;
+  // Persist the layout per user rather than in the CWD. The string must
+  // outlive the ImGui context, which only stores the pointer.
+  static const std::string ini_path = user_ini_path();
+  if (!ini_path.empty()) io.IniFilename = ini_path.c_str();
   ImGui::StyleColorsLight();
   ImGui_ImplGlfw_InitForOpenGL(window, true);
   ImGui_ImplOpenGL3_Init(glsl_version);
@@ -131,6 +172,17 @@ int main(int argc, char **argv) {
   // current — i.e. before the ImGui/GLFW teardown below destroys it.
   {
     mueye::App app;
+    // Dropping a file onto the window opens it (the first path of a
+    // multi-file drop). The callback runs from glfwPollEvents /
+    // glfwWaitEventsTimeout, i.e. between ImGui frames, so loading there is
+    // safe.
+    glfwSetWindowUserPointer(window, &app);
+    glfwSetDropCallback(window, [](GLFWwindow *w, int count,
+                                   const char **paths) {
+      if (count <= 0 || paths == nullptr || paths[0] == nullptr) return;
+      auto *a = static_cast<mueye::App *>(glfwGetWindowUserPointer(w));
+      if (a != nullptr) a->load_file(paths[0]);
+    });
     if (argc > 1) {
       app.load_file(argv[1]);
     }
@@ -175,6 +227,10 @@ int main(int argc, char **argv) {
 
       glfwSwapBuffers(window);
     }
+    // The drop callback holds the App by pointer; detach it before the App
+    // is destroyed at the end of this scope.
+    glfwSetDropCallback(window, nullptr);
+    glfwSetWindowUserPointer(window, nullptr);
   }
 
   ImGui_ImplOpenGL3_Shutdown();

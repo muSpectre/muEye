@@ -154,8 +154,10 @@ __global__ void render_kernel_dvr(gpuTextureObject_t vol,
   if (x >= w || y >= h) return;
   float u = (x + 0.5f) / w;
   float v = (y + 0.5f) / h;
-  Vec4 c = trace_ray_dvr(TextureSampler{vol}, TextureDispSampler{disp}, lut, p,
-                         cam, u, v);
+  // NoBricks: no brick summary is uploaded to the device yet, so the GPU
+  // path renders without empty-space skipping (same image, more samples).
+  Vec4 c = trace_ray_dvr(TextureSampler{vol}, TextureDispSampler{disp},
+                         NoBricks{}, lut, p, cam, u, v);
   write_rgba(out, (static_cast<std::size_t>(y) * w + x) * 4, c);
 }
 
@@ -168,8 +170,8 @@ __global__ void render_kernel_iso(gpuTextureObject_t vol,
   if (x >= w || y >= h) return;
   float u = (x + 0.5f) / w;
   float v = (y + 0.5f) / h;
-  Vec4 c = trace_ray_iso(TextureSampler{vol}, TextureDispSampler{disp}, p, cam,
-                         u, v);
+  Vec4 c = trace_ray_iso(TextureSampler{vol}, TextureDispSampler{disp},
+                         NoBricks{}, p, cam, u, v);
   write_rgba(out, (static_cast<std::size_t>(y) * w + x) * 4, c);
 }
 
@@ -424,9 +426,20 @@ void GpuRenderer::render(const RenderParams &params, const Camera &camera,
 
   launch(handle_to_tex(d_tex_), handle_to_tex(d_disp_tex_), d_lut_, params,
          camera, d_output_, w, h);
-  GPU_DEVICE_SYNCHRONIZE();
-
-  GPU_MEMCPY_D2H(fb.rgba.data(), d_output_, bytes);
+  // Use the non-throwing runtime calls and report through last_error():
+  // muGrid's GPU_CHECK-based macros throw, and an exception escaping render()
+  // would take the whole viewer down for a recoverable device fault.
+  GPU_(Error_t) err = GPU_(GetLastError)();
+  if (err == GPU_(Success)) err = GPU_(DeviceSynchronize)();
+  if (err != GPU_(Success)) {
+    error_ = std::string("render kernel failed: ") + GPU_(GetErrorString)(err);
+    return;
+  }
+  err = GPU_(Memcpy)(fb.rgba.data(), d_output_, bytes, GPU_(MemcpyDeviceToHost));
+  if (err != GPU_(Success)) {
+    error_ = std::string("framebuffer download failed: ") +
+             GPU_(GetErrorString)(err);
+  }
 }
 
 bool GpuRenderer::render_to_gl(const RenderParams &params, const Camera &camera,
@@ -470,15 +483,42 @@ bool GpuRenderer::render_to_gl(const RenderParams &params, const Camera &camera,
   auto res = static_cast<gpuGraphicsResource_t>(pbo_res_);
   unsigned char *dev_ptr = nullptr;
   std::size_t mapped_bytes = 0;
-  GPU_(GraphicsMapResources)(1, &res, 0);
-  GPU_(GraphicsResourceGetMappedPointer)(reinterpret_cast<void **>(&dev_ptr),
-                                         &mapped_bytes, res);
+  const std::size_t needed = static_cast<std::size_t>(width) * height * 4;
+  GPU_(Error_t) err = GPU_(GraphicsMapResources)(1, &res, 0);
+  if (err != GPU_(Success)) {
+    // Never launch into an unmapped buffer. Give up on interop for good (the
+    // caller falls back to render() + host upload) rather than retrying and
+    // failing every frame.
+    error_ = std::string("GL interop map failed: ") + GPU_(GetErrorString)(err);
+    interop_failed_ = true;
+    return false;
+  }
+  err = GPU_(GraphicsResourceGetMappedPointer)(
+      reinterpret_cast<void **>(&dev_ptr), &mapped_bytes, res);
+  if (err != GPU_(Success) || dev_ptr == nullptr || mapped_bytes < needed) {
+    GPU_(GraphicsUnmapResources)(1, &res, 0);
+    error_ = err != GPU_(Success)
+                 ? std::string("GL interop pointer failed: ") +
+                       GPU_(GetErrorString)(err)
+                 : std::string("GL interop buffer smaller than the frame");
+    interop_failed_ = true;
+    return false;
+  }
 
   launch(handle_to_tex(d_tex_), handle_to_tex(d_disp_tex_), d_lut_, params,
          camera, dev_ptr, width, height);
+  err = GPU_(GetLastError)();
 
   // Unmapping synchronizes the render with subsequent GL use of the buffer.
-  GPU_(GraphicsUnmapResources)(1, &res, 0);
+  GPU_(Error_t) unmap_err = GPU_(GraphicsUnmapResources)(1, &res, 0);
+  if (err == GPU_(Success)) err = unmap_err;
+  if (err != GPU_(Success)) {
+    // A launch or sync fault: report it and let the caller fall back to the
+    // host path for this frame (which surfaces its own error if the device
+    // is wedged).
+    error_ = std::string("render kernel failed: ") + GPU_(GetErrorString)(err);
+    return false;
+  }
 
   // Device-to-device copy PBO -> texture (no host round trip).
   glBindTexture(GL_TEXTURE_2D, gl_tex);

@@ -10,7 +10,9 @@ muEye reuses muGrid internally:
 
 - **I/O** — `muGrid::FileIONetCDF` reads frames/fields; muEye introspects the file's
   grid (`nx`/`ny`/`nz`), frame count and variables via the netcdf-c API first, since
-  muGrid's read API needs a pre-shaped `GlobalFieldCollection`.
+  muGrid's read API needs a pre-shaped `GlobalFieldCollection`. Single components and
+  non-double variables are fetched directly through netcdf-c (only the selected
+  component, as `float`); `muEye_check` verifies both readers agree bit for bit.
 - **Data representation** — `muGrid::GlobalFieldCollection` / `Field`; field data
   (double precision) is downcast once to `float` on load (the renderer is single
   precision throughout).
@@ -22,12 +24,27 @@ muEye reuses muGrid internally:
 
 ## Features
 
-- Direct volume rendering (DVR) with an editable transfer function (Viridis / Grayscale
-  / Cool-Warm colormaps + opacity ramp).
+- Direct volume rendering (DVR) with an editable transfer function: Viridis / Grayscale
+  / Cool-Warm colormaps, an opacity ramp with gamma and a **cutoff** (values below it
+  are fully transparent), and a choice of **ascending / descending / symmetric** ramp
+  (symmetric = transparent at the centre of the range, for diverging maps). The preview
+  shows colour *and* opacity.
 - Isosurface ray-casting with on-the-fly gradient (Phong) shading.
-- Orbit camera (left-drag orbit, right/middle-drag pan, wheel zoom).
+- **Empty-space skipping**: a per-brick min/max summary of the volume lets the ray
+  marcher jump over regions that are transparent (DVR) or cannot contain the iso level;
+  the result is bit-identical to the plain march (`muEye_check` asserts it), 2–3× faster
+  on sparse volumes (CPU backend; the GPU backends do not use it yet).
+- **Adaptive quality**: while the mouse is held the viewport renders at a coarser
+  resolution chosen from the last full-quality render time, then refines on release
+  (Render panel → "Adaptive quality while interacting").
+- Orbit camera (left-drag orbit, right/middle-drag pan, wheel zoom; drags continue when
+  the cursor leaves the viewport). 2D fields open face-on. **R** resets the view.
 - Field / frame / component selection, plus derived scalars: vector **magnitude** and,
-  for 3×3 tensor fields, **von Mises** and **trace**.
+  for 2×2 and 3×3 tensor fields, **von Mises** and **trace**. Tensor components are
+  labelled `(row,col)`; muGrid flattens them column-major. Only the reductions that
+  apply to the selected field are offered.
+- **Lock range** (Render panel): map colours and the iso slider to a fixed value range
+  instead of each frame's own min/max, so frames of a time series are comparable.
 - Toggleable **box outline** around the rendered volume (Render panel → "Show box").
 - **Non-orthogonal (Bravais) cells**: render the volume in a sheared unit cell given by a
   macroscopic deformation gradient **F** (cell edge vectors = columns of `C = F · box`).
@@ -52,11 +69,20 @@ muEye reuses muGrid internally:
   - **CUDA / HIP** — single-source kernel sharing `render_core.hh` with the CPU path
     (opt-in; requires the respective toolchain).
 - Adjustable render downscale for interactivity.
-- **PNG snapshots** of the rendered scene (Render panel → "Save PNG"), written at full
-  viewport resolution regardless of the downscale setting.
+- **PNG snapshots** of the rendered scene (Render panel → "Save PNG" / "Save as...",
+  Ctrl+S), written at full viewport resolution regardless of the downscale setting and,
+  by default, next to the data file. Existing files are never overwritten without asking.
+- Files open from the path box, **Browse...** (Ctrl+O), the command line, or by
+  **dragging them onto the window**. A status bar along the bottom shows the result of
+  the last action and the active backend.
+- **Keyboard shortcuts**: Left/Right and Home/End step frames, R resets the view, B
+  toggles the box, P periodic images, I switches DVR/isosurface (listed under Stats →
+  "Keyboard shortcuts").
 - Uses the host platform's **native UI font** (San Francisco on macOS, Segoe UI on
   Windows, Ubuntu/Cantarell/Noto→DejaVu Sans on Linux), HiDPI-aware, with a graceful
-  fallback to Dear ImGui's built-in font.
+  fallback to Dear ImGui's built-in font. The window layout is remembered per user
+  (`~/.config/muEye/imgui.ini`, `~/Library/Application Support/muEye/` or
+  `%APPDATA%\muEye\`).
 
 ## Build
 
@@ -76,9 +102,11 @@ On macOS install NetCDF e.g. with `brew install netcdf`. On Debian/Ubuntu:
 ## Run
 
 ```bash
-# generate a test volume (needs muGrid's Python package; use the workspace venv)
-source ../venv/bin/activate
-python scripts/make_test_volume.py demo.nc
+# generate a test volume (needs muGrid's Python package, e.g. the workspace venv
+# ../muGrid/venv with the muGrid build tree on PYTHONPATH)
+source ../muGrid/venv/bin/activate
+python scripts/make_test_volume.py demo.nc            # 64^3 cube, 2 frames
+python scripts/make_test_volume.py --warp --shear 0.2 warped.nc 32   # + displacement, sheared cell
 
 # launch the viewer (optionally auto-open a file)
 # macOS builds a .app bundle (so the Dock/Finder icon is the muSpectre logo):
@@ -118,8 +146,13 @@ Notes:
 - For a small-strain workflow, store the **average strain** ε instead under
   `average_strain`; muEye applies `F = I + ε`.
 - muEye's rendered cell is `C = F · diag(box)`, where `box` is the grid shape normalized
-  so the longest axis is 1. `scripts/make_test_volume.py --shear S` writes such a file
-  for testing, and `./build/muEye_check --view file.nc [field]` renders it headlessly.
+  so the longest axis is 1 (or the `domain_lengths` attribute when present).
+  `scripts/make_test_volume.py --shear S` writes such a file for testing, and
+  `./build/muEye_check --view file.nc [field]` renders it headlessly to
+  `<file>.view.png` / `<file>.view_rep.png` next to the data.
+- A per-frame `applied_deformation_gradient` variable (as muTopOpt writes) supersedes
+  the global attribute frame by frame. Editing F by hand in the Cell panel overrides
+  both until "Use file's F" is pressed.
 
 ## Rendering backends
 
@@ -166,11 +199,11 @@ cmake -S . -B build -DMUEYE_MUGRID_SOURCE_DIR=../muGrid -DMUEYE_ENABLE_HIP=ON
 src/
   main.cc              GLFW + OpenGL3 + ImGui bootstrap and main loop
   App.{hh,cc}          application state; load + render orchestration
-  ui/panels.cc         ImGui windows (file/dataset/render/transfer/device/stats/viewport)
+  ui/panels.cc         ImGui windows (dataset/cell/render/transfer/device/stats/status/viewport), shortcuts, dialogs
   ui/OrbitCamera.*     mouse-driven orbit camera
   ui/TransferFunction.* colormap + opacity LUT
-  io/Volume.*          dense float volume + scalarization
-  io/VolumeLoader.*    netcdf-c introspection + muGrid-backed field read
+  io/Volume.*          dense float volume + scalarization + brick min/max summary
+  io/VolumeLoader.*    netcdf-c introspection; muGrid-backed and direct netcdf-c field readers
   render/render_core.hh shared host/device ray-march core (DVR + isosurface)
   render/Renderer.hh   backend interface (Backend enum) + RGBA8 framebuffer
   render/RendererFactory.* backend discovery + construction
@@ -188,6 +221,11 @@ tools/offscreen_check.cc      headless pipeline + cross-backend verification
 - Fields on a sub-point (quadrature) subdivision are read, but derived scalars operate
   on sub-point 0 only.
 - The transfer function is a colormap preset + opacity ramp (no node editor yet).
+- Empty-space skipping runs on the CPU backend only; the Metal and CUDA/HIP kernels
+  render the identical image but march every sample (no brick summary is uploaded yet).
+- Rendering is synchronous: a very large volume at full resolution still blocks the UI
+  for the duration of one frame (adaptive quality keeps interaction fluid, but the
+  final refine is a single blocking render).
 - The CUDA/HIP backend displays via a CUDA↔GL PBO (no device→host round trip). The Metal
   backend still copies its result through the host before the GL upload: a true Metal→GL
   zero-copy needs an IOSurface exposed to GL as `GL_TEXTURE_RECTANGLE`, which Dear ImGui's

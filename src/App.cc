@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 
@@ -55,8 +56,7 @@ App::App() {
     current_backend_ = Backend::CPU;
   }
 
-  status_ = std::string("Renderer: ") + renderer_->name() +
-            "  —  open a muGrid NetCDF (.nc) file to begin.";
+  status_ = "Open a muGrid NetCDF (.nc) file to begin.";
 }
 
 void App::set_backend(Backend backend) {
@@ -74,16 +74,20 @@ void App::set_backend(Backend backend) {
   tf_dirty_ = true;
   disp_dirty_ = true;  // the new backend has no displacement uploaded yet
   needs_render_ = true;
-  status_ = std::string("Renderer: ") + renderer_->name();
+  status_ = std::string("Switched to the ") + renderer_->name() + " backend.";
 }
 
 void App::open_path(const std::string &path) {
-  meta_ = loader_.open(path);
-  if (!meta_.valid) {
-    has_file_ = false;
-    status_ = "Failed to open '" + path + "': " + meta_.error;
+  // Introspect into a temporary: if the new file cannot be opened, the
+  // currently loaded dataset (metadata, volume, displacement, renderer data)
+  // stays fully intact and only the error is reported. Previously the failed
+  // metadata replaced meta_ while volume_ kept rendering the old file.
+  FileMeta meta = loader_.open(path);
+  if (!meta.valid) {
+    status_ = "Failed to open '" + path + "': " + meta.error;
     return;
   }
+  meta_ = std::move(meta);
   has_file_ = true;
   path_buf_ = path;
   // Mirror into the File panel's edit buffer (e.g. for a command-line load).
@@ -97,6 +101,7 @@ void App::open_path(const std::string &path) {
     std::snprintf(png_path_, sizeof(png_path_), "%s", png.string().c_str());
   }
   field_index_ = default_field_index(meta_.fields);
+  loaded_field_ = -1;  // a new file always re-derives the default iso level
   frame_ = 0;
   component_ = 0;
   // Start undeformed: no displacement field selected until the user picks one.
@@ -105,10 +110,8 @@ void App::open_path(const std::string &path) {
   disp_dirty_ = true;
   // Adopt the file's deformation gradient (identity if the file has none). A
   // per-frame applied_deformation_gradient, if present, supersedes it for the
-  // current frame.
-  for (int i = 0; i < 9; ++i) F_[i] = static_cast<float>(meta_.F[i]);
-  deformation_from_file_ = meta_.has_deformation;
-  sync_frame_deformation();  // frame_ == 0 here
+  // current frame. A new file always discards a manual override.
+  adopt_file_deformation();  // frame_ == 0 here
   status_ = "Loaded '" + path + "' (" + std::to_string(meta_.nx) + "x" +
             std::to_string(meta_.ny) + "x" + std::to_string(meta_.nz) + ", " +
             std::to_string(meta_.nb_frames) + " frame(s), " +
@@ -119,12 +122,22 @@ void App::open_path(const std::string &path) {
   // load would use stale/empty dimensions and put the orbit pivot at the origin
   // (a corner of the cell) instead of its centre.
   reload_volume();
-  {
-    Vec3 center;
-    float extent;
-    cell_bounds(center, extent);
+  frame_view(true);
+}
+
+void App::frame_view(bool reset_angles) {
+  Vec3 center;
+  float extent;
+  cell_bounds(center, extent);
+  if (reset_angles) {
     camera_.frame_aabb(center, extent);
+    // A 2D field is a single slice in the x-y plane; look at it face-on
+    // rather than as an obliquely tilted slab.
+    if (meta_.spatial_dim == 2) camera_.set_face_on();
+  } else {
+    camera_.retarget_aabb(center, extent);
   }
+  needs_render_ = true;
 }
 
 void App::reload_volume() {
@@ -136,25 +149,46 @@ void App::reload_volume() {
   if (frame_ >= meta_.nb_frames) frame_ = meta_.nb_frames - 1;
 
   const FieldInfo &fi = meta_.fields[field_index_];
-  int comp = component_;
-  if (comp >= fi.nb_components) comp = fi.nb_components - 1;
+  // Clamp the component into the new field's range *and write it back*, so
+  // the Component slider never displays a value outside its own range after
+  // switching from a field with more components.
+  if (component_ >= fi.nb_components) component_ = fi.nb_components - 1;
+  if (component_ < 0) component_ = 0;
 
   auto t0 = std::chrono::high_resolution_clock::now();
-  std::string err = loader_.load(path_buf_, meta_, fi, frame_, scalarize_, comp,
-                                 volume_);
+  std::string err = loader_.load(path_buf_, meta_, fi, frame_, scalarize_,
+                                 component_, volume_);
   last_load_ms_ = std::chrono::duration<double, std::milli>(
                       std::chrono::high_resolution_clock::now() - t0)
                       .count();
   if (!err.empty()) {
     status_ = err;
+    info_ = "(load failed)";
     volume_ = Volume{};
+    // The CPU backend borrows volume_.data; it was just freed, so the backend
+    // must be re-pointed before it renders again.
+    volume_dirty_ = true;
+    needs_render_ = true;
     return;
   }
-  // Sensible default iso value at the data midpoint on (re)load.
-  iso_value_ = 0.5f * (volume_.vmin + volume_.vmax);
-  status_ = "Field '" + fi.name + "' frame " + std::to_string(frame_) +
-            "  range [" + std::to_string(volume_.vmin) + ", " +
-            std::to_string(volume_.vmax) + "]";
+  // Iso level: start at the data midpoint when a *different quantity* is shown
+  // (new field or scalarization); otherwise keep the user's level across frame
+  // and component changes, clamping it into the new range so scrubbing the
+  // frame slider does not silently discard a hand-tuned isosurface.
+  const bool new_quantity =
+      field_index_ != loaded_field_ || scalarize_ != loaded_scalarize_;
+  if (new_quantity || !(iso_value_ >= data_min() && iso_value_ <= data_max())) {
+    iso_value_ = new_quantity ? 0.5f * (data_min() + data_max())
+                              : std::clamp(iso_value_, data_min(), data_max());
+  }
+  loaded_field_ = field_index_;
+  loaded_scalarize_ = scalarize_;
+  info_ = "Field '" + fi.name + "' frame " + std::to_string(frame_) +
+          "  range [" + std::to_string(volume_.vmin) + ", " +
+          std::to_string(volume_.vmax) + "]";
+  if (volume_.nb_nonfinite > 0)
+    info_ += "  (" + std::to_string(volume_.nb_nonfinite) +
+             " NaN/Inf voxel(s) shown as the minimum)";
   volume_dirty_ = true;  // backend must re-upload the new volume
   needs_render_ = true;
 
@@ -185,6 +219,10 @@ void App::sync_renderer_data() {
   if (volume_dirty_) {
     renderer_->set_volume(volume_.data.data(), volume_.nx, volume_.ny,
                           volume_.nz);
+    const BrickGrid &b = volume_.bricks;
+    renderer_->set_brick_grid(b.empty() ? nullptr : b.bmin.data(),
+                              b.empty() ? nullptr : b.bmax.data(), b.bx, b.by,
+                              b.bz);
     volume_dirty_ = false;
     uploaded = true;
   }
@@ -231,12 +269,24 @@ Vec3 App::reference_box() const {
 }
 
 void App::sync_frame_deformation() {
+  // A hand-edited F wins over the file's per-frame tensor until the user asks
+  // for the file's value back; otherwise scrubbing frames would silently undo
+  // an edit or a "Reset to identity".
+  if (F_user_override_) return;
   if (frame_ >= 0 && frame_ < static_cast<int>(meta_.applied_F.size())) {
     for (int i = 0; i < 9; ++i)
       F_[i] = static_cast<float>(meta_.applied_F[frame_][i]);
     deformation_from_file_ = true;
     needs_render_ = true;
   }
+}
+
+void App::adopt_file_deformation() {
+  F_user_override_ = false;
+  for (int i = 0; i < 9; ++i) F_[i] = static_cast<float>(meta_.F[i]);
+  deformation_from_file_ = meta_.has_deformation;
+  sync_frame_deformation();
+  needs_render_ = true;
 }
 
 Mat3 App::world_cell() const {
@@ -280,23 +330,26 @@ RenderParams App::make_render_params() const {
   if (volume_.ny > max_dim) max_dim = volume_.ny;
   if (volume_.nz > max_dim) max_dim = volume_.nz;
   p.step = step_ / static_cast<float>(max_dim > 0 ? max_dim : 1);
-  p.data_min = volume_.vmin;
-  p.data_max = volume_.vmax;
+  p.data_min = data_min();
+  p.data_max = data_max();
   p.lut_size = tf_.size();
   p.density_scale = density_scale_;
   p.iso_value = iso_value_;
   p.mode = mode_;
   p.bg = Vec3{bg_[0], bg_[1], bg_[2]};
+  // Empty-space skipping threshold, from the transfer function's transparent
+  // band (only the DVR path uses it; the iso path skips by iso level).
+  p.skip_below = tf_.skip_below(p.data_min, p.data_max);
 
   // Deformed-geometry warp. Active only when a displacement field is loaded.
-  const bool warp = disp_field_index_ >= 0 && !disp_.empty();
+  // Periodic tiling is unsupported while warping (the deformed body no longer
+  // tiles trivially); rep() already returns 1 per axis in that case, for the
+  // render, the box overlay and the camera framing alike.
+  const bool warp = warping();
   p.warp_enabled = warp ? 1 : 0;
   p.warp_scale = warp_scale_;
   p.warp_iters = warp_iters_;
   if (warp) {
-    // Periodic tiling is unsupported while warping (the deformed body no longer
-    // tiles trivially); render a single cell.
-    p.rep_x = p.rep_y = p.rep_z = 1;
     // World AABB of the deformed body: the single-cell parallelepiped expanded
     // by the largest world-space displacement on every side.
     Mat3 C = world_cell();
@@ -316,6 +369,14 @@ RenderParams App::make_render_params() const {
   return p;
 }
 
+std::filesystem::path App::resolve_output(const std::string &path) const {
+  std::filesystem::path out{path};
+  if (out.is_relative() && !path_buf_.empty()) {
+    out = std::filesystem::path(path_buf_).parent_path() / out;
+  }
+  return out;
+}
+
 void App::save_png(const std::string &path) {
   if (path.empty()) {
     status_ = "Enter a file name to save the PNG.";
@@ -325,16 +386,11 @@ void App::save_png(const std::string &path) {
     status_ = "Nothing to save — load a file first.";
     return;
   }
-  // Resolve a relative name against the loaded data file's directory, so
-  // renders are saved next to the data by default.
-  std::filesystem::path out{path};
-  if (out.is_relative() && !path_buf_.empty()) {
-    out = std::filesystem::path(path_buf_).parent_path() / out;
-  }
-  const std::string out_path = out.string();
-  // Full viewport resolution regardless of the interactive downscale.
-  int w = last_render_w_ > 0 ? last_render_w_ * render_downscale_ : 1280;
-  int h = last_render_h_ > 0 ? last_render_h_ * render_downscale_ : 720;
+  const std::string out_path = resolve_output(path).string();
+  // Full viewport resolution regardless of the interactive downscale (the
+  // last render may have been a coarse interactive one).
+  int w = last_render_w_ > 0 ? last_render_w_ * last_downscale_ : 1280;
+  int h = last_render_h_ > 0 ? last_render_h_ * last_downscale_ : 720;
 
   // Always go through the host-framebuffer path: with a zero-copy backend
   // (render_to_gl) the pixels never reach fb_, so render afresh either way.
@@ -353,12 +409,26 @@ void App::save_png(const std::string &path) {
   }
 }
 
-void App::render(int width, int height) {
+int App::effective_downscale(bool interacting) const {
+  int d = render_downscale_ < 1 ? 1 : render_downscale_;
+  if (!interacting || !adaptive_quality_ || last_full_ms_ <= 0.0) return d;
+  // Render time scales with the pixel count, so the extra factor needed to
+  // reach the target is sqrt(t_full / t_target); never coarser than 1/8.
+  double f = std::sqrt(last_full_ms_ / kInteractiveTargetMs);
+  int extra = static_cast<int>(std::ceil(f));
+  if (extra < 1) extra = 1;
+  if (extra > 8) extra = 8;
+  return d * extra;
+}
+
+void App::render(int width, int height, int downscale) {
   if (width <= 0 || height <= 0) return;
-  int rw = width / render_downscale_;
-  int rh = height / render_downscale_;
+  if (downscale < 1) downscale = 1;
+  int rw = width / downscale;
+  int rh = height / downscale;
   if (rw < 1) rw = 1;
   if (rh < 1) rh = 1;
+  last_downscale_ = downscale;
 
   if (volume_.empty() || !renderer_) {
     // Clear to background.
@@ -396,6 +466,9 @@ void App::render(int width, int height) {
   auto t1 = std::chrono::high_resolution_clock::now();
   last_render_ms_ =
       std::chrono::duration<double, std::milli>(t1 - t0).count();
+  // Only a render at the user's own quality setting calibrates the adaptive
+  // factor; scale a coarse frame's time back up would compound rounding.
+  if (downscale == render_downscale_) last_full_ms_ = last_render_ms_;
 
   last_render_w_ = rw;
   last_render_h_ = rh;

@@ -71,6 +71,20 @@ struct FileMeta {
   std::vector<std::array<double, 9>> applied_F;
 };
 
+/** Which reader fetches the voxel data.
+ *
+ *  - MuGrid: muGrid::FileIONetCDF into a GlobalFieldCollection. Reads *every*
+ *    component of the field (AoS), so for a 3x3 double tensor it moves and
+ *    holds nine times the data a single component needs. Only works for
+ *    NC_DOUBLE variables (muGrid copies bytes without type conversion).
+ *  - Direct: netcdf-c hyperslab read with on-the-fly type conversion. Fetches
+ *    only the selected component in Component mode.
+ *  - Auto: Direct for non-double variables and for Component mode (where it
+ *    is both required or much cheaper), MuGrid otherwise. muEye_check verifies
+ *    that both readers produce identical volumes.
+ */
+enum class ReadPath : int { Auto = 0, MuGrid = 1, Direct = 2 };
+
 /** Stateless loader: every open()/load() opens the file, reads and closes it
  *  again, so the viewer never holds a simulation's output file open. The
  *  per-load open/registration overhead is sub-millisecond — deliberately not
@@ -81,16 +95,21 @@ class VolumeLoader {
    *  populated error string. */
   FileMeta open(const std::string &path);
 
-  /** Read (field, frame) and scalarize into @p out.
+  /** Read (field, frame) and scalarize into @p out. @p read_path selects the
+   *  reader (see ReadPath); ReadPath::MuGrid on a non-double variable is an
+   *  error.
    *  @returns empty string on success, otherwise an error message. */
   std::string load(const std::string &path, const FileMeta &meta,
                    const FieldInfo &field, int frame, Scalarize mode,
-                   int component, Volume &out);
+                   int component, Volume &out,
+                   ReadPath read_path = ReadPath::Auto);
 
   /** Read (field, frame) as a displacement vector field: the first
    *  meta.spatial_dim components are packed into @p out (4 floats/voxel, z=0 in
-   *  2D). @p field must have at least spatial_dim components. Reuses load()
-   *  per component, so it handles the double/float and 2D/3D paths identically.
+   *  2D). @p field must have at least spatial_dim components. One read of the
+   *  whole field through the same readers load() uses (muGrid for double
+   *  variables, netcdf-c otherwise), so the double/float and 2D/3D cases are
+   *  handled identically.
    *  @returns empty string on success, otherwise an error message. */
   std::string load_displacement(const std::string &path, const FileMeta &meta,
                                 const FieldInfo &field, int frame,

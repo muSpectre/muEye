@@ -81,6 +81,24 @@ add_subdirectory(${MUEYE_MUGRID_SOURCE_DIR} mugrid_build)
 # ---------------------------------------------------------------------------
 find_package(NetCDF REQUIRED)
 
+# netcdf-c exports the MSVC flag "/utf-8" as a PUBLIC compile option with no
+# language guard, so it also reaches nvcc when compiling GpuRenderer.cc, and
+# nvcc takes it for a second input file. Hand the target's options to the host
+# compiler (-Xcompiler) for CUDA sources and leave them unchanged elsewhere.
+if(MUEYE_ENABLE_CUDA AND MSVC AND TARGET netCDF::netcdf)
+    get_target_property(_nc_opts netCDF::netcdf INTERFACE_COMPILE_OPTIONS)
+    if(_nc_opts)
+        set(_nc_wrapped "")
+        foreach(_opt IN LISTS _nc_opts)
+            list(APPEND _nc_wrapped
+                "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${_opt}>"
+                "$<$<NOT:$<COMPILE_LANGUAGE:CUDA>>:${_opt}>")
+        endforeach()
+        set_target_properties(netCDF::netcdf PROPERTIES
+            INTERFACE_COMPILE_OPTIONS "${_nc_wrapped}")
+    endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # OpenGL + GLFW + Dear ImGui
 # ---------------------------------------------------------------------------

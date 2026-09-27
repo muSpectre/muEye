@@ -113,6 +113,10 @@ every CI run also uploads them as workflow artifacts.
 - **Windows** (`.zip`, x86_64 / arm64): unzip and run `muEye.exe`. The MSVC runtime is
   included, so no VC++ redistributable is needed.
 
+The x86_64 Linux and Windows packages include the **CUDA** backend (Volta and newer;
+needs an NVIDIA driver recent enough for CUDA 12.6). Without an NVIDIA GPU they run on
+the CPU backend. HIP is not packaged: build it from source against your ROCm install.
+
 To cut a release, push a tag `v<version>` (keep it in sync with `project(muEye VERSION ...)`
 in `CMakeLists.txt`); CI builds every platform and publishes the release.
 

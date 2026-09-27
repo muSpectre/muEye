@@ -38,13 +38,62 @@
 // GL 1.5+ buffer functions (glGenBuffers/glBindBuffer/...) declared in glext.h;
 // on Linux (the usual CUDA/HIP target) these are exported by libGL. Plus the
 // CUDA/HIP <-> GL graphics-interop API.
+#if defined(_WIN32)
+// On Windows <GL/gl.h> needs WINGDIAPI/APIENTRY from <windows.h>, the SDK
+// ships no glext.h, and opengl32.dll exports only GL 1.1 — so the four buffer
+// entry points are resolved at runtime instead (gl_buffer_fns() below).
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <GL/gl.h>
+
+#include <cstddef>
+#else
 #define GL_GLEXT_PROTOTYPES
 #include <GL/gl.h>
 #include <GL/glext.h>
+#endif
 #if defined(MUGRID_ENABLE_CUDA)
 #include <cuda_gl_interop.h>
 #elif defined(MUGRID_ENABLE_HIP)
 #include <hip/hip_gl_interop.h>
+#endif
+
+#if defined(_WIN32)
+#define GL_PIXEL_UNPACK_BUFFER 0x88EC
+#define GL_STREAM_DRAW 0x88E0
+using GLsizeiptr = std::ptrdiff_t;
+
+namespace {
+struct GlBufferFns {
+  void(APIENTRY *GenBuffers)(GLsizei, GLuint *);
+  void(APIENTRY *DeleteBuffers)(GLsizei, const GLuint *);
+  void(APIENTRY *BindBuffer)(GLenum, GLuint);
+  void(APIENTRY *BufferData)(GLenum, GLsizeiptr, const void *, GLenum);
+};
+
+// Resolved on first use. wglGetProcAddress needs a current GL context, which
+// holds here: these are only called from the render_to_gl() PBO path (and the
+// destructor, once a PBO exists).
+const GlBufferFns &gl_buffer_fns() {
+  static const GlBufferFns fns = {
+      reinterpret_cast<decltype(GlBufferFns::GenBuffers)>(
+          wglGetProcAddress("glGenBuffers")),
+      reinterpret_cast<decltype(GlBufferFns::DeleteBuffers)>(
+          wglGetProcAddress("glDeleteBuffers")),
+      reinterpret_cast<decltype(GlBufferFns::BindBuffer)>(
+          wglGetProcAddress("glBindBuffer")),
+      reinterpret_cast<decltype(GlBufferFns::BufferData)>(
+          wglGetProcAddress("glBufferData"))};
+  return fns;
+}
+}  // namespace
+
+#define glGenBuffers gl_buffer_fns().GenBuffers
+#define glDeleteBuffers gl_buffer_fns().DeleteBuffers
+#define glBindBuffer gl_buffer_fns().BindBuffer
+#define glBufferData gl_buffer_fns().BufferData
 #endif
 
 namespace mueye {

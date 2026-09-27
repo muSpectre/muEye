@@ -402,23 +402,48 @@ void App::draw_ui() {
       ImGui::SetTooltip("Values below this fraction of the range are fully "
                         "transparent (and skipped by the ray marcher).");
 
-    // A small preview strip of the colormap.
+    // Preview: the colormap drawn *with its opacity* over a checkerboard, so
+    // the transparent band and the ramp are visible, plus the alpha curve.
     ImDrawList *dl = ImGui::GetWindowDrawList();
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     float w = ImGui::GetContentRegionAvail().x;
-    float h = 24.0f;
-    int steps = 64;
-    for (int i = 0; i < steps; ++i) {
+    float h = 48.0f;
+    const float cs = 8.0f;  // checker size
+    for (int cy = 0; cy * cs < h; ++cy)
+      for (int cx = 0; cx * cs < w; ++cx) {
+        ImU32 cc = ((cx + cy) & 1) ? IM_COL32(150, 150, 150, 255)
+                                   : IM_COL32(215, 215, 215, 255);
+        dl->AddRectFilled(
+            ImVec2(p0.x + cx * cs, p0.y + cy * cs),
+            ImVec2(std::min(p0.x + (cx + 1) * cs, p0.x + w),
+                   std::min(p0.y + (cy + 1) * cs, p0.y + h)),
+            cc);
+      }
+    const int n = tf_.size();
+    const Vec4 *lut = tf_.data();
+    const int steps = 128;
+    std::vector<ImVec2> curve;
+    curve.reserve(steps + 1);
+    for (int i = 0; i <= steps; ++i) {
       float t0 = static_cast<float>(i) / steps;
-      const Vec4 *lut = tf_.data();
-      int li = static_cast<int>(t0 * (tf_.size() - 1));
-      Vec4 c = lut[li];
-      ImU32 col = IM_COL32(static_cast<int>(c.x * 255), static_cast<int>(c.y * 255),
-                           static_cast<int>(c.z * 255), 255);
-      dl->AddRectFilled(ImVec2(p0.x + w * t0, p0.y),
-                        ImVec2(p0.x + w * (i + 1) / steps, p0.y + h), col);
+      Vec4 c = lut[std::min(n - 1, static_cast<int>(t0 * (n - 1)))];
+      if (i < steps) {
+        float t1 = static_cast<float>(i + 1) / steps;
+        ImU32 col = IM_COL32(static_cast<int>(c.x * 255),
+                             static_cast<int>(c.y * 255),
+                             static_cast<int>(c.z * 255),
+                             static_cast<int>(c.w * 255));
+        dl->AddRectFilled(ImVec2(p0.x + w * t0, p0.y),
+                          ImVec2(p0.x + w * t1, p0.y + h), col);
+      }
+      curve.push_back(ImVec2(p0.x + w * t0, p0.y + h * (1.0f - c.w)));
     }
+    dl->AddPolyline(curve.data(), static_cast<int>(curve.size()),
+                    IM_COL32(20, 20, 20, 255), ImDrawFlags_None, 1.5f);
     ImGui::Dummy(ImVec2(w, h));
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Colour and opacity over the value range; the curve "
+                        "is the opacity.");
     ImGui::End();
   }
 

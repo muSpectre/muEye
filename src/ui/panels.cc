@@ -6,6 +6,12 @@
  * Part of muEye, a viewer for muGrid data.
  */
 
+// portable-file-dialogs.h includes <windows.h> on Windows, whose min/max
+// macros would otherwise mangle the std::min / std::max calls below.
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>

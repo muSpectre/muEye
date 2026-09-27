@@ -52,7 +52,89 @@ void draw_box_edge(ImDrawList *dl, const Camera &cam, Vec3 a, Vec3 b,
               project_to_image(cam, b, origin, w, h), col, 1.5f);
 }
 
+// Probed once: on Linux, available() runs subprocesses to look for a dialog
+// backend (zenity/kdialog/...), so it must not run every frame. An immutable
+// capability, not UI state — a static const is fine.
+bool dialogs_available() {
+  static const bool can = pfd::settings::available();
+  return can;
+}
+
 }  // namespace
+
+void App::browse_for_file() {
+  if (!dialogs_available()) return;
+  // Default to the *.nc filter. On macOS (pfd's osascript backend) any "*"
+  // pattern disables filtering altogether, so the all-files escape hatch is
+  // omitted there; on Windows/Linux it is kept as a switchable second entry
+  // (the *.nc filter stays first, i.e. the default).
+  std::vector<std::string> filters{"NetCDF files (*.nc)", "*.nc"};
+#ifndef __APPLE__
+  filters.push_back("All files");
+  filters.push_back("*");
+#endif
+  // Open in the current file's *directory*. Passing the file path itself as
+  // the default location makes the macOS (osascript) dialog error out and
+  // silently fail to reopen after a file has been loaded, so derive the
+  // parent directory instead.
+  std::string start_dir;
+  try {
+    std::filesystem::path p{path_edit_};
+    start_dir = (p.has_filename() ? p.parent_path() : p).string();
+  } catch (...) {
+    start_dir.clear();
+  }
+  auto sel =
+      pfd::open_file("Open muGrid NetCDF file", start_dir, filters).result();
+  if (!sel.empty()) {
+    // Show the choice in the field even if the load then fails.
+    std::snprintf(path_edit_, sizeof(path_edit_), "%s", sel.front().c_str());
+    open_path(sel.front());
+  }
+}
+
+void App::request_save_png(const std::string &path) {
+  if (path.empty()) {
+    status_ = "Enter a file name to save the PNG.";
+    return;
+  }
+  const std::filesystem::path out = resolve_output(path);
+  std::error_code ec;
+  if (std::filesystem::exists(out, ec)) {
+    // Never overwrite silently. Ask through the native message box; without a
+    // dialog backend, refuse and let the user pick another name.
+    if (!dialogs_available()) {
+      status_ = "'" + out.string() +
+                "' exists; choose another name (no dialog available to "
+                "confirm overwriting).";
+      return;
+    }
+    auto choice = pfd::message("Overwrite file?",
+                               "'" + out.string() + "' already exists.\n"
+                               "Overwrite it?",
+                               pfd::choice::yes_no, pfd::icon::warning)
+                      .result();
+    if (choice != pfd::button::yes) {
+      status_ = "Save cancelled.";
+      return;
+    }
+  }
+  save_png(out.string());
+}
+
+void App::save_png_as() {
+  if (!dialogs_available() || volume_.empty()) return;
+  const std::string start = resolve_output(png_path_).string();
+  // The native save dialog confirms overwriting itself.
+  std::string sel =
+      pfd::save_file("Save rendering as PNG", start, {"PNG image (*.png)", "*.png"})
+          .result();
+  if (sel.empty()) return;
+  std::filesystem::path p{sel};
+  if (p.extension().empty()) p += ".png";
+  std::snprintf(png_path_, sizeof(png_path_), "%s", p.string().c_str());
+  save_png(p.string());
+}
 
 // Arrange the panels into a default layout: a left control column (grouped into
 // three stacked tab-nodes) and a large viewport filling the rest. Called once
@@ -120,39 +202,9 @@ void App::draw_ui() {
     // Probed once: on Linux, available() runs subprocesses to look for a
     // dialog backend (zenity/kdialog/...), so it must not run every frame.
     // An immutable capability, not UI state — a static const is fine.
-    static const bool can_browse = pfd::settings::available();
-    ImGui::BeginDisabled(!can_browse);
+    ImGui::BeginDisabled(!dialogs_available());
     // Native file chooser; blocks the UI loop while the modal dialog is open.
-    if (ImGui::Button("Browse...")) {
-      // Default to the *.nc filter. On macOS (pfd's osascript backend) any "*"
-      // pattern disables filtering altogether, so the all-files escape hatch is
-      // omitted there; on Windows/Linux it is kept as a switchable second entry
-      // (the *.nc filter stays first, i.e. the default).
-      std::vector<std::string> filters{"NetCDF files (*.nc)", "*.nc"};
-#ifndef __APPLE__
-      filters.push_back("All files");
-      filters.push_back("*");
-#endif
-      // Open in the current file's *directory*. Passing the file path itself as
-      // the default location makes the macOS (osascript) dialog error out and
-      // silently fail to reopen after a file has been loaded, so derive the
-      // parent directory instead.
-      std::string start_dir;
-      try {
-        std::filesystem::path p{path_edit_};
-        start_dir = (p.has_filename() ? p.parent_path() : p).string();
-      } catch (...) {
-        start_dir.clear();
-      }
-      auto sel = pfd::open_file("Open muGrid NetCDF file", start_dir, filters)
-                     .result();
-      if (!sel.empty()) {
-        // Show the choice in the field even if the load then fails.
-        std::snprintf(path_edit_, sizeof(path_edit_), "%s",
-                      sel.front().c_str());
-        open_path(sel.front());
-      }
-    }
+    if (ImGui::Button("Browse...")) browse_for_file();
     ImGui::EndDisabled();
     // Errors and action results go to the status bar; this panel only shows
     // the persistent description of what is loaded.
@@ -429,7 +481,14 @@ void App::draw_ui() {
     // outline is a UI overlay and is not part of the saved image).
     ImGui::InputText("PNG file", png_path_, sizeof(png_path_));
     ImGui::BeginDisabled(volume_.empty());
-    if (ImGui::Button("Save PNG")) save_png(png_path_);
+    if (ImGui::Button("Save PNG")) request_save_png(png_path_);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Save to the file above (Ctrl+S); asks before "
+                        "overwriting.");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!dialogs_available());
+    if (ImGui::Button("Save as...")) save_png_as();
+    ImGui::EndDisabled();
     ImGui::EndDisabled();
   }
   ImGui::End();

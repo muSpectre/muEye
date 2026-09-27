@@ -12,6 +12,7 @@
 #ifndef MUEYE_APP_HH_
 #define MUEYE_APP_HH_
 
+#include <filesystem>
 #include <memory>
 #include <string>
 
@@ -92,8 +93,21 @@ class App {
   void frame_view(bool reset_angles);
 
   /** Re-render the current scene into a host framebuffer at full viewport
-   *  resolution (ignoring the interactive downscale) and write it as a PNG. */
+   *  resolution (ignoring the interactive downscale) and write it as a PNG.
+   *  Overwrites silently; the UI goes through request_save_png(). */
   void save_png(const std::string &path);
+
+  /** Resolve a possibly relative output name against the data file's
+   *  directory (renders are saved next to the data by default). */
+  std::filesystem::path resolve_output(const std::string &path) const;
+
+  /** "Save PNG" button / Ctrl+S: save to @p path, asking before overwriting
+   *  an existing file (implemented in panels.cc, needs the dialog library). */
+  void request_save_png(const std::string &path);
+  /** "Save as...": native save dialog, then save_png(). */
+  void save_png_as();
+  /** "Browse..." / Ctrl+O: native open dialog, then open_path(). */
+  void browse_for_file();
 
   VolumeLoader loader_;
   FileMeta meta_;

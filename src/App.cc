@@ -369,6 +369,14 @@ RenderParams App::make_render_params() const {
   return p;
 }
 
+std::filesystem::path App::resolve_output(const std::string &path) const {
+  std::filesystem::path out{path};
+  if (out.is_relative() && !path_buf_.empty()) {
+    out = std::filesystem::path(path_buf_).parent_path() / out;
+  }
+  return out;
+}
+
 void App::save_png(const std::string &path) {
   if (path.empty()) {
     status_ = "Enter a file name to save the PNG.";
@@ -378,13 +386,7 @@ void App::save_png(const std::string &path) {
     status_ = "Nothing to save — load a file first.";
     return;
   }
-  // Resolve a relative name against the loaded data file's directory, so
-  // renders are saved next to the data by default.
-  std::filesystem::path out{path};
-  if (out.is_relative() && !path_buf_.empty()) {
-    out = std::filesystem::path(path_buf_).parent_path() / out;
-  }
-  const std::string out_path = out.string();
+  const std::string out_path = resolve_output(path).string();
   // Full viewport resolution regardless of the interactive downscale (the
   // last render may have been a coarse interactive one).
   int w = last_render_w_ > 0 ? last_render_w_ * last_downscale_ : 1280;

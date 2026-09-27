@@ -6,6 +6,7 @@
  * Part of muEye, a viewer for muGrid data.
  */
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -344,6 +345,11 @@ void App::draw_ui() {
 
     if (ImGui::SliderInt("Downscale", &render_downscale_, 1, 4))
       needs_render_ = true;
+    ImGui::Checkbox("Adaptive quality while interacting", &adaptive_quality_);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Render coarser while the mouse is held so orbiting "
+                        "stays fluid, then refine at the chosen quality on "
+                        "release.");
 
     ImGui::Separator();
     // Drawn as a viewport overlay, so toggling needs no re-render.
@@ -461,7 +467,11 @@ void App::draw_ui() {
     } else {
       ImGui::TextDisabled("No volume loaded.");
     }
-    ImGui::Text("Render: %d x %d", last_render_w_, last_render_h_);
+    if (last_downscale_ > render_downscale_)
+      ImGui::Text("Render: %d x %d (interactive, 1/%d)", last_render_w_,
+                  last_render_h_, last_downscale_);
+    else
+      ImGui::Text("Render: %d x %d", last_render_w_, last_render_h_);
     ImGui::Text("Frame time: %.2f ms (%.1f fps)", last_render_ms_,
                 last_render_ms_ > 0 ? 1000.0 / last_render_ms_ : 0.0);
     ImGui::Text("UI: %.1f fps", ImGui::GetIO().Framerate);
@@ -477,11 +487,15 @@ void App::draw_ui() {
     int vh = static_cast<int>(avail.y);
 
     if (vw > 0 && vh > 0) {
-      // Re-render on demand or when the viewport was resized.
-      int want_w = vw / render_downscale_;
-      int want_h = vh / render_downscale_;
+      // Re-render on demand or when the viewport was resized. While a mouse
+      // button is held (orbit/pan, slider drags) the effective downscale grows
+      // adaptively; on release it drops back to the user's setting, which
+      // shows up here as a size change and triggers the full-quality refine.
+      const int eff = effective_downscale(ImGui::IsAnyMouseDown());
+      int want_w = std::max(1, vw / eff);
+      int want_h = std::max(1, vh / eff);
       if (needs_render_ || want_w != last_render_w_ || want_h != last_render_h_) {
-        render(vw, vh);
+        render(vw, vh, eff);
         needs_render_ = false;
       }
 

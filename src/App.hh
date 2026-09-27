@@ -55,7 +55,16 @@ class App {
   void reload_displacement();  //!< (re)read the selected displacement field
 
   // --- rendering -------------------------------------------------------
-  void render(int width, int height);
+  /** Render the scene for a @p width x @p height viewport at 1/@p downscale
+   *  of that resolution (the texture is stretched back onto the viewport). */
+  void render(int width, int height, int downscale);
+
+  /** Downscale to render with right now: the user's setting, times an
+   *  automatic factor while the user is interacting (mouse held) when
+   *  adaptive quality is on. The factor is chosen from the last
+   *  full-quality render time so an interactive frame takes roughly
+   *  kInteractiveTargetMs. */
+  int effective_downscale(bool interacting) const;
   void set_backend(Backend backend);
   RenderParams make_render_params() const;
   void sync_renderer_data();  //!< (re-)upload volume / LUT if dirty
@@ -161,10 +170,17 @@ class App {
   Framebuffer fb_;
   GlTexture texture_;
   int render_downscale_{1};  //!< 1 = full viewport res; 2 = half, etc.
+  //! Progressive rendering: while the mouse is held (orbit, pan, slider drag)
+  //! render at a coarser resolution chosen so a frame takes about
+  //! kInteractiveTargetMs, then re-render at the user's quality on release.
+  bool adaptive_quality_{true};
+  static constexpr double kInteractiveTargetMs = 33.0;
   bool needs_render_{true};
   double last_render_ms_{0.0};
+  double last_full_ms_{0.0};   //!< duration of the last non-interactive render
   int last_render_w_{0};
   int last_render_h_{0};
+  int last_downscale_{1};      //!< downscale the last render actually used
 };
 
 }  // namespace mueye

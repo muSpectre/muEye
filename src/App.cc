@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 
@@ -374,9 +375,10 @@ void App::save_png(const std::string &path) {
     out = std::filesystem::path(path_buf_).parent_path() / out;
   }
   const std::string out_path = out.string();
-  // Full viewport resolution regardless of the interactive downscale.
-  int w = last_render_w_ > 0 ? last_render_w_ * render_downscale_ : 1280;
-  int h = last_render_h_ > 0 ? last_render_h_ * render_downscale_ : 720;
+  // Full viewport resolution regardless of the interactive downscale (the
+  // last render may have been a coarse interactive one).
+  int w = last_render_w_ > 0 ? last_render_w_ * last_downscale_ : 1280;
+  int h = last_render_h_ > 0 ? last_render_h_ * last_downscale_ : 720;
 
   // Always go through the host-framebuffer path: with a zero-copy backend
   // (render_to_gl) the pixels never reach fb_, so render afresh either way.
@@ -395,12 +397,26 @@ void App::save_png(const std::string &path) {
   }
 }
 
-void App::render(int width, int height) {
+int App::effective_downscale(bool interacting) const {
+  int d = render_downscale_ < 1 ? 1 : render_downscale_;
+  if (!interacting || !adaptive_quality_ || last_full_ms_ <= 0.0) return d;
+  // Render time scales with the pixel count, so the extra factor needed to
+  // reach the target is sqrt(t_full / t_target); never coarser than 1/8.
+  double f = std::sqrt(last_full_ms_ / kInteractiveTargetMs);
+  int extra = static_cast<int>(std::ceil(f));
+  if (extra < 1) extra = 1;
+  if (extra > 8) extra = 8;
+  return d * extra;
+}
+
+void App::render(int width, int height, int downscale) {
   if (width <= 0 || height <= 0) return;
-  int rw = width / render_downscale_;
-  int rh = height / render_downscale_;
+  if (downscale < 1) downscale = 1;
+  int rw = width / downscale;
+  int rh = height / downscale;
   if (rw < 1) rw = 1;
   if (rh < 1) rh = 1;
+  last_downscale_ = downscale;
 
   if (volume_.empty() || !renderer_) {
     // Clear to background.
@@ -438,6 +454,9 @@ void App::render(int width, int height) {
   auto t1 = std::chrono::high_resolution_clock::now();
   last_render_ms_ =
       std::chrono::duration<double, std::milli>(t1 - t0).count();
+  // Only a render at the user's own quality setting calibrates the adaptive
+  // factor; scale a coarse frame's time back up would compound rounding.
+  if (downscale == render_downscale_) last_full_ms_ = last_render_ms_;
 
   last_render_w_ = rw;
   last_render_h_ = rh;

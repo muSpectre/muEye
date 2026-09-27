@@ -153,6 +153,13 @@ class App {
   float step_{0.5f};          //!< in voxels; converted to world units per render
   float density_scale_{1.0f};
   float iso_value_{0.5f};
+  //! Colour / iso value range: by default the loaded volume's own [vmin, vmax]
+  //! (which changes from frame to frame and makes colours flicker while
+  //! scrubbing); when locked, a fixed user range so frames stay comparable.
+  bool range_locked_{false};
+  float range_min_{0.0f}, range_max_{1.0f};
+  float data_min() const { return range_locked_ ? range_min_ : volume_.vmin; }
+  float data_max() const { return range_locked_ ? range_max_ : volume_.vmax; }
   float bg_[3] = {1.0f, 1.0f, 1.0f};  // white scene background
   bool show_box_{true};   //!< draw the volume box outline over the viewport
   bool periodic_{false};  //!< tile the volume periodically

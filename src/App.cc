@@ -177,9 +177,9 @@ void App::reload_volume() {
   // frame slider does not silently discard a hand-tuned isosurface.
   const bool new_quantity =
       field_index_ != loaded_field_ || scalarize_ != loaded_scalarize_;
-  if (new_quantity || !(iso_value_ >= volume_.vmin && iso_value_ <= volume_.vmax)) {
-    iso_value_ = new_quantity ? 0.5f * (volume_.vmin + volume_.vmax)
-                              : std::clamp(iso_value_, volume_.vmin, volume_.vmax);
+  if (new_quantity || !(iso_value_ >= data_min() && iso_value_ <= data_max())) {
+    iso_value_ = new_quantity ? 0.5f * (data_min() + data_max())
+                              : std::clamp(iso_value_, data_min(), data_max());
   }
   loaded_field_ = field_index_;
   loaded_scalarize_ = scalarize_;
@@ -330,8 +330,8 @@ RenderParams App::make_render_params() const {
   if (volume_.ny > max_dim) max_dim = volume_.ny;
   if (volume_.nz > max_dim) max_dim = volume_.nz;
   p.step = step_ / static_cast<float>(max_dim > 0 ? max_dim : 1);
-  p.data_min = volume_.vmin;
-  p.data_max = volume_.vmax;
+  p.data_min = data_min();
+  p.data_max = data_max();
   p.lut_size = tf_.size();
   p.density_scale = density_scale_;
   p.iso_value = iso_value_;

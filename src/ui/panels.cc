@@ -335,10 +335,31 @@ void App::draw_ui() {
         ImGui::SetTooltip("Global multiplier on the transfer function's "
                           "per-voxel opacity.");
     } else {
-      float lo = volume_.empty() ? 0.f : volume_.vmin;
-      float hi = volume_.empty() ? 1.f : volume_.vmax;
+      float lo = volume_.empty() ? 0.f : data_min();
+      float hi = volume_.empty() ? 1.f : data_max();
       if (ImGui::SliderFloat("Iso value", &iso_value_, lo, hi, "%.4g"))
         needs_render_ = true;
+    }
+    // Fixed value range for colours and the iso slider, so frames of a time
+    // series are comparable instead of each being stretched to its own
+    // min/max.
+    if (ImGui::Checkbox("Lock range", &range_locked_)) {
+      if (range_locked_ && !volume_.empty()) {
+        range_min_ = volume_.vmin;
+        range_max_ = volume_.vmax;
+      }
+      needs_render_ = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Map colours and the iso slider to a fixed value range "
+                        "instead of each frame's own minimum and maximum.");
+    if (range_locked_) {
+      float r[2] = {range_min_, range_max_};
+      if (ImGui::InputFloat2("Range", r, "%.4g") && r[1] > r[0]) {
+        range_min_ = r[0];
+        range_max_ = r[1];
+        needs_render_ = true;
+      }
     }
 
     if (ImGui::ColorEdit3("Background", bg_)) needs_render_ = true;

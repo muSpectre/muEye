@@ -61,6 +61,12 @@ muEye reuses muGrid internally:
 - **Periodic images**: tile the volume periodically with a per-axis replica count
   (Render panel → "Periodic images" + "Replicas"); the ray marcher wraps sampling back
   into the unit cell, so memory use is independent of the replica count.
+- **Periodic shift**: translate the structure through the periodic boundaries by whole
+  voxels per axis (Cell panel → "Periodic shift"; "Half cell" moves the cell corner to
+  the centre). The loaded data (and any displacement field) is rolled in place, so a
+  structure straddling the boundary is shown contiguous, interpolated across the old
+  seam. Viewer-only: the file is never modified; the shift persists across frames and
+  fields and resets when a new file is opened.
 - **Pluggable rendering backends** behind one interface (`render/Renderer.hh`),
   selectable at runtime in the Device panel:
   - **CPU** — multi-threaded (OpenMP, or a `std::thread` fallback so it is parallel

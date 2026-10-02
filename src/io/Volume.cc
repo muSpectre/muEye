@@ -228,6 +228,52 @@ void Volume::build_bricks() {
   });
 }
 
+namespace {
+
+/** Reduce a shift into [0, n). */
+int wrap_shift(int d, int n) {
+  d %= n;
+  return d < 0 ? d + n : d;
+}
+
+}  // namespace
+
+void roll_periodic(std::vector<float> &data, int nx, int ny, int nz, int block,
+                   int di, int dj, int dk) {
+  if (data.empty() || nx <= 0 || ny <= 0 || nz <= 0) return;
+  const std::size_t b = static_cast<std::size_t>(block);
+  const std::size_t row = b * nx;          // one x row
+  const std::size_t slab = row * ny;       // one z slab
+  di = wrap_shift(di, nx);
+  dj = wrap_shift(dj, ny);
+  dk = wrap_shift(dk, nz);
+  float *base = data.data();
+  // A right-rotation by d of a contiguous run of n units: std::rotate makes
+  // element (n - d) the new first, so new[i] = old[(i - d) mod n].
+  if (di != 0) {
+    const std::size_t mid = b * (nx - di);
+    parallel_for(ny * nz, 0, [&](int r) {
+      float *first = base + row * r;
+      std::rotate(first, first + mid, first + row);
+    });
+  }
+  if (dj != 0) {
+    const std::size_t mid = row * (ny - dj);
+    parallel_for(nz, 0, [&](int k) {
+      float *first = base + slab * k;
+      std::rotate(first, first + mid, first + slab);
+    });
+  }
+  if (dk != 0)
+    std::rotate(base, base + slab * (nz - dk), base + slab * nz);
+}
+
+void Volume::roll(int di, int dj, int dk) {
+  if (data.empty()) return;
+  roll_periodic(data, nx, ny, nz, 1, di, dj, dk);
+  build_bricks();
+}
+
 template void Volume::from_field<double>(const double *, int, int, int, int,
                                          std::ptrdiff_t, std::ptrdiff_t,
                                          std::ptrdiff_t, Scalarize, int,

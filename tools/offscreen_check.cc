@@ -952,6 +952,70 @@ int view_file(const std::string &path, const char *field_name) {
 
 }  // namespace
 
+/**
+ * Periodic shift (Volume::roll / roll_periodic) against a direct index
+ * computation, on an anisotropic grid with non-trivial shifts along every
+ * axis (including negative and larger-than-extent ones), for a scalar volume
+ * and a 4-float-per-voxel displacement field. Also checks that the inverse
+ * shift restores the data bit-identically and the brick summary is rebuilt.
+ * @returns 0 on success, non-zero on any failure.
+ */
+int check_roll() {
+  std::printf("\n=== checking periodic shift (roll) ===\n");
+  const int nx = 7, ny = 5, nz = 3;
+  const int di = 3, dj = -2, dk = 4;  // dk > nz exercises the modulo
+  auto mod = [](int a, int n) { return ((a % n) + n) % n; };
+  auto value = [](int i, int j, int k) {
+    return static_cast<float>(i + 10 * j + 100 * k);
+  };
+  int failures = 0;
+
+  mueye::Volume v;
+  v.nx = nx; v.ny = ny; v.nz = nz;
+  v.data.resize(v.size());
+  for (int k = 0; k < nz; ++k)
+    for (int j = 0; j < ny; ++j)
+      for (int i = 0; i < nx; ++i) v.data[i + nx * (j + ny * k)] = value(i, j, k);
+  const std::vector<float> orig = v.data;
+  v.roll(di, dj, dk);
+  for (int k = 0; k < nz; ++k)
+    for (int j = 0; j < ny; ++j)
+      for (int i = 0; i < nx; ++i) {
+        const float want =
+            value(mod(i - di, nx), mod(j - dj, ny), mod(k - dk, nz));
+        if (v.data[i + nx * (j + ny * k)] != want) ++failures;
+      }
+  const bool bricks_ok = !v.bricks.empty() && v.bricks.bmin[0] == 0.0f &&
+                         v.bricks.bmax[0] == value(nx - 1, ny - 1, nz - 1);
+  if (!bricks_ok) ++failures;
+  v.roll(-di, -dj, -dk);
+  const bool inverse_ok = v.data == orig;
+  if (!inverse_ok) ++failures;
+
+  mueye::DisplacementField d;
+  d.nx = nx; d.ny = ny; d.nz = nz;
+  d.data.resize(4 * d.size());
+  for (std::size_t e = 0; e < d.size(); ++e)
+    for (int c = 0; c < 4; ++c) d.data[4 * e + c] = orig[e] + 0.25f * c;
+  d.roll(di, dj, dk);
+  int disp_bad = 0;
+  for (int k = 0; k < nz; ++k)
+    for (int j = 0; j < ny; ++j)
+      for (int i = 0; i < nx; ++i)
+        for (int c = 0; c < 4; ++c) {
+          const float want = value(mod(i - di, nx), mod(j - dj, ny),
+                                   mod(k - dk, nz)) + 0.25f * c;
+          if (d.data[4 * (i + nx * (j + ny * k)) + c] != want) ++disp_bad;
+        }
+  failures += disp_bad;
+
+  std::printf("  scalar roll            : %s\n", failures - disp_bad == 0 ? "ok" : "MISMATCH");
+  std::printf("  bricks rebuilt         : %s\n", bricks_ok ? "ok" : "MISMATCH");
+  std::printf("  inverse restores data  : %s\n", inverse_ok ? "ok" : "MISMATCH");
+  std::printf("  displacement roll      : %s\n", disp_bad == 0 ? "ok" : "MISMATCH");
+  return failures;
+}
+
 int main(int argc, char **argv) {
   if (argc > 2 && std::string(argv[1]) == "--view") {
     return view_file(argv[2], argc > 3 ? argv[3] : nullptr);
@@ -970,6 +1034,7 @@ int main(int argc, char **argv) {
   }
 
   if (check_reductions() != 0) return 1;
+  if (check_roll() != 0) return 1;
   if (check_file(path, "offscreen.ppm") != 0) return 1;
   if (check_file(path2d, "offscreen_2d.ppm") != 0) return 1;
   if (check_anisotropic() != 0) return 1;

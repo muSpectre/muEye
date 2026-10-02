@@ -432,6 +432,36 @@ void App::draw_ui() {
       if (ImGui::Button("Use file's F")) adopt_file_deformation();
     }
     if (changed) needs_render_ = true;
+
+    // Periodic shift: translate the structure through the periodic
+    // boundaries by whole voxels (rolls the loaded data; see apply_shift).
+    ImGui::SeparatorText("Periodic shift");
+    const int n[3] = {volume_.nx, volume_.ny, volume_.nz};
+    const char *axis_label[3] = {"x", "y", "z"};
+    bool shift_changed = false;
+    for (int a = 0; a < dim; ++a) {
+      const int na = n[a] > 0 ? n[a] : 1;
+      // [-n/2, n/2] covers every distinct shift (the roll wraps).
+      const int lo = -(na / 2), hi = na - 1 - na / 2;
+      ImGui::SetNextItemWidth(160.0f);
+      if (ImGui::SliderInt(axis_label[a], &shift_[a], lo, hi, "%d vox"))
+        shift_changed = true;
+      ImGui::SameLine();
+      ImGui::TextDisabled("%+.3f cell", static_cast<float>(shift_[a]) / na);
+    }
+    if (ImGui::Button("Half cell")) {
+      for (int a = 0; a < dim; ++a) shift_[a] = n[a] / 2 > 0 ? -(n[a] / 2) : 0;
+      shift_changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Shift by half a cell along every axis, moving the "
+                        "cell corner to its centre.");
+    ImGui::SameLine();
+    if (ImGui::Button("Reset shift")) {
+      for (int &d : shift_) d = 0;
+      shift_changed = true;
+    }
+    if (shift_changed) apply_shift();
     ImGui::EndDisabled();
     ImGui::End();
   }

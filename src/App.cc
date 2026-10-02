@@ -108,6 +108,8 @@ void App::open_path(const std::string &path) {
   disp_field_index_ = -1;
   disp_ = DisplacementField{};
   disp_dirty_ = true;
+  // The periodic shift is per-file view state; the grid may have changed.
+  for (int &d : shift_) d = 0;
   // Adopt the file's deformation gradient (identity if the file has none). A
   // per-frame applied_deformation_gradient, if present, supersedes it for the
   // current frame. A new file always discards a manual override.
@@ -158,6 +160,7 @@ void App::reload_volume() {
   auto t0 = std::chrono::high_resolution_clock::now();
   std::string err = loader_.load(path_buf_, meta_, fi, frame_, scalarize_,
                                  component_, volume_);
+  for (int &d : vol_shift_) d = 0;  // freshly loaded data is unshifted
   last_load_ms_ = std::chrono::duration<double, std::milli>(
                       std::chrono::high_resolution_clock::now() - t0)
                       .count();
@@ -194,6 +197,7 @@ void App::reload_volume() {
 
   // If a displacement field is selected, refresh it for the current frame too.
   if (disp_field_index_ >= 0) reload_displacement();
+  apply_shift();
 }
 
 void App::reload_displacement() {
@@ -208,8 +212,30 @@ void App::reload_displacement() {
       disp_field_index_ = -1;
     }
   }
+  for (int &d : disp_shift_) d = 0;  // freshly loaded data is unshifted
+  apply_shift();
   disp_dirty_ = true;  // backend must (re-)upload or clear the displacement
   needs_render_ = true;
+}
+
+void App::apply_shift() {
+  auto differs = [](const int *a, const int *b) {
+    return a[0] != b[0] || a[1] != b[1] || a[2] != b[2];
+  };
+  if (differs(shift_, vol_shift_)) {
+    volume_.roll(shift_[0] - vol_shift_[0], shift_[1] - vol_shift_[1],
+                 shift_[2] - vol_shift_[2]);
+    for (int a = 0; a < 3; ++a) vol_shift_[a] = shift_[a];
+    volume_dirty_ = true;
+    needs_render_ = true;
+  }
+  if (differs(shift_, disp_shift_)) {
+    disp_.roll(shift_[0] - disp_shift_[0], shift_[1] - disp_shift_[1],
+               shift_[2] - disp_shift_[2]);
+    for (int a = 0; a < 3; ++a) disp_shift_[a] = shift_[a];
+    disp_dirty_ = true;
+    needs_render_ = true;
+  }
 }
 
 // Upload data to the backend only when it changed (cheap for CPU, avoids a

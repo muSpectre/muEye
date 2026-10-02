@@ -164,6 +164,19 @@ class App {
   int warp_iters_{6};
   bool disp_dirty_{true};  //!< re-upload displacement to the backend before render
 
+  //! Periodic shift: translate the structure through the periodic boundaries
+  //! by whole voxels per axis (viewer-only state, reset on file open). It is
+  //! applied to the loaded data itself (Volume::roll), so the kernels never
+  //! see it. shift_ is the requested shift; vol_shift_/disp_shift_ are what
+  //! volume_/disp_ currently hold (a fresh load holds zero).
+  int shift_[3] = {0, 0, 0};
+  int vol_shift_[3] = {0, 0, 0};
+  int disp_shift_[3] = {0, 0, 0};
+
+  /** Roll volume_ and disp_ by the difference between shift_ and what they
+   *  currently hold, and mark them for re-upload. */
+  void apply_shift();
+
   // --- view / appearance ----------------------------------------------
   OrbitCamera camera_;
   TransferFunction tf_;

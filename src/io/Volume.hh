@@ -32,6 +32,15 @@ const char *to_string(Scalarize s);
  *  (2 for 4 components, 3 for 9), or 0 if it is not a square tensor. */
 int tensor_dim(int nb_components);
 
+/**
+ * Periodically shift (roll) a column-major nx*ny*nz grid in place by whole
+ * voxels, like numpy.roll: afterwards, voxel (i,j,k) holds what was at
+ * ((i-di) mod nx, (j-dj) mod ny, (k-dk) mod nz). Each voxel is @p block
+ * consecutive floats. Shifts of any sign/size are reduced modulo the extent.
+ */
+void roll_periodic(std::vector<float> &data, int nx, int ny, int nz, int block,
+                   int di, int dj, int dk);
+
 /** Coarse per-brick value range of a volume, for the ray marcher's
  *  empty-space skipping (see render_core.hh). Bricks are kSize^3 voxels; each
  *  brick's range is taken over its voxels dilated by one on every side, so
@@ -61,6 +70,11 @@ struct Volume {
   /** (Re)build the brick summary from `data`. from_field() calls this; call it
    *  again after modifying `data` by hand. */
   void build_bricks();
+
+  /** Translate the data through the periodic boundaries by whole voxels (see
+   *  roll_periodic) and rebuild the brick summary. The value range is
+   *  unchanged. */
+  void roll(int di, int dj, int dk);
 
   /**
    * Fill this volume from a raw field buffer of doubles or floats (the
@@ -104,6 +118,11 @@ struct DisplacementField {
   bool empty() const { return data.empty(); }
   std::size_t size() const {
     return static_cast<std::size_t>(nx) * ny * nz;
+  }
+
+  /** Translate the field through the periodic boundaries (see roll_periodic). */
+  void roll(int di, int dj, int dk) {
+    roll_periodic(data, nx, ny, nz, 4, di, dj, dk);
   }
 };
 
